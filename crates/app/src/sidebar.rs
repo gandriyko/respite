@@ -90,18 +90,9 @@ impl Respite {
         .detach();
     }
 
-    /// Postman / Insomnia / OpenAPI / Bruno / HAR → a new folder in the current project.
+    /// Postman / Insomnia / OpenAPI / Bruno / HAR → a new folder in the collections dir.
     pub(crate) fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dest = match self.doc() {
-            Some(d) => http_env::workspace_root(&d.path),
-            None => match self.projects.first() {
-                Some(p) => p.root.clone(),
-                None => {
-                    window.push_notification("Add a project first: imported files go into it", cx);
-                    return;
-                }
-            },
-        };
+        let dest = workspace::collections_dir();
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             // Bruno collections are folders.
@@ -138,6 +129,48 @@ impl Respite {
         .detach();
     }
 
+    /// Hover `+`: a new `.http` file in `dir`, named in the system save dialog.
+    fn add_button(&self, ix: usize, dir: PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("add-file", ix))
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .text_color(cx.theme().muted_foreground)
+            .invisible()
+            .group_hover("row", |s| s.visible())
+            .hover(|s| s.bg(cx.theme().list_active))
+            .child("+")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.new_file(&dir, window, cx);
+            }))
+    }
+
+    fn new_file(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_new_path(dir, Some("requests.http"));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut path))) = picked.await else { return };
+            if path.extension().is_none_or(|e| e != "http" && e != "rest") {
+                path.set_extension("http");
+            }
+            this.update_in(cx, |this, window, cx| {
+                // The dialog already confirmed overwriting; an existing file is just opened, never truncated.
+                if !path.exists()
+                    && let Err(e) = std::fs::write(&path, "### New request\nGET https://\n")
+                {
+                    window.push_notification(format!("{}: {e}", path.display()), cx);
+                    return;
+                }
+                this.rescan_projects_of(&path);
+                this.open(path, None, window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Drops the project from the sidebar list only; files and history stay.
     fn remove_project(&mut self, pi: usize, window: &mut Window, cx: &mut Context<Self>) {
         if pi >= self.projects.len() {
@@ -151,7 +184,7 @@ impl Respite {
     }
 
     fn save_projects(&self) {
-        let roots: Vec<PathBuf> = self.projects.iter().map(|p| p.root.clone()).collect();
+        let roots: Vec<PathBuf> = self.projects.iter().filter(|p| !p.flat).map(|p| p.root.clone()).collect();
         workspace::save_list(Store::default_base().as_deref(), &roots);
     }
 
@@ -192,12 +225,16 @@ impl Respite {
     fn build_rows(&mut self) -> Vec<Row> {
         let mut rows = vec![];
         for pi in 0..self.projects.len() {
-            rows.push(Row::Project(pi));
             let p = &self.projects[pi];
-            if !self.expanded.contains(&p.root) {
+            let (root, files, flat) = (p.root.clone(), p.files.clone().unwrap_or_default(), p.flat);
+            if flat {
+                self.emit(&Tree::build(&root, &files), &root, 0, &mut rows);
                 continue;
             }
-            let (root, files) = (p.root.clone(), p.files.clone().unwrap_or_default());
+            rows.push(Row::Project(pi));
+            if !self.expanded.contains(&root) {
+                continue;
+            }
             if files.is_empty() {
                 rows.push(Row::Note { text: "No .http or .rest files", depth: 1 });
             }
@@ -213,6 +250,11 @@ impl Respite {
             while node.files.is_empty() && node.dirs.len() == 1 {
                 let (child, next) = node.dirs.iter().next().unwrap();
                 (node, path, label) = (next, path.join(child), format!("{label}/{child}"));
+            }
+            // `Demo/Demo.http` alone in its folder (an imported collection) shows as just the file.
+            if node.dirs.is_empty() && node.files.len() == 1 && node.files[0].file_stem() == path.file_name() {
+                self.emit(node, &path, depth, rows);
+                continue;
             }
             rows.push(Row::Dir { path: path.clone(), name: label, depth });
             if !self.collapsed_dirs.contains(&path) {
@@ -251,6 +293,7 @@ impl Respite {
             .gap_1p5()
             .text_sm()
             .cursor_pointer()
+            .group("row")
             .hover(move |s| s.bg(hover))
             .children(guides);
         let spacer = || div().w(px(CHEVRON)).flex_none();
@@ -268,18 +311,18 @@ impl Respite {
                     .rounded_sm()
                     .text_color(muted)
                     .invisible()
-                    .group_hover("project", |s| s.visible())
+                    .group_hover("row", |s| s.visible())
                     .hover(move |s| s.bg(active))
                     .child("×")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.remove_project(pi, window, cx);
                     }));
-                base.group("project")
-                    .when(pi > 0, |r| r.mt_1())
+                base.when(pi > 0, |r| r.mt_1())
                     .child(chevron(open, muted))
                     .child(icon(if open { IconName::FolderOpen } else { IconName::Folder }, t.primary))
                     .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).truncate().child(p.name.clone()))
+                    .child(self.add_button(ix, p.root.clone(), cx))
                     .child(remove)
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_project(pi, cx)))
                     .into_any_element()
@@ -290,6 +333,7 @@ impl Respite {
                 base.child(chevron(open, muted))
                     .child(icon(if open { IconName::FolderOpen } else { IconName::Folder }, muted))
                     .child(div().flex_1().truncate().child(name.clone()))
+                    .child(self.add_button(ix, path.clone(), cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_dir(&p);
                         cx.notify();
@@ -321,6 +365,8 @@ impl Respite {
                     .map(|r| if env { r.child(spacer()) } else { r.child(toggle) })
                     .child(icon(if env { IconName::Globe } else { IconName::FileText }, if current { t.foreground } else { muted }))
                     .child(div().flex_1().truncate().child(name.clone()))
+                    // Next to the file: also how a collapsed `Demo/Demo.http` gets a sibling.
+                    .children(path.parent().map(|d| self.add_button(ix, d.to_path_buf(), cx)))
                     .child(div().flex_none().text_xs().text_color(muted).child(meta))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let is_current = this.doc().is_some_and(|d| *d.path == p);

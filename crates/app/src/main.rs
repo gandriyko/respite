@@ -109,10 +109,10 @@ impl Respite {
     fn new(root: PathBuf, open: Option<PathBuf>, env_name: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // `--env` wins; otherwise the environment last picked for this project.
         let env_name = env_name.or_else(|| workspace::load_env(Store::default_base().as_deref(), &root));
-        let mut projects = workspace::projects(Store::default_base().as_deref(), &root);
-        let files = workspace::scan(&root);
-        let first = files.first().cloned();
-        projects[0].files = Some(files);
+        let mut projects = workspace::projects(Store::default_base().as_deref(), &workspace::collections_dir(), &root);
+        let current = projects.iter_mut().find(|p| p.root == root).expect("current project is listed");
+        let files = current.files.get_or_insert_with(|| workspace::scan(&root));
+        let first = files.iter().find(|f| !workspace::is_env_file(f)).cloned();
         let readonly = |http: bool, window: &mut Window, cx: &mut App| {
             cx.new(|cx| {
                 // Folding only for bodies (JSON nodes); in headers/request it would fold the whole text.
@@ -1120,18 +1120,18 @@ fn main() -> std::process::ExitCode {
         }
     }
     let cwd = std::env::current_dir().expect("current dir");
-    let base = Store::default_base();
     let (root, open) = match target.map(|t| std::path::absolute(&t).unwrap_or_else(|_| cwd.join(&t))) {
         Some(p) if p.is_dir() => (p, None),
         Some(p) => (http_env::workspace_root(&p), Some(p)),
-        // Launched from Finder / Dock the cwd is `/`: reopen the last project instead of scanning the disk.
-        None if cwd == Path::new("/") => {
-            let home = std::env::home_dir().unwrap_or_else(|| cwd.clone());
-            (workspace::last_root(base.as_deref()).unwrap_or(home), None)
+        // No target: the collections folder, not the launch dir (cwd is `/` from Finder, `target/…` from cargo).
+        None => {
+            let dir = workspace::collections_dir();
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("respite: {}: {e}", dir.display());
+            }
+            (dir, None)
         }
-        None => (cwd, None),
     };
-    workspace::save_last_root(base.as_deref(), &root);
     gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx); // theme and fonts come from settings (Respite::apply_settings)
         themes::register(cx);

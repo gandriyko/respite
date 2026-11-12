@@ -11,24 +11,34 @@ pub struct Project {
     pub name: String,
     /// `None` until first expanded (other projects may be big; scan lazily).
     pub files: Option<Vec<PathBuf>>,
+    /// The collections folder: its contents sit at the sidebar root, with no project row.
+    pub flat: bool,
 }
 
 impl Project {
     pub fn new(root: PathBuf) -> Self {
-        Self { name: name_of(&root), files: None, root }
+        Self { name: name_of(&root), files: None, root, flat: false }
     }
 }
 
-/// `current` first (added to the saved list if new), then the other listed roots that still exist, by name.
-pub fn projects(base: Option<&Path>, current: &Path) -> Vec<Project> {
+/// `~/.config/respite`: the default home of collections (one folder each), next to `settings.json`.
+pub fn collections_dir() -> PathBuf {
+    std::env::home_dir().unwrap_or_default().join(".config/respite")
+}
+
+/// `collections` (flat, always scanned) first, then `current` (added to the saved list if new),
+/// then the other listed roots that still exist, by name.
+pub fn projects(base: Option<&Path>, collections: &Path, current: &Path) -> Vec<Project> {
     let mut roots = load_list(base);
-    if !roots.iter().any(|r| r == current) {
+    if current != collections && !roots.iter().any(|r| r == current) {
         roots.push(current.to_path_buf());
         save_list(base, &roots);
     }
-    let mut others: Vec<PathBuf> = roots.into_iter().filter(|r| r != current && r.is_dir()).collect();
+    let mut others: Vec<PathBuf> = roots.into_iter().filter(|r| r != current && r != collections && r.is_dir()).collect();
     others.sort_by_key(|r| name_of(r).to_lowercase());
-    std::iter::once(current.to_path_buf()).chain(others).map(Project::new).collect()
+    let current = (current != collections).then(|| current.to_path_buf());
+    let flat = Project { files: Some(scan(collections)), flat: true, ..Project::new(collections.to_path_buf()) };
+    std::iter::once(flat).chain(current.into_iter().chain(others).map(Project::new)).collect()
 }
 
 fn load_list(base: Option<&Path>) -> Vec<PathBuf> {
@@ -65,19 +75,6 @@ fn write_state(base: &Path, state: &serde_json::Value) {
     if let Err(e) = std::fs::create_dir_all(base).and_then(|()| std::fs::write(base.join("state.json"), state.to_string())) {
         eprintln!("respite: state not saved: {e}");
     }
-}
-
-/// Project opened last (`state.json` → `last_root`), if it still exists.
-pub fn last_root(base: Option<&Path>) -> Option<PathBuf> {
-    let root = PathBuf::from(read_state(base?)["last_root"].as_str()?);
-    root.is_dir().then_some(root)
-}
-
-pub fn save_last_root(base: Option<&Path>, root: &Path) {
-    let Some(base) = base else { return };
-    let mut state = read_state(base);
-    state["last_root"] = root.to_string_lossy().into_owned().into();
-    write_state(base, &state);
 }
 
 /// File last selected in `root` and its cursor (0-based line, column), if the file still exists.
@@ -156,16 +153,22 @@ mod tests {
             "/definitely/not/here": "gone",
         });
         std::fs::write(base.path().join("projects.json"), map.to_string()).unwrap();
-        let ps = projects(Some(base.path()), cur.path());
-        assert_eq!(ps.iter().map(|p| p.root.as_path()).collect::<Vec<_>>(), [cur.path(), other.path()]);
+        let coll = tempfile::tempdir().unwrap();
+        let ps = projects(Some(base.path()), coll.path(), cur.path());
+        assert_eq!(ps.iter().map(|p| p.root.as_path()).collect::<Vec<_>>(), [coll.path(), cur.path(), other.path()]);
+        assert!(ps[0].flat && !ps[1].flat);
+        // Collections as current: shown once and never saved to the project list.
+        let ps = projects(Some(base.path()), coll.path(), coll.path());
+        assert_eq!((ps.len(), ps[0].root.as_path()), (3, coll.path())); // the other two are sorted by (random) name
+        assert!(!load_list(Some(base.path())).iter().any(|r| r == coll.path()));
 
         // Seeded list is saved; a removed root stays removed, a new current one is appended.
         let mut list = load_list(Some(base.path()));
         list.retain(|r| r != other.path());
         save_list(Some(base.path()), &list);
         let fresh = tempfile::tempdir().unwrap();
-        let ps = projects(Some(base.path()), fresh.path());
-        assert_eq!(ps.iter().map(|p| p.root.as_path()).collect::<Vec<_>>(), [fresh.path(), cur.path()]);
+        let ps = projects(Some(base.path()), coll.path(), fresh.path());
+        assert_eq!(ps.iter().map(|p| p.root.as_path()).collect::<Vec<_>>(), [coll.path(), fresh.path(), cur.path()]);
 
         assert_eq!(load_env(Some(base.path()), cur.path()), None);
         save_env(Some(base.path()), cur.path(), Some("dev"));
@@ -174,13 +177,10 @@ mod tests {
         save_env(Some(base.path()), cur.path(), None);
         assert_eq!(load_env(Some(base.path()), cur.path()), None);
         assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod"));
-        assert_eq!(last_root(Some(base.path())), None);
-        save_last_root(Some(base.path()), other.path());
-        assert_eq!(last_root(Some(base.path())).as_deref(), Some(other.path()));
-        assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod")); // same file, other keys kept
         let f = other.path().join("x.http");
         std::fs::write(&f, "GET /").unwrap();
         save_last_file(Some(base.path()), other.path(), &f, 12, 4);
+        assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod")); // same file, other keys kept
         assert_eq!(last_file(Some(base.path()), other.path()), Some((f.clone(), 12, 4)));
         std::fs::remove_file(&f).unwrap();
         assert_eq!(last_file(Some(base.path()), other.path()), None); // deleted file is not reopened
