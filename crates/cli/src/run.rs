@@ -6,11 +6,11 @@ use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use http_env::ResolveError;
-use http_exec::{Context, Error, Exchange, Executor, SentRequest};
+use http_exec::{Context, Error, Exchange, SentRequest};
 use http_syntax::Request;
 use serde_json::{Map, Value, json};
 
-use crate::{BOLD, CliError, DIM, EnvArgs, Format, Loaded, YELLOW, environment, find, load, open_store, paint, status_color};
+use crate::{BOLD, CliError, DIM, EnvArgs, Format, Loaded, YELLOW, environment, find, load, paint, status_color};
 
 const MASK: &str = "••••";
 const SENSITIVE: [&str; 3] = ["authorization", "cookie", "x-api-key"];
@@ -88,7 +88,7 @@ pub(crate) fn run(args: RunArgs) -> Result<u8, CliError> {
     // ponytail: masks private-env and prompted values; $dotenv/$processEnv values are not tracked yet.
     let mut secrets: Vec<String> = env.values().filter(|v| v.secret && v.value.len() >= 4).map(|v| v.value.clone()).collect();
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
-    let exec = Executor::new(open_store(&loaded.root), args.env.env.as_deref(), "cli");
+    let exec = crate::executor(&loaded.root, args.env.env.as_deref());
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
 
     let mut exit = 0;

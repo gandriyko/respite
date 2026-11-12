@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use http_env::Environments;
 
-use crate::{CliError, DIM, EnvArgs, environment, find, load, open_store, paint};
+use crate::{CliError, DIM, EnvArgs, environment, find, load, paint};
 
 #[derive(Args)]
 pub(crate) struct ImportArgs {
@@ -47,7 +47,15 @@ pub(crate) fn import(args: ImportArgs) -> Result<u8, CliError> {
         s
     };
     let vars = substitution_vars(args.to.as_deref(), args.env.as_deref());
-    let opts = http_curl::Options { keep_original: !args.no_original, vars: &vars, ..Default::default() };
+    let cwd = std::path::absolute(".").unwrap_or_default();
+    let s = crate::settings(&http_env::workspace_root(&cwd.join("_.http")));
+    let strip: Vec<&str> = s.curl.strip_headers.iter().map(String::as_str).collect();
+    let opts = http_curl::Options {
+        keep_original: s.curl.keep_original_as_comment && !args.no_original,
+        strip_headers: &strip,
+        vars: &vars,
+        ..Default::default()
+    };
     let blocks = http_curl::import_all(&text, &opts).map_err(|e| CliError::new("invalid_curl", e, 3))?;
     let joined = blocks.join("\n");
     let Some(to) = args.to else {
@@ -87,7 +95,7 @@ pub(crate) fn export(args: ExportArgs) -> Result<u8, CliError> {
         return Ok(0);
     }
     let (env, overrides) = environment(&loaded, &args.env)?;
-    let exec = http_exec::Executor::new(open_store(&loaded.root), args.env.env.as_deref(), "cli");
+    let exec = crate::executor(&loaded.root, args.env.env.as_deref());
     let cx = http_exec::Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
     let sent = exec.prepare(&cx, index).map_err(|e| crate::run::exec_error(e, &loaded, req))?;
     println!("{}", http_curl::export(&sent, req));

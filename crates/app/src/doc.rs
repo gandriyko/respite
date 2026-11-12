@@ -10,10 +10,7 @@ use std::{
 use gpui::*;
 use gpui_component::{
     ActiveTheme as _,
-    input::{
-        EditorState, GutterDecoration, GutterDecorationCollection, RangeDecoration, RangeDecorationCollection,
-        RangeDecorationStyle, RopeExt as _,
-    },
+    input::{EditorState, GutterDecoration, GutterDecorationCollection, RopeExt as _},
 };
 use http_env::Variable;
 use http_exec::{Exchange, Executor};
@@ -31,12 +28,13 @@ pub struct Doc {
     pub editor: Entity<EditorState>,
     pub file: Arc<HttpFile>,
     pub env: Arc<HashMap<String, Variable>>,
+    /// Environments visible from this file's env-file chain.
+    pub env_names: Vec<String>,
     pub exec: Arc<Executor>,
     /// `request_line` of the block under the cursor.
     pub active: Option<usize>,
     /// Byte range currently decorated as the active block.
     applied: Option<Range<usize>>,
-    block_fill: RangeDecorationCollection,
     block_bar: GutterDecorationCollection,
     // ponytail: keyed by request line, so statuses drift when lines above are edited;
     // key by block identity once ResponseStore exists.
@@ -44,6 +42,8 @@ pub struct Doc {
     pub tasks: HashMap<usize, Task<()>>,
     /// Edited since load / last save.
     pub dirty: bool,
+    /// `false` for `*.env.json`: plain JSON, no requests, no ▶.
+    pub http: bool,
     pub _subs: Vec<Subscription>,
 }
 
@@ -51,27 +51,27 @@ impl Doc {
     pub fn new(
         path: PathBuf,
         editor: Entity<EditorState>,
-        env: HashMap<String, Variable>,
+        (env, env_names): (HashMap<String, Variable>, Vec<String>),
         exec: Arc<Executor>,
         subs: Vec<Subscription>,
         cx: &mut App,
     ) -> Self {
-        let (block_fill, block_bar) = editor.update(cx, |s, cx| {
-            (s.create_range_decorations_collection(vec![], cx), s.create_gutter_decorations_collection(vec![], cx))
-        });
+        let block_bar = editor.update(cx, |s, cx| s.create_gutter_decorations_collection(vec![], cx));
+        let http = !crate::workspace::is_env_file(&path);
         let mut doc = Self {
             path: Arc::new(path),
             editor,
             file: Arc::default(),
             env: Arc::new(env),
+            env_names,
             exec,
             active: None,
             applied: None,
-            block_fill,
             block_bar,
             status: HashMap::new(),
             tasks: HashMap::new(),
             dirty: false,
+            http,
             _subs: subs,
         };
         doc.reparse(cx);
@@ -85,6 +85,9 @@ impl Doc {
     // ponytail: parses on every keystroke on the UI thread; move to background + 30 ms debounce
     // when large files stutter.
     pub fn reparse(&mut self, cx: &mut App) {
+        if !self.http {
+            return;
+        }
         self.file = Arc::new(http_syntax::parse(&self.editor.read(cx).value()));
         self.sync_active(cx);
     }
@@ -107,11 +110,11 @@ impl Doc {
             return;
         }
         self.applied = range.clone();
-        let (tint, bar) = (cx.theme().primary.opacity(0.07), cx.theme().primary);
-        self.block_fill.set(
-            range.iter().map(|r| RangeDecoration::new(r.clone()).with_style(RangeDecorationStyle::Fill).with_color(tint)).collect(),
-            cx,
-        );
+        // Only a gutter bar marks the block (as in Zed / JetBrains): gpui-component has no
+        // full-width line background, and a text-range fill paints a ragged edge plus an extra
+        // cell for every line's `\n`.
+        // ponytail: bring a background back if the editor gains full-width line decorations.
+        let bar = cx.theme().primary;
         self.block_bar.set(range.iter().map(|r| GutterDecoration::new(r.clone()).with_color(bar)).collect(), cx);
     }
 }

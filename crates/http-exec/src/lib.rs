@@ -100,8 +100,25 @@ impl From<reqwest::Error> for Error {
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Defaults for requests without the matching directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    /// Used when there is no `# @timeout`.
+    pub timeout: Option<Duration>,
+    /// `# @no-redirect` still wins.
+    pub follow_redirects: bool,
+    pub max_redirects: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { timeout: None, follow_redirects: true, max_redirects: 10 }
+    }
+}
+
 /// Long-lived: owns the cookie jar and the named-response cache. Share via `Arc`.
 pub struct Executor {
+    options: std::sync::RwLock<Options>,
     cookies: Arc<reqwest_cookie_store::CookieStoreMutex>,
     /// In-memory layer over `store.latest()`.
     named: Mutex<HashMap<(PathBuf, String), Arc<Exchange>>>,
@@ -132,6 +149,7 @@ impl Executor {
             .and_then(|f| cookie_store::serde::json::load(std::io::BufReader::new(f)).ok())
             .unwrap_or_default();
         Self {
+            options: Default::default(),
             cookies: Arc::new(reqwest_cookie_store::CookieStoreMutex::new(jar)),
             named: Mutex::default(),
             store,
@@ -142,6 +160,11 @@ impl Executor {
 
     pub fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// Takes effect for requests started afterwards.
+    pub fn set_options(&self, options: Options) {
+        *self.options.write().unwrap() = options;
     }
 
     /// Run `cx.file.requests[index]`.
@@ -222,7 +245,8 @@ impl Executor {
             };
             stack.pop();
 
-            let response = send(req, &prepared.sent, self.cookies.clone()).await?;
+            let options = self.options.read().unwrap().clone();
+            let response = send(req, &prepared.sent, self.cookies.clone(), &options).await?;
             if let Some((path, overwrite)) = &prepared.output {
                 write_output(path, *overwrite, &response.body)?;
             }
@@ -401,12 +425,18 @@ async fn send(
     req: &Request,
     sent: &SentRequest,
     cookies: Arc<reqwest_cookie_store::CookieStoreMutex>,
+    options: &Options,
 ) -> Result<Response, Error> {
     let has = |d: &str| req.directive(d).is_some();
+    let redirect = if has("no-redirect") || !options.follow_redirects {
+        reqwest::redirect::Policy::none()
+    } else {
+        reqwest::redirect::Policy::limited(options.max_redirects)
+    };
     // ponytail: a client per run (redirect/TLS/connect-timeout are client-level in reqwest),
     // so no connection reuse between runs; cache clients by settings if latency matters.
     let mut builder = reqwest::Client::builder()
-        .redirect(if has("no-redirect") { reqwest::redirect::Policy::none() } else { reqwest::redirect::Policy::limited(10) })
+        .redirect(redirect)
         .danger_accept_invalid_certs(has("insecure"));
     if !has("no-cookie-jar") {
         builder = builder.cookie_provider(cookies);
@@ -422,7 +452,7 @@ async fn send(
     for (n, v) in &sent.headers {
         rb = rb.header(n, v);
     }
-    if let Some(t) = duration(req, "timeout")? {
+    if let Some(t) = duration(req, "timeout")?.or(options.timeout) {
         rb = rb.timeout(t);
     }
 

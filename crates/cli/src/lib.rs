@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use http_env::{Environments, Variable};
 use http_exec::Store;
+pub use respite_settings::Settings;
 use http_syntax::{HttpFile, Severity};
 use serde_json::{Value, json};
 
@@ -280,18 +281,34 @@ pub(crate) fn environment(loaded: &Loaded, args: &EnvArgs) -> Result<(Vars, Over
     Ok((envs.variables(args.env.as_deref()), overrides))
 }
 
-/// `envFiles` from `<root>/.respite/settings.json` (`~/` expanded).
+/// Global + workspace settings; problems in the files go to stderr.
+pub(crate) fn settings(root: &Path) -> Settings {
+    let loaded = respite_settings::Loaded::load(Some(root));
+    for e in &loaded.errors {
+        eprintln!("{} {e}", paint("warning:", YELLOW, true));
+    }
+    loaded.settings
+}
+
 fn settings_env_files(root: &Path) -> Vec<PathBuf> {
-    let Ok(bytes) = std::fs::read(root.join(".respite/settings.json")) else { return vec![] };
-    let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { return vec![] };
-    let home = std::env::home_dir().unwrap_or_default();
-    v["envFiles"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|p| p.strip_prefix("~/").map_or_else(|| root.join(p), |rest| home.join(rest)))
-        .collect()
+    settings(root).env_files(root)
+}
+
+/// Request defaults from `request.*` settings.
+pub fn exec_options(s: &Settings) -> http_exec::Options {
+    http_exec::Options {
+        timeout: (s.request.timeout_ms > 0).then(|| std::time::Duration::from_millis(s.request.timeout_ms)),
+        follow_redirects: s.request.follow_redirects,
+        max_redirects: s.request.max_redirects,
+    }
+}
+
+/// Executor with history (limits from settings) and request defaults.
+pub(crate) fn executor(root: &Path, env: Option<&str>) -> http_exec::Executor {
+    let s = settings(root);
+    let exec = http_exec::Executor::new(open_store(root, &s), env, "cli");
+    exec.set_options(exec_options(&s));
+    exec
 }
 
 /// `.http` / `.rest` files under `path` (respects .gitignore), or `path` itself.
@@ -349,7 +366,7 @@ fn show(path: &Path, addr: &str, resolved: bool, args: &EnvArgs) -> Result<u8, C
         return Ok(0);
     }
     let (env, overrides) = environment(&loaded, args)?;
-    let exec = http_exec::Executor::new(open_store(&loaded.root), args.env.as_deref(), "cli");
+    let exec = executor(&loaded.root, args.env.as_deref());
     let cx = http_exec::Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
     let sent = exec.prepare(&cx, index).map_err(|e| run::exec_error(e, &loaded, r))?;
     println!("{} {}", sent.method, sent.url);
@@ -362,10 +379,12 @@ fn show(path: &Path, addr: &str, resolved: bool, args: &EnvArgs) -> Result<u8, C
     Ok(0)
 }
 
-pub(crate) fn open_store(root: &Path) -> Option<Store> {
-    Store::open(&Store::default_base()?, root)
+pub(crate) fn open_store(root: &Path, s: &Settings) -> Option<Store> {
+    let mut store = Store::open(&Store::default_base()?, root)
         .inspect_err(|e| eprintln!("{} history disabled: {e}", paint("warning:", YELLOW, true)))
-        .ok()
+        .ok()?;
+    (store.per_request, store.total) = (s.history.per_request, s.history.total);
+    Some(store)
 }
 
 fn check(paths: &[PathBuf], format: Format) -> Result<u8, CliError> {
@@ -465,7 +484,7 @@ pub(crate) fn status_color(status: u16) -> &'static str {
 fn history(last: usize, format: Format) -> Result<u8, CliError> {
     let cwd = std::path::absolute(".").unwrap_or_default();
     let root = http_env::workspace_root(&cwd.join("_.http"));
-    let entries: Vec<_> = open_store(&root).map(|s| s.list()).unwrap_or_default().into_iter().take(last).collect();
+    let entries: Vec<_> = open_store(&root, &settings(&root)).map(|s| s.list()).unwrap_or_default().into_iter().take(last).collect();
     match format {
         Format::Human => {
             for e in &entries {
