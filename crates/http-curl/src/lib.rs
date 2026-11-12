@@ -383,7 +383,16 @@ pub fn export(sent: &SentRequest, req: &Request) -> String {
         // ponytail: non-UTF-8 bodies are exported lossily; curl would need the bytes in a file.
         Err(e) => ("--data-binary", String::from_utf8_lossy(e.as_bytes()).into_owned()),
     });
-    render(&sent.method, &sent.url, &sent.headers, body, req)
+    render(&sent.method, &sent.url, &sent.headers, body, Some(req))
+}
+
+/// Exactly what was sent (e.g. a past run from history), without the block's directives.
+pub fn export_sent(sent: &SentRequest) -> String {
+    let body = (!sent.body.is_empty()).then(|| match String::from_utf8(sent.body.clone()) {
+        Ok(text) => ("--data-raw", text),
+        Err(e) => ("--data-binary", String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    });
+    render(&sent.method, &sent.url, &sent.headers, body, None)
 }
 
 /// Block as written, `{{variables}}` kept; `< file` bodies become `--data-binary @file`.
@@ -400,10 +409,10 @@ pub fn export_raw(req: &Request) -> String {
             _ => ("--data-raw", b.text.clone()),
         }
     });
-    render(&req.method, &req.url, &headers, body, req)
+    render(&req.method, &req.url, &headers, body, Some(req))
 }
 
-fn render(method: &str, url: &str, headers: &[(String, String)], body: Option<(&str, String)>, req: &Request) -> String {
+fn render(method: &str, url: &str, headers: &[(String, String)], body: Option<(&str, String)>, req: Option<&Request>) -> String {
     let mut args = vec!["curl".to_string()];
     match method {
         "GET" => {}
@@ -411,17 +420,17 @@ fn render(method: &str, url: &str, headers: &[(String, String)], body: Option<(&
         m => args.push(format!("-X {}", quote(m))),
     }
     args.push(quote(url));
-    if req.directive("no-redirect").is_none() {
+    if req.is_none_or(|r| r.directive("no-redirect").is_none()) {
         args.push("-L".into());
     }
-    if req.directive("insecure").is_some() {
+    if req.is_some_and(|r| r.directive("insecure").is_some()) {
         args.push("-k".into());
     }
-    if req.http_version.as_deref() == Some("HTTP/2") {
+    if req.is_some_and(|r| r.http_version.as_deref() == Some("HTTP/2")) {
         args.push("--http2".into());
     }
     for (directive, flag) in [("timeout", "--max-time"), ("connection-timeout", "--connect-timeout")] {
-        if let Some(secs) = req.directive(directive).and_then(|d| seconds(d.value.as_deref()?)) {
+        if let Some(secs) = req.and_then(|r| r.directive(directive)).and_then(|d| seconds(d.value.as_deref()?)) {
             args.push(format!("{flag} {secs}"));
         }
     }

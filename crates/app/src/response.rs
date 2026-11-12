@@ -321,6 +321,11 @@ impl Respite {
         window.push_notification(format!("Copied the body ({})", size_label(ex.response.body.len())), cx);
     }
 
+    fn copy_curl(&self, ex: &Exchange, window: &mut Window, cx: &mut App) {
+        cx.write_to_clipboard(ClipboardItem::new_string(http_curl::export_sent(&ex.request)));
+        window.push_notification("Copied as cURL", cx);
+    }
+
     fn save_body(&self, ex: &Exchange, window: &mut Window, cx: &mut Context<Self>) {
         let dir = self.doc().and_then(|d| d.path.parent().map(Path::to_path_buf)).or_else(std::env::home_dir).unwrap_or_default();
         let picked = cx.prompt_for_new_path(&dir, Some(&suggested_name(ex)));
@@ -584,20 +589,26 @@ impl Respite {
                             cx.notify();
                         }))
                 });
-                let (a, b) = (ex.clone(), ex.clone());
+                let (a, b, c_) = (ex.clone(), ex.clone(), ex.clone());
                 let copy = Button::new("copy-body")
                     .icon(IconName::Copy)
                     .ghost()
                     .xsmall()
                     .tooltip("Copy the body")
                     .on_click(cx.listener(move |this, _, window, cx| this.copy_body(&a, window, cx)));
+                let curl = Button::new("copy-curl")
+                    .label("cURL")
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Copy the request as a cURL command")
+                    .on_click(cx.listener(move |this, _, window, cx| this.copy_curl(&c_, window, cx)));
                 let save = Button::new("save-body")
                     .icon(icon(include_bytes!("../assets/download.svg")))
                     .ghost()
                     .xsmall()
                     .tooltip("Save the body to a file")
                     .on_click(cx.listener(move |this, _, window, cx| this.save_body(&b, window, cx)));
-                Some(div().flex().items_center().gap_1().children(raw).child(wrap).child(div().w_2()).child(copy).child(save).child(search))
+                Some(div().flex().items_center().gap_1().children(raw).child(wrap).child(div().w_2()).child(copy).child(curl).child(save).child(search))
             }
             _ => None,
         };
