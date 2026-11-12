@@ -79,6 +79,12 @@ impl Respite {
                     .child(self.row("Line numbers", "editor.line_numbers", self.switch("editor.line_numbers", s.editor.line_numbers, cx), cx))
                     .child(self.row("Soft wrap", "editor.soft_wrap", self.switch("editor.soft_wrap", s.editor.soft_wrap, cx), cx))
                     .child(self.row("Status after the request line", "editor.inlay_status", self.switch("editor.inlay_status", s.editor.inlay_status, cx), cx))
+                    .child(self.row(
+                        "Highlight the current line",
+                        "editor.highlight_current_line",
+                        self.switch("editor.highlight_current_line", s.editor.highlight_current_line, cx),
+                        cx,
+                    ))
                     .child(section("Requests"))
                     .child(self.row("Default timeout, ms", "request.timeout_ms", Input::new(&self.timeout_input).w(px(160.)).into_any_element(), cx))
                     .child(self.row("Follow redirects", "request.follow_redirects", self.switch("request.follow_redirects", s.request.follow_redirects, cx), cx))

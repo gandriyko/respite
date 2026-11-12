@@ -46,6 +46,8 @@ pub struct Editor {
     pub soft_wrap: bool,
     /// `200 OK · 142 ms · 3.4 KB` after the request line.
     pub inlay_status: bool,
+    /// Background on the line under the cursor.
+    pub highlight_current_line: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,7 +119,7 @@ impl Default for Settings {
 
 impl Default for Editor {
     fn default() -> Self {
-        Self { line_numbers: true, soft_wrap: false, inlay_status: true }
+        Self { line_numbers: true, soft_wrap: false, inlay_status: true, highlight_current_line: false }
     }
 }
 

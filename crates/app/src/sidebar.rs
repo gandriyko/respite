@@ -341,27 +341,35 @@ impl Respite {
             .text_color(muted)
             .child("PROJECTS")
             .child(icon_button("add-project", IconName::Plus).on_click(cx.listener(|this, _, _, cx| this.add_project(cx))));
+        let item = |id: &'static str, icon: IconName, label: &'static str| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(30.))
+                .px_2()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(muted)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(Icon::new(icon).size_3p5())
+                .child(label)
+        };
         let footer = div()
-            .id("open-settings")
             .flex_none()
-            .h(px(32.))
             .mx_1()
             .mb_1()
-            .px_2()
-            .rounded_md()
             .flex()
-            .items_center()
-            .gap_2()
-            .text_sm()
-            .text_color(muted)
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .child(Icon::new(IconName::Settings).size_3p5())
-            .child("Settings")
-            .on_click(cx.listener(|this, _, _, cx| {
+            .gap_1()
+            .child(item("open-settings", IconName::Settings, "Settings").on_click(cx.listener(|this, _, _, cx| {
                 this.show_settings = !this.show_settings;
+                this.show_history &= !this.show_settings;
                 cx.notify();
-            }));
+            })))
+            .child(item("open-history", IconName::RotateCw, "History").on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))));
         div()
             .size_full()
             .flex()

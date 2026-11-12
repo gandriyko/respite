@@ -151,7 +151,16 @@ impl Store {
     /// Newest recorded exchange of request `name` in `file` (cross-run `{{name.response…}}` cache).
     pub fn latest(&self, file: &Path, name: &str) -> Option<Exchange> {
         let rel = self.relative(file);
-        let entry = self.list().into_iter().find(|e| e.file == rel && e.name.as_deref() == Some(name))?;
+        self.exchange(self.list().into_iter().find(|e| e.file == rel && e.name.as_deref() == Some(name))?)
+    }
+
+    /// Workspace root; `Entry::file` is relative to it.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// A recorded entry as an exchange (body read from disk). Request secrets stay masked.
+    pub fn exchange(&self, entry: Entry) -> Option<Exchange> {
         let body = self.body(&entry.id)?;
         Some(Exchange {
             request: SentRequest {

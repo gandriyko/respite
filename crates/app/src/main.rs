@@ -5,6 +5,7 @@
 
 mod doc;
 mod highlight;
+mod history_page;
 mod settings_page;
 mod sidebar;
 mod themes;
@@ -34,7 +35,10 @@ use workspace::Project;
 
 actions!(
     respite,
-    [RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Quit, NextEnvironment]
+    [
+        RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Quit,
+        NextEnvironment, ToggleHistory
+    ]
 );
 
 const SAMPLE: &str = include_str!("../sample.http");
@@ -87,6 +91,13 @@ struct Respite {
     shown: Option<(usize, usize)>,
     settings: respite_settings::Loaded,
     show_settings: bool,
+    show_history: bool,
+    /// Current project's history, newest first; reloaded when the page opens and after runs.
+    history: Vec<http_exec::Entry>,
+    /// Indices into `history` that match the filter (the list's rows).
+    history_rows: Vec<usize>,
+    history_pick: Option<(http_exec::Entry, Arc<Exchange>)>,
+    history_filter: Entity<InputState>,
     font_input: Entity<InputState>,
     timeout_input: Entity<InputState>,
     /// Theme's own monospace font, used when `font_family` is empty.
@@ -126,6 +137,7 @@ impl Respite {
         let s = &settings.settings;
         let font_input = cx.new(|cx| InputState::new(window, cx).placeholder("Default monospace font").default_value(s.font_family.clone()));
         let timeout_input = cx.new(|cx| InputState::new(window, cx).placeholder("0 = no limit").default_value(s.request.timeout_ms.to_string()));
+        let history_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: method, URL, name, file, status"));
         let _subs = vec![
             cx.subscribe_in(&font_input, window, |this, input, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::Change) {
@@ -139,15 +151,32 @@ impl Respite {
                     this.set("request.timeout_ms", ms.into(), window, cx);
                 }
             }),
+            cx.subscribe_in(&history_filter, window, |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            // Remember the current file and cursor for the next launch of this project.
+            cx.on_app_quit(|this, cx| {
+                this.remember_position(cx);
+                async {}
+            }),
             cx.observe_window_appearance(window, |this, window, cx| {
                 if this.settings.settings.appearance == respite_settings::Appearance::System {
                     Theme::sync_system_appearance(Some(window), cx);
+                    // Switching mode reloads the highlight theme; re-apply the option.
+                    themes::current_line(this.settings.settings.editor.highlight_current_line, cx);
                 }
             }),
         ];
         let mut this = Self {
             settings,
             show_settings: false,
+            show_history: false,
+            history: vec![],
+            history_rows: vec![],
+            history_pick: None,
+            history_filter,
             font_input,
             timeout_input,
             default_mono: cx.theme().mono_font_family.clone(),
@@ -168,10 +197,24 @@ impl Respite {
             tab: 0,
             shown: None,
         };
-        match open.or(first) {
-            Some(path) => this.open(path, None, window, cx),
-            None => this.open(root.join("untitled.http"), Some(SAMPLE.into()), window, cx),
-        };
+        // An explicit file wins; else the file (and cursor) last used in this project; else the first one.
+        let last = workspace::last_file(Store::default_base().as_deref(), &root);
+        match (open, last, first) {
+            (Some(path), _, _) => {
+                this.open(path, None, window, cx);
+            }
+            (None, Some((path, line, column)), _) => {
+                if let Some(ix) = this.open(path, None, window, cx) {
+                    this.docs[ix].editor.update(cx, |s, cx| s.set_cursor_position(Position::new(line, column), window, cx));
+                }
+            }
+            (None, None, Some(path)) => {
+                this.open(path, None, window, cx);
+            }
+            (None, None, None) => {
+                this.open(root.join("untitled.http"), Some(SAMPLE.into()), window, cx);
+            }
+        }
         this.apply_settings(window, cx);
         this
     }
@@ -212,6 +255,7 @@ impl Respite {
             A::Light => Theme::change(ThemeMode::Light, Some(window), cx),
             A::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
         }
+        themes::current_line(s.editor.highlight_current_line, cx);
         let t = Theme::global_mut(cx);
         t.font_size = px(s.ui_font_size);
         t.mono_font_size = px(s.font_size);
@@ -326,6 +370,14 @@ impl Respite {
         cx.notify();
     }
 
+    /// Current file + cursor, per project (`state.json` → `files`); reopened on next launch.
+    fn remember_position(&self, cx: &App) {
+        let Some(d) = self.doc() else { return };
+        let pos = d.editor.read(cx).cursor_position();
+        let root = http_env::workspace_root(&d.path);
+        workspace::save_last_file(Store::default_base().as_deref(), &root, &d.path, pos.line, pos.character);
+    }
+
     fn rescan_projects_of(&mut self, path: &Path) {
         for p in self.projects.iter_mut().filter(|p| p.files.is_some() && path.starts_with(&p.root)) {
             p.files = Some(workspace::scan(&p.root));
@@ -390,6 +442,9 @@ impl Respite {
                 this.update(cx, |this, cx| {
                     if let Some(d) = this.docs.iter_mut().find(|d| d.path == key) {
                         d.status.insert(request_line, status);
+                    }
+                    if this.show_history {
+                        this.reload_history();
                     }
                     cx.notify();
                 })
@@ -579,17 +634,19 @@ impl Respite {
                     let shown = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
                     menu = menu.item(PopupMenuItem::new(format!("Edit {shown}")).on_click(edit(p, None)));
                 }
+                // New files go to the workspace root (nearest folder with .git / .respite); say which.
+                let dir = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
                 for (name, template) in ENV_TEMPLATES {
                     let p = root.join(name);
                     if !p.exists() {
-                        menu = menu.item(PopupMenuItem::new(format!("Create {name}")).on_click(edit(p, Some(template))));
+                        menu = menu.item(PopupMenuItem::new(format!("Create {name} in {dir}/")).on_click(edit(p, Some(template))));
                     }
                 }
                 // Respite format: one flat file per environment.
-                let name = format!("respite.{}.json", current.as_deref().unwrap_or("dev"));
+                let name = format!("respite-{}.json", current.as_deref().unwrap_or("dev"));
                 let p = root.join(&name);
                 if !p.exists() {
-                    menu = menu.item(PopupMenuItem::new(format!("Create {name}")).on_click(edit(p, Some(RESPITE_TEMPLATE))));
+                    menu = menu.item(PopupMenuItem::new(format!("Create {name} in {dir}/")).on_click(edit(p, Some(RESPITE_TEMPLATE))));
                 }
                 menu
             })
@@ -623,6 +680,9 @@ impl Respite {
         if self.show_settings {
             return self.settings_page(cx);
         }
+        if self.show_history {
+            return self.history_page(cx);
+        }
         let body = match self.doc() {
             Some(d) => div().flex_1().min_h_0().child(Editor::new(&d.editor).size_full()),
             None => div()
@@ -637,15 +697,17 @@ impl Respite {
         div().size_full().flex().flex_col().children(tabs).child(body).into_any_element()
     }
 
-    fn overlays(&self, cx: &Context<Self>) -> Vec<AnyElement> {
-        // The editor is not on screen behind the settings page; its last layout is stale.
-        let (false, Some(ix), Some(d)) = (self.show_settings, self.current, self.doc()) else { return vec![] };
+    /// ▶ / ◼ and status hints for the visible request lines, from the editor's layout as it
+    /// is *now* — call during prepaint, after the editor laid out this frame.
+    fn marks(&self, cx: &App) -> Option<(usize, Vec<Mark>)> {
+        // The editor is not on screen behind the settings / history page.
+        let (false, false, Some(ix), Some(d)) = (self.show_settings, self.show_history, self.current, self.doc()) else { return None };
         if !d.http {
-            return vec![];
+            return None;
         }
         let s = d.editor.read(cx);
         let (text, bounds) = (s.text(), s.input_bounds());
-        let mut out = vec![];
+        let mut marks = vec![];
         for r in &d.file.requests {
             let line = r.request_line;
             let (start, end) = (text.line_start_offset(line - 1), text.line_end_offset(line - 1));
@@ -654,32 +716,62 @@ impl Respite {
                 continue; // scrolled out or folded
             }
             let status = d.status.get(&line).cloned();
-            let running = matches!(status, Some(Status::Running));
-            let button = div()
-                .id(("run", line))
-                .cursor_pointer()
-                .text_sm()
-                .text_color(if running { cx.theme().warning } else { cx.theme().success })
-                .child(if running { "◼" } else { "▶" })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if running { this.cancel(ix, line, cx) } else { this.run(ix, line, cx) }
-                }));
-            // Between line numbers and text (fold chevrons sit on `###` lines, not request lines).
-            // ponytail: follows horizontal scroll; pin to text_bounds().left() if that bothers.
-            out.push(deferred(anchored().position(point(lb.left() - px(16.), lb.top())).child(button)).into_any_element());
-
             let hint = match &status {
                 _ if !self.settings.settings.editor.inlay_status => None,
                 Some(Status::Done(ex)) => Some((summary(ex), self.status_color(ex.response.status, cx))),
                 Some(Status::Failed(e)) => Some((format!("✕ {}", truncate(e, 80)), cx.theme().danger)),
                 _ => None,
             };
-            if let (Some((text, color)), Some(eb)) = (hint, s.range_to_bounds(&(end..end))) {
-                let hint = div().text_sm().text_color(color).child(text);
-                out.push(deferred(anchored().position(point(eb.right() + px(24.), eb.top())).child(hint)).into_any_element());
-            }
+            let hint = hint.zip(s.range_to_bounds(&(end..end))).map(|((t, c), eb)| (t, c, point(eb.right() + px(24.), eb.top())));
+            marks.push(Mark {
+                line,
+                running: matches!(status, Some(Status::Running)),
+                // Between line numbers and text (fold chevrons sit on `###` lines, not request lines).
+                // ponytail: follows horizontal scroll; pin to text_bounds().left() if that bothers.
+                at: point(lb.left() - px(16.), lb.top()),
+                line_height: lb.size.height,
+                hint,
+            });
         }
-        out
+        Some((ix, marks))
+    }
+
+    /// Run buttons and status hints painted over the editor. A canvas, not child elements:
+    /// its prepaint runs after the editor's in the same frame, so positions never lag a
+    /// frame behind while scrolling.
+    fn overlay(&self, cx: &Context<Self>) -> impl IntoElement {
+        let (read, write) = (cx.entity(), cx.entity());
+        canvas(
+            move |_, window, cx| {
+                let Some((ix, marks)) = read.read(cx).marks(cx) else { return vec![] };
+                marks
+                    .into_iter()
+                    .map(|m| (ix, window.insert_hitbox(Bounds::new(m.at, size(px(14.), m.line_height)), HitboxBehavior::Normal), m))
+                    .collect::<Vec<_>>()
+            },
+            move |_, marks, window, cx| {
+                let (run, stop) = (cx.theme().success, cx.theme().warning);
+                for (ix, hitbox, m) in marks {
+                    paint_text(if m.running { "◼" } else { "▶" }, m.at, if m.running { stop } else { run }, m.line_height, window, cx);
+                    if let Some((text, color, at)) = &m.hint {
+                        paint_text(text, *at, *color, m.line_height, window, cx);
+                    }
+                    window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                    let (view, line, running) = (write.clone(), m.line, m.running);
+                    window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && hitbox.is_hovered(window) {
+                            // Painted after the editor, so this runs first; keep the click from moving the caret.
+                            cx.stop_propagation();
+                            view.update(cx, |this, cx| if running { this.cancel(ix, line, cx) } else { this.run(ix, line, cx) });
+                        }
+                    });
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
     }
 
     // ---- response ----
@@ -688,16 +780,24 @@ impl Respite {
     fn response_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         let t = cx.theme();
         let muted = t.muted_foreground;
-        let d = self.doc();
-        let req = d.and_then(|d| d.active.and_then(|l| d.file.requests.iter().find(|r| r.request_line == l)));
-        let status = req.and_then(|r| d?.status.get(&r.request_line)).cloned();
+        // (method, label) of what the panel shows: the picked history entry while History is
+        // open, else the request under the cursor.
+        let (head, status) = if self.show_history {
+            match &self.history_pick {
+                Some((e, ex)) => (Some((e.method.clone(), e.label.clone())), Some(Status::Done(ex.clone()))),
+                None => (None, None),
+            }
+        } else {
+            let d = self.doc();
+            let req = d.and_then(|d| d.active.and_then(|l| d.file.requests.iter().find(|r| r.request_line == l)));
+            (req.map(|r| (r.method.clone(), r.label())), req.and_then(|r| d?.status.get(&r.request_line)).cloned())
+        };
 
         let title = div().flex_1().min_w_0().flex().items_center().gap_1p5().text_sm();
-        let title = match req {
-            Some(r) => {
-                let label = r.label();
+        let title = match head {
+            Some((method, label)) => {
                 // Imported blocks are titled "METHOD /path" already.
-                let label = label.strip_prefix(&format!("{} ", r.method)).map(str::to_string).unwrap_or(label);
+                let label = label.strip_prefix(&format!("{method} ")).map(str::to_string).unwrap_or(label);
                 title
                     .child(
                         div()
@@ -705,17 +805,19 @@ impl Respite {
                             .text_size(px(10.))
                             .font_weight(FontWeight::BOLD)
                             .font_family(t.mono_font_family.clone())
-                            .text_color(sidebar::method_color(&r.method, cx))
-                            .child(r.method.clone()),
+                            .text_color(sidebar::method_color(&method, cx))
+                            .child(method),
                     )
                     .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(label))
             }
+            None if self.show_history => title.text_color(muted).child("Pick an entry"),
             None => title.text_color(muted).child("No request under the cursor"),
         };
         let pill = |text: String, color: Hsla| {
             div().flex_none().px_1p5().rounded_sm().bg(color.opacity(0.15)).text_color(color).text_xs().font_weight(FontWeight::BOLD).child(text)
         };
         let right = match &status {
+            None if self.show_history => div(),
             None => div().text_xs().text_color(muted).child("Cmd+Enter to send"),
             Some(Status::Running) => div().text_xs().text_color(t.warning).child("Running…"),
             Some(Status::Failed(_)) => pill("Error".into(), t.danger),
@@ -779,10 +881,14 @@ impl Respite {
     /// Load the active block's exchange into the response editors (only when it or the tab changed:
     /// `set_value` resets selection and scroll).
     fn sync_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ex = self.doc().and_then(|d| match d.status.get(&d.active?) {
-            Some(Status::Done(ex)) => Some(ex.clone()),
-            _ => None,
-        });
+        let ex = if self.show_history {
+            self.history_pick.as_ref().map(|(_, ex)| ex.clone())
+        } else {
+            self.doc().and_then(|d| match d.status.get(&d.active?) {
+                Some(Status::Done(ex)) => Some(ex.clone()),
+                _ => None,
+            })
+        };
         let Some(ex) = ex else {
             self.shown = None;
             return;
@@ -827,6 +933,23 @@ fn body_language(r: &http_exec::Response) -> &'static str {
         _ if serde_json::from_slice::<serde_json::Value>(&r.body).is_ok() => "json",
         _ => "text",
     }
+}
+
+/// One request line's ▶ / ◼ and its status hint, in window coordinates.
+struct Mark {
+    line: usize,
+    running: bool,
+    at: Point<Pixels>,
+    line_height: Pixels,
+    hint: Option<(String, Hsla, Point<Pixels>)>,
+}
+
+/// Paint one line of UI text at `origin` (top-left of an editor line `line_height` tall).
+fn paint_text(text: &str, origin: Point<Pixels>, color: Hsla, line_height: Pixels, window: &mut Window, cx: &mut App) {
+    let font_size = px(13.);
+    let run = TextRun { len: text.len(), font: window.text_style().font(), color, background_color: None, underline: None, strikethrough: None };
+    let shaped = window.text_system().shape_line(SharedString::from(text.to_string()), font_size, &[run], None);
+    let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
 }
 
 /// `200 OK · 142 ms · 3.4 KB`
@@ -887,8 +1010,10 @@ impl Render for Respite {
             }))
             .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
             .on_action(cx.listener(|this, _: &NextEnvironment, window, cx| this.next_env(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.show_settings = !this.show_settings;
+                this.show_history &= !this.show_settings;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
@@ -906,7 +1031,7 @@ impl Render for Respite {
                     .child(resizable_panel().child(center))
                     .child(resizable_panel().size(px(420.)).child(self.response_panel(cx))),
             )
-            .children(self.overlays(cx))
+            .child(self.overlay(cx))
     }
 }
 
@@ -948,6 +1073,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Next Environment", NextEnvironment),
         ]),
         Menu::new("View").items([
+            MenuItem::action("History", ToggleHistory),
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Next Tab", NextTab),
         ]),
@@ -961,7 +1087,8 @@ fn main() -> std::process::ExitCode {
         return code;
     }
     // ponytail: hand-rolled GUI args; fold into clap when `open` grows options.
-    let mut args = std::env::args().skip(1).filter(|a| a != "open");
+    // `-psn_…` is a process serial number some macOS launches still pass to app bundles.
+    let mut args = std::env::args().skip(1).filter(|a| a != "open" && !a.starts_with("-psn_"));
     let (mut env_name, mut target) = (None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -970,11 +1097,18 @@ fn main() -> std::process::ExitCode {
         }
     }
     let cwd = std::env::current_dir().expect("current dir");
+    let base = Store::default_base();
     let (root, open) = match target.map(|t| std::path::absolute(&t).unwrap_or_else(|_| cwd.join(&t))) {
         Some(p) if p.is_dir() => (p, None),
         Some(p) => (http_env::workspace_root(&p), Some(p)),
+        // Launched from Finder / Dock the cwd is `/`: reopen the last project instead of scanning the disk.
+        None if cwd == Path::new("/") => {
+            let home = std::env::home_dir().unwrap_or_else(|| cwd.clone());
+            (workspace::last_root(base.as_deref()).unwrap_or(home), None)
+        }
         None => (cwd, None),
     };
+    workspace::save_last_root(base.as_deref(), &root);
     gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx); // theme and fonts come from settings (Respite::apply_settings)
         themes::register(cx);
@@ -997,6 +1131,7 @@ fn main() -> std::process::ExitCode {
                 KeyBinding::new("ctrl-tab", NextTab, Some(ctx)),
                 KeyBinding::new(key(","), OpenSettings, Some(ctx)),
                 KeyBinding::new(key("alt-e"), NextEnvironment, Some(ctx)),
+                KeyBinding::new(key("y"), ToggleHistory, Some(ctx)),
             ]);
         }
         cx.bind_keys([KeyBinding::new(key("q"), Quit, None)]);

@@ -14,6 +14,7 @@ respite-settings = { path = "../settings" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 serde_json = "1"
 ignore = "0.4"
+jiff = "0.2"
 gpui = { package = "gpui-pre", version = "=0.3.12" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders"] } # runtime_shaders: no Xcode `metal` needed
 # tree-sitter: JSON highlighting in the response panel; -html also covers XML-ish bodies

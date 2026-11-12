@@ -32,6 +32,18 @@ pub fn register(cx: &mut App) {
     }
 }
 
+/// Show or hide the line-under-cursor background (`editor.highlight_current_line`).
+/// The theme supplies the colour; applying a theme or mode brings it back, so call this after.
+pub fn current_line(show: bool, cx: &mut App) {
+    if show {
+        return;
+    }
+    let theme = Theme::global_mut(cx);
+    let mut highlight = (*theme.highlight_theme).clone();
+    highlight.style.editor_active_line = None;
+    theme.highlight_theme = std::sync::Arc::new(highlight);
+}
+
 /// Point the light/dark slots at `family`'s variants. Apply a mode afterwards
 /// (`Theme::change`) to show them.
 pub fn select(family: &str, cx: &mut App) {

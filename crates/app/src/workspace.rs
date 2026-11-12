@@ -57,25 +57,61 @@ fn name_of(root: &Path) -> String {
     root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+fn read_state(base: &Path) -> serde_json::Value {
+    std::fs::read(base.join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_state(base: &Path, state: &serde_json::Value) {
+    if let Err(e) = std::fs::create_dir_all(base).and_then(|()| std::fs::write(base.join("state.json"), state.to_string())) {
+        eprintln!("respite: state not saved: {e}");
+    }
+}
+
+/// Project opened last (`state.json` → `last_root`), if it still exists.
+pub fn last_root(base: Option<&Path>) -> Option<PathBuf> {
+    let root = PathBuf::from(read_state(base?)["last_root"].as_str()?);
+    root.is_dir().then_some(root)
+}
+
+pub fn save_last_root(base: Option<&Path>, root: &Path) {
+    let Some(base) = base else { return };
+    let mut state = read_state(base);
+    state["last_root"] = root.to_string_lossy().into_owned().into();
+    write_state(base, &state);
+}
+
+/// File last selected in `root` and its cursor (0-based line, column), if the file still exists.
+pub fn last_file(base: Option<&Path>, root: &Path) -> Option<(PathBuf, u32, u32)> {
+    let v = &read_state(base?)["files"][root.to_string_lossy().as_ref()];
+    let path = PathBuf::from(v["path"].as_str()?);
+    let pos = |k: &str| v[k].as_u64().unwrap_or(0) as u32;
+    path.is_file().then(|| (path, pos("line"), pos("column")))
+}
+
+pub fn save_last_file(base: Option<&Path>, root: &Path, path: &Path, line: u32, column: u32) {
+    let Some(base) = base else { return };
+    let mut state = read_state(base);
+    if !state["files"].is_object() {
+        state["files"] = serde_json::json!({});
+    }
+    state["files"][root.to_string_lossy().as_ref()] = serde_json::json!({ "path": path, "line": line, "column": column });
+    write_state(base, &state);
+}
+
 /// Environment last chosen for `root` (`~/.respite/state.json` → `{"env": {root: name}}`).
 pub fn load_env(base: Option<&Path>, root: &Path) -> Option<String> {
-    let state: serde_json::Value = serde_json::from_slice(&std::fs::read(base?.join("state.json")).ok()?).ok()?;
-    state["env"][root.to_string_lossy().as_ref()].as_str().map(str::to_string)
+    read_state(base?)["env"][root.to_string_lossy().as_ref()].as_str().map(str::to_string)
 }
 
 /// Remember the environment for `root`; `None` = "No environment".
 pub fn save_env(base: Option<&Path>, root: &Path, env: Option<&str>) {
     let Some(base) = base else { return };
-    let path = base.join("state.json");
-    let mut state: serde_json::Value =
-        std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
+    let mut state = read_state(base);
     if !state["env"].is_object() {
         state["env"] = serde_json::json!({});
     }
     state["env"][root.to_string_lossy().as_ref()] = env.map_or(serde_json::Value::Null, Into::into);
-    if let Err(e) = std::fs::create_dir_all(base).and_then(|()| std::fs::write(&path, state.to_string())) {
-        eprintln!("respite: environment choice not saved: {e}");
-    }
+    write_state(base, &state);
 }
 
 pub use http_env::is_env_file;
@@ -138,13 +174,23 @@ mod tests {
         save_env(Some(base.path()), cur.path(), None);
         assert_eq!(load_env(Some(base.path()), cur.path()), None);
         assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod"));
+        assert_eq!(last_root(Some(base.path())), None);
+        save_last_root(Some(base.path()), other.path());
+        assert_eq!(last_root(Some(base.path())).as_deref(), Some(other.path()));
+        assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod")); // same file, other keys kept
+        let f = other.path().join("x.http");
+        std::fs::write(&f, "GET /").unwrap();
+        save_last_file(Some(base.path()), other.path(), &f, 12, 4);
+        assert_eq!(last_file(Some(base.path()), other.path()), Some((f.clone(), 12, 4)));
+        std::fs::remove_file(&f).unwrap();
+        assert_eq!(last_file(Some(base.path()), other.path()), None); // deleted file is not reopened
 
         let r = cur.path();
         std::fs::create_dir_all(r.join("api/v2")).unwrap();
         std::fs::create_dir_all(r.join("ignored")).unwrap();
         for f in [
             "a.http", "api/v2/b.rest", "api/notes.txt", "ignored/c.http", "package.json",
-            "http-client.env.json", "http-client.private.env.json", "respite.dev.json", "respite.dev.private.json",
+            "http-client.env.json", "http-client.private.env.json", "respite-dev.json", "respite-dev.private.json",
         ] {
             std::fs::write(r.join(f), "").unwrap();
         }
@@ -153,7 +199,7 @@ mod tests {
         let rel: Vec<_> = scan(r).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(rel, [
             "a.http", "api/v2/b.rest", "http-client.env.json", "http-client.private.env.json",
-            "respite.dev.json", "respite.dev.private.json",
+            "respite-dev.json", "respite-dev.private.json",
         ]);
     }
 }

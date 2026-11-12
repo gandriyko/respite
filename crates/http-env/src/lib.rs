@@ -4,8 +4,8 @@
 //! down to the `.http` file:
 //! - JetBrains: `http-client.env.json` / `http-client.private.env.json`, one file with all
 //!   environments (`{"$shared": {…}, "dev": {…}}`);
-//! - Respite: one file per environment, `respite.json` (shared), `respite.<env>.json`,
-//!   `respite.<env>.private.json` (flat `{"baseUrl": "…"}`).
+//! - Respite: one file per environment, `respite.json` (shared), `respite-<env>.json`,
+//!   `respite-<env>.private.json` (flat `{"baseUrl": "…"}`).
 //!
 //! Within a directory: JetBrains public, JetBrains private, then Respite files (public before
 //! private); deeper directories override shallower ones.
@@ -23,19 +23,17 @@ use serde_json::{Map, Value};
 const PUBLIC: [&str; 2] = ["http-client.env.json", "rest-client.env.json"];
 const PRIVATE: [&str; 2] = ["http-client.private.env.json", "rest-client.private.env.json"];
 
-/// Respite per-environment file name → (environment key, private). `respite.json` and
-/// `respite.private.json` hold `$shared`.
+/// Respite env file name → (environment key, private): `respite-<env>.json`,
+/// `respite-<env>.private.json`; `respite.json` / `respite.private.json` hold `$shared`.
 pub fn respite_env_file(name: &str) -> Option<(String, bool)> {
-    if name == "respite.json" {
-        return Some(("$shared".into(), false));
+    match name {
+        "respite.json" => return Some(("$shared".into(), false)),
+        "respite.private.json" => return Some(("$shared".into(), true)),
+        _ => {}
     }
-    let mid = name.strip_prefix("respite.")?.strip_suffix(".json")?;
-    let (env, private) = match mid.strip_suffix(".private") {
-        Some(env) => (env, true),
-        None if mid == "private" => ("", true),
-        None => (mid, false),
-    };
-    Some((if env.is_empty() { "$shared".into() } else { env.into() }, private))
+    let mid = name.strip_prefix("respite-")?.strip_suffix(".json")?;
+    let (env, private) = mid.strip_suffix(".private").map_or((mid, false), |env| (env, true));
+    (!env.is_empty()).then(|| (env.to_string(), private))
 }
 
 /// Any env file of either format (for UIs listing / opening them as JSON).
@@ -349,14 +347,14 @@ mod tests {
         fs::create_dir(r.join("api")).unwrap();
         fs::write(r.join("http-client.env.json"), r#"{"dev":{"host":"jetbrains","port":"1"}}"#).unwrap();
         fs::write(r.join("respite.json"), r#"{"apiVersion":"v2"}"#).unwrap();
-        fs::write(r.join("respite.dev.json"), r#"{"host":"respite-root"}"#).unwrap();
-        fs::write(r.join("respite.local.json"), r#"{"host":"localhost"}"#).unwrap();
-        fs::write(r.join("api/respite.dev.json"), r#"{"host":"api"}"#).unwrap();
-        fs::write(r.join("api/respite.dev.private.json"), r#"{"token":"s3cret"}"#).unwrap();
-        fs::write(r.join("respite.broken.json"), "{").unwrap();
+        fs::write(r.join("respite-dev.json"), r#"{"host":"respite-root"}"#).unwrap();
+        fs::write(r.join("respite-local.json"), r#"{"host":"localhost"}"#).unwrap();
+        fs::write(r.join("api/respite-dev.json"), r#"{"host":"api"}"#).unwrap();
+        fs::write(r.join("api/respite-dev.private.json"), r#"{"token":"s3cret"}"#).unwrap();
+        fs::write(r.join("respite-broken.json"), "{").unwrap();
 
         let envs = Environments::load(&r.join("api/users.http"), r, &[]);
-        assert_eq!(envs.names(), ["dev", "local"]); // respite.broken.json is an error, not an environment
+        assert_eq!(envs.names(), ["dev", "local"]); // respite-broken.json is an error, not an environment
         assert_eq!(envs.errors.len(), 1);
         let v = envs.variables(Some("dev"));
         let get = |k: &str| (v[k].value.as_str(), v[k].secret);
@@ -368,9 +366,12 @@ mod tests {
 
         assert_eq!(respite_env_file("respite.json"), Some(("$shared".into(), false)));
         assert_eq!(respite_env_file("respite.private.json"), Some(("$shared".into(), true)));
-        assert_eq!(respite_env_file("respite.prod.private.json"), Some(("prod".into(), true)));
+        assert_eq!(respite_env_file("respite-prod.private.json"), Some(("prod".into(), true)));
+        assert_eq!(respite_env_file("respite-my-local.json"), Some(("my-local".into(), false)));
+        assert_eq!(respite_env_file("respite.dev.json"), None); // dot form is not the format
+        assert_eq!(respite_env_file("respite-.json"), None);
         assert_eq!(respite_env_file("respite.toml"), None);
-        assert!(is_env_file(Path::new("x/respite.dev.json")) && is_env_file(Path::new("http-client.env.json")));
+        assert!(is_env_file(Path::new("x/respite-dev.json")) && is_env_file(Path::new("http-client.env.json")));
         assert!(!is_env_file(Path::new("package.json")));
     }
 

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Respite: a crescent moon (rest) with request / response arrows (REST).
+       macOS icon grid: 824×824 body at 100,100, corner radius ≈ 185. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1E1B4B"/>
+      <stop offset="0.55" stop-color="#312E81"/>
+      <stop offset="1" stop-color="#5B21B6"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="moon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFBEB"/>
+      <stop offset="1" stop-color="#FCD34D"/>
+    </linearGradient>
+    <mask id="crescent">
+      <rect width="1024" height="1024" fill="black"/>
+      <circle cx="430" cy="530" r="270" fill="white"/>
+      <circle cx="565" cy="440" r="235" fill="black"/>
+    </mask>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#sheen)"/>
+
+  <!-- stars -->
+  <circle cx="745" cy="250" r="9" fill="#E0E7FF" opacity="0.9"/>
+  <circle cx="815" cy="330" r="6" fill="#E0E7FF" opacity="0.7"/>
+  <circle cx="660" cy="205" r="5" fill="#E0E7FF" opacity="0.6"/>
+
+  <!-- moon with a soft glow -->
+  <rect width="1024" height="1024" fill="#FCD34D" mask="url(#crescent)" filter="url(#glow)" opacity="0.45"/>
+  <rect width="1024" height="1024" fill="url(#moon)" mask="url(#crescent)"/>
+
+  <!-- request → (green) and ← response (amber), resting in the crescent -->
+  <g stroke-linecap="round" stroke-linejoin="round" fill="none" stroke-width="44">
+    <path d="M560 440 H800 M735 375 L800 440 L735 505" stroke="#4ADE80"/>
+    <path d="M800 590 H560 M625 525 L560 590 L625 655" stroke="#F8FAFC"/>
+  </g>
+</svg>
