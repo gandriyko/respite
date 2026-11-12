@@ -79,6 +79,17 @@ async fn bodies_auth_graphql_redirect() {
     assert!(dir.path().join("out/moved.txt").exists());
 }
 
+#[test]
+fn literal_variable_in_url_is_named() {
+    // The GUI sends an undefined variable as written (an override equal to `{{name}}`).
+    let file = http_syntax::parse("GET {{host}}/a\nX-Note: {{host}}\n");
+    let path = Path::new("/tmp/api.http");
+    let (env, overrides) = (HashMap::new(), HashMap::from([("host".to_string(), "{{host}}".to_string())]));
+    let cx = Context { path, file: &file, env: &env, overrides: &overrides };
+    let err = Executor::default().prepare(&cx, 0).unwrap_err().to_string();
+    assert!(err.contains("the URL has {{host}}, which is not defined"), "{err}");
+}
+
 #[tokio::test]
 async fn redirect_chain_recorded() {
     let server = MockServer::start().await;

@@ -292,6 +292,16 @@ impl Executor {
 
         let mut method = req.method.clone();
         let mut url = r(&req.url)?;
+        // An undefined variable sent as written is fine in a header or body, never in the URL:
+        // say which one instead of letting the URL parser fail on `{{`.
+        if let Some(open) = url.find("{{")
+            && let Some(len) = url[open..].find("}}")
+        {
+            let var = &url[open..open + len + 2];
+            return Err(Error::BadRequest(format!(
+                "the URL has {var}, which is not defined: add it to the file or the selected environment (an env file with invalid JSON is skipped)"
+            )));
+        }
         let mut headers =
             req.headers.iter().map(|h| Ok((r(&h.name)?, r(&h.value)?))).collect::<Result<Vec<_>, ResolveError>>()?;
 

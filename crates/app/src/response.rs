@@ -6,7 +6,7 @@ use std::{fmt::Write as _, path::Path, sync::Arc};
 
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     diff::{Diff, DiffFile, DiffMode, DiffState},
     input::{Editor, Input},
@@ -222,7 +222,16 @@ pub fn diff(prev: &[u8], cur: &[u8]) -> String {
             + "\n"
     };
     let (a, b) = (show(prev), show(cur));
-    similar::TextDiff::from_lines(&a, &b).unified_diff().context_radius(3).header("previous", "current").to_string()
+    // Whole bodies as context: the view folds unchanged lines itself and can unfold them all.
+    similar::TextDiff::from_lines(&a, &b).unified_diff().context_radius(usize::MAX / 2).header("previous", "current").to_string()
+}
+
+/// History time (RFC 3339, UTC) in local time: `15:17:01` today, else `Nov 11 15:17`.
+fn run_time(time: &str) -> String {
+    let Ok(t) = time.parse::<jiff::Timestamp>() else { return String::new() };
+    let tz = jiff::tz::TimeZone::system();
+    let (z, now) = (t.to_zoned(tz.clone()), jiff::Timestamp::now().to_zoned(tz));
+    if z.date() == now.date() { z.strftime("%H:%M:%S").to_string() } else { z.strftime("%b %-d %H:%M").to_string() }
 }
 
 /// A file name for Save: the URL's last segment when it has an extension, else by type.
@@ -348,11 +357,32 @@ impl Respite {
                 return;
             }
         };
-        let state = cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split));
-        let title = format!("Body: {} → {}", prev.time.get(..19).unwrap_or(&prev.time).replace('T', " "), "this run");
+        // Highlighted like the Body tab: the patch's file names say nothing about the type.
+        let lang = match body_view(&ex.response, false, "", &Limits { format: usize::MAX, preview: usize::MAX }) {
+            BodyView::Text(lang, _) if lang != "text" => Some(lang),
+            _ => None,
+        };
+        let files: Vec<DiffFile> = files.into_iter().map(|f| if let Some(l) = lang { f.with_language(l) } else { f }).collect();
+        // Unchanged lines fold to 3 around each change; the toggle unfolds the whole body.
+        let state = cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split).with_context_lines(Some(3)));
+        let whole = std::rc::Rc::new(std::cell::Cell::new(false));
+        let title = format!("Body: {} → this run", run_time(&prev.time));
         window.open_dialog(cx, move |dialog, window, _| {
             let h = window.viewport_size().height * 0.75;
-            dialog.title(title.clone()).w(px(1100.)).child(div().h(h).child(Diff::new(&state)))
+            let (state_t, whole_t) = (state.clone(), whole.clone());
+            let toggle = Button::new("diff-whole")
+                .label(if whole.get() { "Changes only" } else { "Whole body" })
+                .ghost()
+                .xsmall()
+                .on_click(move |_, window, cx| {
+                    whole_t.set(!whole_t.get());
+                    state_t.update(cx, |s, cx| if whole_t.get() { s.expand_unchanged(cx) } else { s.collapse_unchanged(cx) });
+                    window.refresh();
+                });
+            dialog
+                .title(title.clone())
+                .w(px(1100.))
+                .child(v_flex().gap_2().child(div().flex().justify_end().child(toggle)).child(div().h(h).child(Diff::new(&state))))
         });
     }
 
@@ -462,41 +492,21 @@ impl Respite {
                     .child(div().text_xs().text_color(muted).child(format!("{} ms · {} · {}", r.total.as_millis(), size_label(r.body.len()), r.http_version)))
             }
         };
-        // Runs ‹ i/N ›, Copy, Save, Diff, Pin — for a received response.
-        let actions = match &status {
-            Some(Status::Done(ex)) if !self.show_history => {
-                let small = |id: &'static str, label: &'static str, tip: &'static str| Button::new(id).label(label).ghost().xsmall().tooltip(tip);
-                let pos = self.run_position(ex);
-                let nav = pos.filter(|(_, n)| *n > 1).map(|(i, n)| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(small("run-older", "‹", "Older run").disabled(i + 1 >= n).on_click(cx.listener(|this, _, window, cx| this.step_run(true, window, cx))))
-                        .child(div().text_xs().text_color(muted).child(format!("{}/{n}", n - i)))
-                        .child(small("run-newer", "›", "Newer run").disabled(i == 0).on_click(cx.listener(|this, _, window, cx| this.step_run(false, window, cx))))
-                });
-                let has_prev = pos.is_some_and(|(i, n)| i + 1 < n);
-                let (a, b, c) = (ex.clone(), ex.clone(), ex.clone());
-                let pinned = self.pinned.is_some();
-                let current = shown.clone();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_0p5()
-                    .children(nav)
-                    .child(small("copy-body", "Copy", "Copy the body").on_click(cx.listener(move |this, _, window, cx| this.copy_body(&a, window, cx))))
-                    .child(small("save-body", "Save", "Save the body to a file").on_click(cx.listener(move |this, _, window, cx| this.save_body(&b, window, cx))))
-                    .when(has_prev, |el| {
-                        el.child(small("diff-body", "Diff", "Compare with the previous run").on_click(cx.listener(move |this, _, window, cx| this.compare(&c, window, cx))))
-                    })
-                    .child(small("pin", "Pin", "Keep this response; stop following the cursor").selected(pinned).on_click(cx.listener(move |this, _, _, cx| {
-                        this.pinned = if this.pinned.is_some() { None } else { current.clone() };
-                        cx.notify();
-                    })))
-                    .into_any_element()
-            }
-            _ => div().into_any_element(),
-        };
+        let icon = |svg: &'static [u8]| Icon::default().data(svg);
+        // Pin: keep this response on screen; next to Run because both are about the panel itself.
+        let pin = (matches!(status, Some(Status::Done(_))) && !self.show_history).then(|| {
+            let (pinned, current) = (self.pinned.is_some(), shown.clone());
+            Button::new("pin")
+                .icon(icon(include_bytes!("../assets/pin.svg")))
+                .ghost()
+                .small()
+                .selected(pinned)
+                .tooltip(if pinned { "Pinned — click to follow the cursor again" } else { "Pin: keep this response while the cursor moves" })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pinned = if this.pinned.is_some() { None } else { current.clone() };
+                    cx.notify();
+                }))
+        });
         // Re-run / stop the request under the cursor; not on the History page or while pinned.
         let running = matches!(status, Some(Status::Running));
         let run = (!self.show_history && self.pinned.is_none() && shown.is_some()).then(|| {
@@ -510,17 +520,95 @@ impl Respite {
                     if running { this.cancel(ix, line, cx) } else { this.send(ix, vec![line], window, cx) }
                 }))
         });
-        let head = div()
+        // This request's earlier runs: ‹ Run 3 of 5 · 15:17:01 › and Compare with the previous one.
+        let history = match &status {
+            Some(Status::Done(ex)) if !self.show_history => self.run_position(ex).filter(|(_, n)| *n > 1).map(|(i, n)| {
+                let when = self.runs.as_ref().and_then(|(_, e)| e.get(i)).map(|e| run_time(&e.time)).unwrap_or_default();
+                let step = |id: &'static str, name: IconName, tip: &'static str, enabled: bool, older: bool| {
+                    Button::new(id).icon(name).ghost().xsmall().tooltip(tip).disabled(!enabled).on_click(cx.listener(move |this, _, window, cx| this.step_run(older, window, cx)))
+                };
+                let c = ex.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(step("run-older", IconName::ChevronLeft, "Older run", i + 1 < n, true))
+                    .child(format!("Run {} of {n} · {when}", n - i))
+                    .child(step("run-newer", IconName::ChevronRight, "Newer run", i > 0, false))
+                    .when(i + 1 < n, |el| {
+                        el.child(
+                            Button::new("diff-body")
+                                .icon(icon(include_bytes!("../assets/git-compare.svg")))
+                                .label("Compare with previous")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, window, cx| this.compare(&c, window, cx))),
+                        )
+                    })
+            }),
+            _ => None,
+        };
+        let body_tab = self.tab == 0;
+        let view = if body_tab { &self.resp_body } else { &self.resp_meta };
+        // What can be done with the response, next to its status: view options, then
+        // copy / save / search.
+        let tools = match &status {
+            Some(Status::Done(ex)) => {
+                // Same panel as Cmd+F inside the response (find, next/prev, match case, regex).
+                let target = view.clone();
+                let search = Button::new("response-search").icon(IconName::Search).ghost().xsmall().tooltip("Search response (Cmd+F)").on_click(move |_, window, cx| {
+                    target.update(cx, |s, cx| {
+                        s.focus(window, cx);
+                        s.open_search(false, cx);
+                    })
+                });
+                let wrap_on = self.settings.settings.response.soft_wrap;
+                let wrap = Button::new("response-wrap")
+                    .label("Wrap")
+                    .ghost()
+                    .xsmall()
+                    .selected(wrap_on)
+                    .tooltip(if wrap_on { "Long lines wrap — click to scroll them instead" } else { "Long lines scroll — click to wrap them" })
+                    .on_click(cx.listener(move |this, _, window, cx| this.set("response.soft_wrap", (!wrap_on).into(), window, cx)));
+                let raw = (body_tab && self.body_other.is_none()).then(|| {
+                    Button::new("response-raw")
+                        .label("Raw")
+                        .ghost()
+                        .xsmall()
+                        .selected(self.raw)
+                        .tooltip(if self.raw { "As received — click to pretty-print" } else { "Pretty-printed — click to show as received" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.raw = !this.raw;
+                            cx.notify();
+                        }))
+                });
+                let (a, b) = (ex.clone(), ex.clone());
+                let copy = Button::new("copy-body")
+                    .icon(IconName::Copy)
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Copy the body")
+                    .on_click(cx.listener(move |this, _, window, cx| this.copy_body(&a, window, cx)));
+                let save = Button::new("save-body")
+                    .icon(icon(include_bytes!("../assets/download.svg")))
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Save the body to a file")
+                    .on_click(cx.listener(move |this, _, window, cx| this.save_body(&b, window, cx)));
+                Some(div().flex().items_center().gap_1().children(raw).child(wrap).child(div().w_2()).child(copy).child(save).child(search))
+            }
+            _ => None,
+        };
+        // Three groups, apart by spacing only: what was sent, what came back, its earlier runs.
+        let head = v_flex()
             .flex_none()
-            .flex()
-            .flex_col()
             .gap_1()
-            .pb_2()
-            .mb_1()
-            .border_b_1()
-            .border_color(t.border)
-            .child(div().h(px(28.)).flex().items_center().gap_2().child(title).children(run))
-            .child(div().h(px(22.)).flex().items_center().justify_between().gap_2().child(left).child(actions));
+            .pb_3()
+            .child(div().h(px(28.)).flex().items_center().gap_1().child(title).children(pin).children(run))
+            .child(div().h(px(24.)).flex().items_center().justify_between().gap_2().child(left).children(tools))
+            .children(history);
         let panel = div().size_full().px_3().pt_2().flex().flex_col().gap_1().bg(t.background).child(head);
         let ex = match status {
             Some(Status::Done(ex)) => ex,
@@ -529,46 +617,12 @@ impl Respite {
         };
 
         let deps = (!ex.dependencies.is_empty()).then(|| div().text_xs().text_color(muted).child(format!("Ran first: {}", ex.dependencies.join(", "))));
-        let body_tab = self.tab == 0;
-        let view = if body_tab { &self.resp_body } else { &self.resp_meta };
-        // Same panel as Cmd+F inside the response (find, next/prev, match case, regex).
-        let target = view.clone();
-        let search = Button::new("response-search").icon(IconName::Search).ghost().xsmall().tooltip("Search response (Cmd+F)").on_click(move |_, window, cx| {
-            target.update(cx, |s, cx| {
-                s.focus(window, cx);
-                s.open_search(false, cx);
-            })
-        });
-        let wrap_on = self.settings.settings.response.soft_wrap;
-        let wrap = Button::new("response-wrap")
-            .label("Wrap")
-            .ghost()
-            .xsmall()
-            .selected(wrap_on)
-            .tooltip(if wrap_on { "Long lines wrap — click to scroll them instead" } else { "Long lines scroll — click to wrap them" })
-            .on_click(cx.listener(move |this, _, window, cx| this.set("response.soft_wrap", (!wrap_on).into(), window, cx)));
-        let raw = (body_tab && self.body_other.is_none()).then(|| {
-            Button::new("response-raw")
-                .label("Raw")
-                .ghost()
-                .xsmall()
-                .selected(self.raw)
-                .tooltip(if self.raw { "As received — click to pretty-print" } else { "Pretty-printed — click to show as received" })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.raw = !this.raw;
-                    cx.notify();
-                }))
-        });
+        // Pill tabs: no full-width rule under them; the row is theirs alone.
         let tabs = TABS.iter().fold(
-            TabBar::new("response-tabs")
-                .underline()
-                .small()
-                .selected_index(self.tab)
-                .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                    this.tab = *ix;
-                    cx.notify();
-                }))
-                .suffix(div().flex().items_center().gap_1().children(raw).child(wrap).child(search)),
+            TabBar::new("response-tabs").pill().small().selected_index(self.tab).on_click(cx.listener(|this, ix: &usize, _, cx| {
+                this.tab = *ix;
+                cx.notify();
+            })),
             |bar, t| bar.child(Tab::new().label(*t)),
         );
 
