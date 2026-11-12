@@ -46,17 +46,23 @@ pub struct Doc {
     /// `false` for env files (`respite*.json`): plain JSON, no requests, no ▶.
     pub http: bool,
     fold_counts: FoldCounts,
+    /// Shared with the editor's completion / hover / definition providers.
+    lang: crate::lang::Shared,
     pub _subs: Vec<Subscription>,
 }
 
 /// Body fold start row (0-based) → lines it hides; shared with the editor's fold placeholder.
 pub type FoldCounts = std::rc::Rc<std::cell::RefCell<HashMap<usize, usize>>>;
 
+/// A file's environment: the selected one's variables, every environment name, and the
+/// variables of all environments together.
+pub type EnvView = (HashMap<String, Variable>, Vec<String>, HashMap<String, Variable>);
+
 impl Doc {
     pub fn new(
         path: PathBuf,
         editor: Entity<EditorState>,
-        (env, env_names): (HashMap<String, Variable>, Vec<String>),
+        (env, env_names, all): EnvView,
         exec: Arc<Executor>,
         subs: Vec<Subscription>,
         fold_counts: FoldCounts,
@@ -64,11 +70,22 @@ impl Doc {
     ) -> Self {
         let block_bar = editor.update(cx, |s, cx| s.create_gutter_decorations_collection(vec![], cx));
         let http = !crate::workspace::is_env_file(&path);
+        let (path, env) = (Arc::new(path), Arc::new(env));
+        let lang = std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { path: path.clone(), env: env.clone(), all: Arc::new(all) }));
+        if http {
+            let provider = std::rc::Rc::new(crate::lang::Lang(lang.clone()));
+            editor.update(cx, |s, _| {
+                let lsp = s.lsp_mut();
+                lsp.completion_provider = Some(provider.clone());
+                lsp.hover_provider = Some(provider.clone());
+                lsp.definition_provider = Some(provider);
+            });
+        }
         let mut doc = Self {
-            path: Arc::new(path),
+            path,
             editor,
             file: Arc::default(),
-            env: Arc::new(env),
+            env,
             env_names,
             exec,
             active: None,
@@ -79,6 +96,7 @@ impl Doc {
             dirty: false,
             http,
             fold_counts,
+            lang,
             _subs: subs,
         };
         doc.reparse(cx);
@@ -120,7 +138,36 @@ impl Doc {
         // A fold shows its first and last line, so it hides the ones between.
         *self.fold_counts.borrow_mut() =
             crate::highlight::body_folds(&self.file).iter().map(|f| (f.start_line, f.end_line - f.start_line - 1)).collect();
+        self.publish_diagnostics(cx);
         self.sync_active(cx);
+    }
+
+    /// `respite check` findings as editor underlines. The editor drops them on every edit, so
+    /// this runs after each reparse (and after an environment switch).
+    fn publish_diagnostics(&self, cx: &mut App) {
+        let dir = self.path.parent().unwrap_or(std::path::Path::new("."));
+        let all = self.lang.borrow().all.clone();
+        let mut found = self.file.diagnostics.clone();
+        found.extend(http_env::check_vars(&self.file, &all, dir));
+        self.editor.update(cx, |s, cx| {
+            if let Some(set) = s.diagnostics_mut() {
+                set.clear();
+                set.extend(found.iter().map(crate::lang::diagnostic));
+                cx.notify();
+            }
+        });
+    }
+
+    /// After an environment switch: new values for run, hover and diagnostics.
+    pub fn set_env(&mut self, (env, env_names, all): EnvView, exec: Arc<Executor>, cx: &mut App) {
+        (self.env, self.env_names, self.exec) = (Arc::new(env), env_names, exec);
+        {
+            let mut lang = self.lang.borrow_mut();
+            (lang.env, lang.all) = (self.env.clone(), Arc::new(all));
+        }
+        if self.http {
+            self.publish_diagnostics(cx);
+        }
     }
 
     pub fn cursor_request(&self, cx: &App) -> Option<&Request> {

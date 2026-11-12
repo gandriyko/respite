@@ -112,6 +112,15 @@ impl Environments {
         names.into_iter().cloned().collect()
     }
 
+    /// Variables of every environment together (a name defined in any of them counts).
+    pub fn all_variables(&self) -> HashMap<String, Variable> {
+        let mut out = self.variables(None);
+        for name in self.names() {
+            out.extend(self.variables(Some(&name)));
+        }
+        out
+    }
+
     /// Merged variables: `$shared` from every file, then the `env` block from every file.
     /// Shallow merge by key; objects (e.g. `SSLConfiguration`) are not variables.
     // ponytail: SSLConfiguration deep merge comes with mTLS.
@@ -170,10 +179,11 @@ pub fn collections_dir() -> Option<PathBuf> {
 /// Undefined `{{variables}}`, unknown `{{name.response…}}` requests, cycles and bad `{{$…}}`,
 /// checked against the union of all environments (a variable defined in any of them is fine).
 pub fn check(file: &HttpFile, envs: &Environments, dir: &Path) -> Vec<Diagnostic> {
-    let mut env = envs.variables(None);
-    for name in envs.names() {
-        env.extend(envs.variables(Some(&name)));
-    }
+    check_vars(file, &envs.all_variables(), dir)
+}
+
+/// [`check`] against already merged variables ([`Environments::all_variables`]).
+pub fn check_vars(file: &HttpFile, env: &HashMap<String, Variable>, dir: &Path) -> Vec<Diagnostic> {
     let names: HashSet<&str> = file.requests.iter().filter_map(|r| r.name.as_deref()).collect();
     let refs = |name: &str, _: &str| names.contains(name).then(String::new);
     let mut out: Vec<Diagnostic> = vec![];
@@ -186,7 +196,7 @@ pub fn check(file: &HttpFile, envs: &Environments, dir: &Path) -> Vec<Diagnostic
             .filter_map(|d| d.value.as_deref()?.split_whitespace().next())
             .map(|v| (v.to_string(), String::new()))
             .collect();
-        let resolver = Resolver { overrides: &overrides, file_vars: &file.variables, env: &env, dir };
+        let resolver = Resolver { overrides: &overrides, file_vars: &file.variables, env, dir };
         let body = r.body.iter().flat_map(|b| b.text.lines().enumerate().map(move |(i, l)| (b.line + i, l)));
         let pieces = std::iter::once((r.request_line, r.url.as_str()))
             .chain(r.headers.iter().flat_map(|h| [(h.line, h.name.as_str()), (h.line, h.value.as_str())]))

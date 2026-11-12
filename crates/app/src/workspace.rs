@@ -84,6 +84,12 @@ pub fn last_file(base: Option<&Path>, root: &Path) -> Option<(PathBuf, u32, u32)
     path.is_file().then(|| (path, pos("line"), pos("column")))
 }
 
+/// File last selected in any project: a plain launch (no file or folder given) reopens it.
+pub fn last_opened(base: Option<&Path>) -> Option<(PathBuf, u32, u32)> {
+    let key = read_state(base?)["last"].as_str()?.to_string();
+    last_file(base, Path::new(&key))
+}
+
 pub fn save_last_file(base: Option<&Path>, root: &Path, path: &Path, line: u32, column: u32) {
     let Some(base) = base else { return };
     let mut state = read_state(base);
@@ -91,6 +97,7 @@ pub fn save_last_file(base: Option<&Path>, root: &Path, path: &Path, line: u32, 
         state["files"] = serde_json::json!({});
     }
     state["files"][root.to_string_lossy().as_ref()] = serde_json::json!({ "path": path, "line": line, "column": column });
+    state["last"] = root.to_string_lossy().into();
     write_state(base, &state);
 }
 
@@ -99,7 +106,7 @@ pub fn load_env(base: Option<&Path>, root: &Path) -> Option<String> {
     read_state(base?)["env"][root.to_string_lossy().as_ref()].as_str().map(str::to_string)
 }
 
-/// Remember the environment for `root`; `None` = "No environment".
+/// Remember the environment for `root`; `None` = "Shared" (no named environment).
 pub fn save_env(base: Option<&Path>, root: &Path, env: Option<&str>) {
     let Some(base) = base else { return };
     let mut state = read_state(base);
@@ -181,6 +188,7 @@ mod tests {
         save_last_file(Some(base.path()), other.path(), &f, 12, 4);
         assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod")); // same file, other keys kept
         assert_eq!(last_file(Some(base.path()), other.path()), Some((f.clone(), 12, 4)));
+        assert_eq!(last_opened(Some(base.path())), Some((f.clone(), 12, 4))); // a plain launch reopens it
         std::fs::remove_file(&f).unwrap();
         assert_eq!(last_file(Some(base.path()), other.path()), None); // deleted file is not reopened
 

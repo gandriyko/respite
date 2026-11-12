@@ -3,9 +3,13 @@
 //! ▶ and the status inlay are overlays positioned from the editor's last layout
 //! (gpui-component has no custom gutter elements or inlay hints).
 
+mod attach;
 mod doc;
 mod highlight;
 mod history_page;
+mod lang;
+mod palette;
+mod runs;
 mod settings_page;
 mod sidebar;
 mod themes;
@@ -21,7 +25,7 @@ use std::{
 use doc::{Doc, Status};
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, Root, Theme, ThemeMode, WindowExt as _, h_resizable,
+    ActiveTheme as _, Icon, Root, Theme, ThemeMode, WindowExt as _, h_flex, h_resizable,
     input::{Editor, EditorState, InputEvent, InputState, Position, RopeExt as _},
     IconName, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -37,13 +41,25 @@ actions!(
     respite,
     [
         RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Import, Quit,
-        NextEnvironment, ToggleHistory
+        NextEnvironment, ToggleHistory, InsertFile, RunAll, RunSelected, RepeatLast, CancelRequests, GoToFile, GoToRequest,
+        CommandPalette, PrevRequest, NextRequest
     ]
 );
 
 const SAMPLE: &str = include_str!("../sample.http");
 
 /// Starting point for "Create …" in the environment menu (only the Respite format is offered).
+/// The file to edit for environment `name` (`None` = Shared, `respite.json`): public before
+/// private, the one deepest in the chain (closest to the `.http` file, it wins the merge).
+fn env_file(paths: &[PathBuf], name: Option<&str>) -> Option<PathBuf> {
+    let stem = name.map_or_else(|| "respite".to_string(), |n| format!("respite-{n}"));
+    [format!("{stem}.json"), format!("{stem}.private.json")].iter().find_map(|f| {
+        paths.iter().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == *f)).max_by_key(|p| p.components().count()).cloned()
+    })
+}
+
+/// The env picker's "no named environment" entry: only `respite.json` (shared values) applies.
+const SHARED: &str = "Shared";
 const RESPITE_TEMPLATE: &str = "{\n  \"baseUrl\": \"http://localhost:8080\"\n}\n";
 const TABS: [&str; 3] = ["Body", "Headers", "Request"];
 
@@ -77,6 +93,12 @@ struct Respite {
     sidebar: bool,
     /// A dirty tab whose close was requested once; the next close discards it.
     close_armed: Option<PathBuf>,
+    /// What Cmd+Alt+L sends again: the file and its request lines.
+    last_run: Option<(PathBuf, Vec<usize>)>,
+    /// The running "run all / selected" sequence; dropping it stops the rest.
+    batch: Option<Task<()>>,
+    /// Re-renders the open search dialog (Cmd+P …) as its query changes.
+    picker_sub: Option<Subscription>,
     /// Read-only editors (selectable, Cmd+F, folding): body with tree-sitter highlighting,
     /// headers/request with the `.http` highlighter.
     resp_body: Entity<EditorState>,
@@ -128,6 +150,18 @@ impl Respite {
             window.push_notification(format!("Settings: {e}"), cx);
         }
         let history_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: method, URL, name, file, status"));
+        // The close button: with unsaved files, ask (as Quit does) instead of closing.
+        let view = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            view.update(cx, |this, cx| {
+                let dirty = this.docs.iter().any(|d| d.dirty);
+                if dirty {
+                    this.confirm_quit(window, cx);
+                }
+                !dirty
+            })
+            .unwrap_or(true)
+        });
         let _subs = vec![
             cx.subscribe_in(&history_filter, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
@@ -169,13 +203,21 @@ impl Respite {
             rows: vec![],
             sidebar: true,
             close_armed: None,
+            last_run: None,
+            batch: None,
+            picker_sub: None,
             resp_body: readonly(false, window, cx),
             resp_meta: readonly(true, window, cx),
             tab: 0,
             shown: None,
         };
-        // An explicit file wins; else the file (and cursor) last used in this project; else the first one.
-        let last = workspace::last_file(Store::default_base().as_deref(), &root);
+        // An explicit file wins; else the file (and cursor) last used in this project — or in any
+        // project, on a plain launch (no folder given); else the first one.
+        let base = Store::default_base();
+        let last = match root == workspace::collections_dir() {
+            true => workspace::last_opened(base.as_deref()),
+            false => workspace::last_file(base.as_deref(), &root),
+        };
         match (open, last, first) {
             (Some(path), _, _) => {
                 this.open(path, None, window, cx);
@@ -275,6 +317,7 @@ impl Respite {
                 let http = !workspace::is_env_file(&path);
                 // Folded row → hidden lines, kept current by the doc; read by the fold placeholder.
                 let fold_counts = doc::FoldCounts::default();
+                let weak = cx.entity().downgrade();
                 let editor = cx.new(|cx| {
                     let mut s = EditorState::new(window, cx)
                         .language(if http { "http" } else { "json" })
@@ -283,6 +326,14 @@ impl Respite {
                         .soft_wrap(soft_wrap)
                         .default_value(text);
                     if http {
+                        // Go to definition in another file (an env file): open it there. Same-file
+                        // targets return `false`, so the editor selects them itself.
+                        let (this, doc_path) = (weak.clone(), path.clone());
+                        s.lsp_mut().show_document = Some(Rc::new(move |p, window, cx| {
+                            let Some(target) = lang::uri_path(&p.uri).filter(|t| *t != doc_path) else { return false };
+                            let line = p.selection.map_or(0, |r| r.start.line as usize) + 1;
+                            this.update(cx, |this, cx| this.go_to(target, line, false, window, cx)).is_ok()
+                        }));
                         s.set_highlighter_factory(Rc::new(|_: &str| Some(Box::new(highlight::HttpHighlighter::default()) as _)), cx);
                         s.set_gutter_decorations_width(px(3.), cx);
                         // After a folded line (e.g. a long body's preview); clicking it unfolds.
@@ -340,6 +391,8 @@ impl Respite {
         };
         self.current = Some(ix);
         self.expanded.insert(path);
+        // Now, not only on quit: closing the window or killing the process skips the quit hook.
+        self.remember_position(cx);
         self.docs[ix].editor.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
         Some(ix)
@@ -357,15 +410,56 @@ impl Respite {
     fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.docs.len() {
             self.current = Some(ix);
+            self.remember_position(cx);
             self.docs[ix].editor.update(cx, |s, cx| s.focus(window, cx));
             cx.notify();
         }
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.current.map(|ix| &mut self.docs[ix]) else { return };
+        if let Some(ix) = self.current {
+            self.save_doc(ix, window, cx);
+        }
+    }
+
+    /// Ask before quitting with unsaved files: save them all, discard them, or stay.
+    /// Cmd+Q, the Quit menu item and the window's close button all come here.
+    fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty: Vec<String> = self.docs.iter().filter(|d| d.dirty).map(|d| d.name()).collect();
+        if dirty.is_empty() {
+            cx.quit();
+            return;
+        }
+        let message = match dirty.len() {
+            1 => format!("Save changes to {} before quitting?", dirty[0]),
+            n => format!("Save changes to {n} files before quitting?"),
+        };
+        let detail = (dirty.len() > 1).then(|| dirty.join("\n"));
+        let answer = window.prompt(PromptLevel::Warning, &message, detail.as_deref(), &["Save All", "Don't Save", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = answer.await else { return };
+            this.update_in(cx, |this, window, cx| match answer {
+                0 => {
+                    let all_saved = (0..this.docs.len()).filter(|&ix| this.docs[ix].dirty).collect::<Vec<_>>().into_iter().all(|ix| this.save_doc(ix, window, cx));
+                    // A failed save (shown as a notification) keeps the app open.
+                    if all_saved {
+                        cx.quit();
+                    }
+                }
+                1 => cx.quit(),
+                _ => {}
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Write tab `ix` to disk; `false` (with a notification) when that fails.
+    fn save_doc(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(d) = self.docs.get_mut(ix) else { return false };
         let text = d.editor.read(cx).value();
-        match std::fs::write(&*d.path, text.as_bytes()) {
+        let saved = std::fs::write(&*d.path, text.as_bytes());
+        match saved {
             Ok(()) => {
                 d.dirty = false;
                 let path = (*d.path).clone();
@@ -380,10 +474,15 @@ impl Respite {
                         window.push_notification(format!("{} is not valid JSON, so it is skipped: {e}", p.display()), cx);
                     }
                 }
+                cx.notify();
+                true
             }
-            Err(e) => window.push_notification(format!("Save failed: {}: {e}", d.path.display()), cx),
+            Err(e) => {
+                window.push_notification(format!("Save failed: {}: {e}", d.path.display()), cx);
+                cx.notify();
+                false
+            }
         }
-        cx.notify();
     }
 
     /// Current file + cursor, per project (`state.json` → `files`); reopened on next launch.
@@ -430,18 +529,25 @@ impl Respite {
         });
         center_line(self.docs[ix].editor.clone(), line.saturating_sub(1), true, window, cx);
         if run {
-            self.run(ix, line, cx);
+            self.send(ix, vec![line], window, cx);
         }
     }
 
-    fn run(&mut self, ix: usize, request_line: usize, cx: &mut Context<Self>) {
+    /// Run one request now (questions were asked by `send`). `overrides`: `@prompt` values and
+    /// literal undefined variables; `done` fires when it finishes (dropped if cancelled).
+    fn start(
+        &mut self,
+        ix: usize,
+        request_line: usize,
+        overrides: HashMap<String, String>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+        cx: &mut Context<Self>,
+    ) {
         let d = &mut self.docs[ix];
         let Some(index) = d.file.requests.iter().position(|r| r.request_line == request_line) else { return };
         let (exec, file, path, env) = (d.exec.clone(), d.file.clone(), d.path.clone(), d.env.clone());
         let key = path.clone();
         let handle = RT.spawn(async move {
-            // ponytail: no @prompt dialog yet, so prompt variables come out undefined.
-            let overrides = HashMap::new();
             let cx = http_exec::Context { path: &path, file: &file, env: &env, overrides: &overrides };
             exec.run(&cx, index).await
         });
@@ -469,6 +575,9 @@ impl Respite {
                 cx.notify();
             })
             .ok();
+            if let Some(done) = done {
+                done.send(()).ok();
+            }
         });
         d.tasks.insert(request_line, (id, task));
         cx.notify();
@@ -530,6 +639,25 @@ impl Respite {
         true
     }
 
+    /// Cmd+I: pick files in the system dialog and attach each to the request under the cursor
+    /// (a multipart part, or a raw `< file` body — see `attach`).
+    fn insert_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.doc().filter(|d| d.http) else { return };
+        let (editor, dir) = (d.editor.clone(), d.path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Insert".into()) });
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(files))) = picked.await else { return };
+            editor
+                .update_in(cx, |s, window, cx| {
+                    if !attach::attach_files(s, &files, &dir, window, cx) {
+                        window.push_notification("Put the cursor in a request to attach a file", cx);
+                    }
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     /// Cmd+Shift+C: variables substituted; falls back to the raw block when a referenced
     /// response is not cached yet.
     fn copy_as_curl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -560,9 +688,9 @@ impl Respite {
     // ---- center ----
 
     /// Merged variables for the selected environment, plus every environment name the file can see.
-    fn env_for(&self, path: &Path, root: &Path) -> (HashMap<String, http_env::Variable>, Vec<String>) {
+    fn env_for(&self, path: &Path, root: &Path) -> doc::EnvView {
         let envs = Environments::load(path, root, &self.settings.settings.env_files(root));
-        (envs.variables(self.env_name.as_deref()), envs.names())
+        (envs.variables(self.env_name.as_deref()), envs.names(), envs.all_variables())
     }
 
     /// Switch every open file to `name` (`None` = no environment) and remember it for the
@@ -577,15 +705,14 @@ impl Respite {
         for ix in 0..self.docs.len() {
             let path = self.docs[ix].path.clone();
             let root = self.root_of(&path);
-            let (env, names) = self.env_for(&path, &root);
+            let env = self.env_for(&path, &root);
             let exec = self.executor(&root);
-            let d = &mut self.docs[ix];
-            (d.env, d.env_names, d.exec) = (Arc::new(env), names, exec);
+            self.docs[ix].set_env(env, exec, cx);
         }
         cx.notify();
     }
 
-    /// Cmd+Alt+E: No environment → first → … → last → No environment.
+    /// Cmd+Alt+E: Shared → first → … → last → Shared.
     fn next_env(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let names = self.doc().map(|d| d.env_names.clone()).unwrap_or_default();
         let next = match self.env_name.as_ref().and_then(|n| names.iter().position(|x| x == n)) {
@@ -593,7 +720,7 @@ impl Respite {
             Some(i) => names.get(i + 1).cloned(),
         };
         self.select_env(next, cx);
-        let label = self.env_name.clone().unwrap_or_else(|| "No environment".into());
+        let label = self.env_name.clone().unwrap_or_else(|| SHARED.into());
         window.push_notification(format!("Environment: {label}"), cx);
     }
 
@@ -602,7 +729,7 @@ impl Respite {
         let names = self.doc().map(|d| d.env_names.clone()).unwrap_or_default();
         let current = self.env_name.clone();
         let prod = current.as_deref().is_some_and(|n| self.settings.settings.env.is_prod(n));
-        let label = current.clone().unwrap_or_else(|| "No environment".into());
+        let label = current.clone().unwrap_or_else(|| SHARED.into());
         let view = cx.entity().downgrade();
         Button::new("env-picker")
             .icon(IconName::Globe)
@@ -637,39 +764,85 @@ impl Respite {
                         .ok();
                     }
                 };
-                let none = PopupMenuItem::new("No environment").checked(current.is_none()).on_click(pick(None));
-                let mut menu = menu.item(none).separator();
-                if names.is_empty() {
-                    menu = menu.label("No environments defined");
-                }
-                menu = names.iter().fold(menu, |menu, n| {
-                    menu.item(PopupMenuItem::new(n.clone()).checked(current.as_deref() == Some(n)).on_click(pick(Some(n.clone()))))
-                });
-                // Edit / create env files of the current file's chain (read only when the menu opens).
-                let Some((path, root)) = view.upgrade().and_then(|v| {
+                // Env files of the current file's chain (read only when the menu opens).
+                let chain = view.upgrade().and_then(|v| {
                     let this = v.read(cx);
                     this.doc().map(|d| ((*d.path).clone(), this.root_of(&d.path)))
-                }) else {
-                    return menu;
+                });
+                let files = chain.as_ref().map(|(path, root)| Environments::load(path, root, &[]).paths()).unwrap_or_default();
+                // A pencil after each environment opens its file. It runs before the row's own
+                // click (inner first), which then closes the menu without switching environments.
+                let editing = Rc::new(std::cell::Cell::new(false));
+                let row = |label: String, name: Option<String>| {
+                    // Shared always gets a pencil: without `respite.json` it creates one at the root.
+                    let file = env_file(&files, name.as_deref())
+                        .or_else(|| chain.as_ref().filter(|_| name.is_none()).map(|(_, root)| root.join("respite.json")));
+                    let (view, editing, on_row) = (view.clone(), editing.clone(), pick(name.clone()));
+                    let editing_row = editing.clone();
+                    PopupMenuItem::element(move |_, cx| {
+                        let (view, editing, file) = (view.clone(), editing.clone(), file.clone());
+                        h_flex().w_full().justify_between().gap_3().child(label.clone()).when_some(file, |el, file| {
+                            el.child(
+                                div()
+                                    .id("edit-env")
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .hover(|s| s.text_color(cx.theme().foreground))
+                                    // Lucide's pencil, embedded: the bundled assets only hold `IconName` icons.
+                                    .child(Icon::default().data(include_bytes!("../assets/pencil.svg")).size(cx.theme().font_size * 0.9))
+                                    .on_click(move |_, window, cx| {
+                                        editing.set(true);
+                                        let created = !file.exists();
+                                        if created && let Err(e) = std::fs::write(&file, RESPITE_TEMPLATE) {
+                                            window.push_notification(format!("{}: {e}", file.display()), cx);
+                                            return;
+                                        }
+                                        view.update(cx, |this, cx| {
+                                            if created {
+                                                this.rescan_projects_of(&file);
+                                            }
+                                            this.open(file.clone(), None, window, cx);
+                                        })
+                                        .ok();
+                                    }),
+                            )
+                        })
+                    })
+                    .checked(current == name)
+                    .on_click(move |e, window, cx| {
+                        if !editing_row.replace(false) {
+                            on_row(e, window, cx);
+                        }
+                    })
                 };
+                let mut menu = menu.item(row(SHARED.into(), None)).separator();
+                if names.is_empty() {
+                    menu = menu.label("No other environments");
+                }
+                menu = names.iter().fold(menu, |menu, n| menu.item(row(n.clone(), Some(n.clone()))));
+                let Some((path, root)) = chain else { return menu };
                 menu = menu.separator();
-                for p in Environments::load(&path, &root, &[]).paths() {
+                for p in files {
                     let shown = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
                     menu = menu.item(PopupMenuItem::new(format!("Edit {shown}")).on_click(edit(p, None)));
                 }
                 // New files go to the project root (applies to every subfolder) or next to the
-                // file (only its folder and below); say which.
-                let name = format!("respite-{}.json", current.as_deref().unwrap_or("dev"));
+                // file (only its folder and below); say which. Only a new environment's file:
+                // `respite.json` comes from Shared's pencil. `dev` when on Shared.
+                let names = [format!("respite-{}.json", current.as_deref().unwrap_or("dev"))];
                 let root_name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
                 let here = path.parent().unwrap_or(&root).to_path_buf();
                 let dirs = if here == root { vec![root.clone()] } else { vec![root.clone(), here] };
-                for dir in dirs {
-                    let p = dir.join(&name);
-                    if !p.exists() {
-                        // `join("")` (the root itself) leaves a trailing `/`.
-                        let shown = Path::new(&root_name).join(dir.strip_prefix(&root).unwrap_or(&dir)).display().to_string();
-                        let shown = shown.trim_end_matches('/');
-                        menu = menu.item(PopupMenuItem::new(format!("Create {name} in {shown}/")).on_click(edit(p, Some(RESPITE_TEMPLATE))));
+                for name in &names {
+                    for dir in &dirs {
+                        let p = dir.join(name);
+                        if !p.exists() {
+                            // `join("")` (the root itself) leaves a trailing `/`.
+                            let shown = Path::new(&root_name).join(dir.strip_prefix(&root).unwrap_or(dir)).display().to_string();
+                            let shown = shown.trim_end_matches('/');
+                            menu = menu.item(PopupMenuItem::new(format!("Create {name} in {shown}/")).on_click(edit(p, Some(RESPITE_TEMPLATE))));
+                        }
                     }
                 }
                 menu
@@ -678,19 +851,31 @@ impl Respite {
     }
 
     fn tabs(&self, cx: &mut Context<Self>) -> TabBar {
-        let muted = cx.theme().muted_foreground;
+        let (muted, fg, hover_bg) = (cx.theme().muted_foreground, cx.theme().foreground, cx.theme().list_active);
+        // Sized from the interface font, so the close button keeps up with the tab label.
+        let fs = cx.theme().font_size;
         self.docs.iter().enumerate().fold(
             TabBar::new("docs")
                 .selected_index(self.current.unwrap_or(0))
                 .on_click(cx.listener(|this, ix: &usize, window, cx| this.select(*ix, window, cx)))
                 .suffix(div().px_2().flex().items_center().h_full().child(self.env_picker(cx))),
             |bar, (i, d)| {
+                // An icon, not a `×` glyph: the glyph sits small and low next to the label.
                 let close = div()
                     .id(("close", i))
-                    .px_1()
+                    .size(fs * 1.5)
+                    // Cancels the tab label's own 12 px right padding; the tab's 4 px gap stays.
+                    .ml(px(-12.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
                     .text_color(muted)
-                    .hover(|s| s.text_color(gpui::white()))
-                    .child(if d.dirty { "●" } else { "×" })
+                    .hover(move |s| s.text_color(fg).bg(hover_bg))
+                    .map(|el| match d.dirty {
+                        true => el.child(div().size(fs * 0.5).rounded_full().bg(muted)),
+                        false => el.child(Icon::new(IconName::Close).size(fs)),
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.close(i, window, cx);
@@ -715,7 +900,8 @@ impl Respite {
                 .child("Open a file from the sidebar"),
         };
         let tabs = (!self.docs.is_empty()).then(|| self.tabs(cx));
-        div().size_full().flex().flex_col().children(tabs).child(body).into_any_element()
+        let crumbs = self.breadcrumbs(cx);
+        div().size_full().flex().flex_col().children(tabs).children(crumbs).child(body).into_any_element()
     }
 
     /// ▶ / ◼ and status hints for the visible request lines, from the editor's layout as it
@@ -796,7 +982,7 @@ impl Respite {
                                 if let Some(d) = this.docs.get(ix) {
                                     d.editor.update(cx, |s, cx| s.set_cursor_position(Position::new(line as u32 - 1, 0), window, cx));
                                 }
-                                this.run(ix, line, cx);
+                                this.send(ix, vec![line], window, cx);
                             });
                         }
                     });
@@ -880,9 +1066,9 @@ impl Respite {
                 .primary()
                 .small()
                 .tooltip(if running { "Stop" } else { "Run again (Cmd+Enter)" })
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     let Some((ix, line)) = this.current.zip(this.doc().and_then(|d| d.active)) else { return };
-                    if running { this.cancel(ix, line, cx) } else { this.run(ix, line, cx) }
+                    if running { this.cancel(ix, line, cx) } else { this.send(ix, vec![line], window, cx) }
                 }))
         });
         // Title (+ run) on one row, status on its own row below, so neither squeezes the other.
@@ -1085,13 +1271,41 @@ impl Render for Respite {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(|this, _: &RunRequest, _, cx| {
+            .on_action(cx.listener(|this, _: &RunRequest, window, cx| {
                 if let (Some(ix), Some(line)) = (this.current, this.doc().and_then(|d| d.cursor_request(cx)).map(|r| r.request_line)) {
-                    this.run(ix, line, cx);
+                    this.send(ix, vec![line], window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &RunAll, window, cx| {
+                if let Some(ix) = this.current {
+                    let lines = this.docs[ix].file.requests.iter().map(|r| r.request_line).collect();
+                    this.send(ix, lines, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RunSelected, window, cx| {
+                if let Some(ix) = this.current {
+                    let lines = this.selected_requests(ix, cx);
+                    this.send(ix, lines, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RepeatLast, window, cx| {
+                let Some((path, lines)) = this.last_run.clone() else {
+                    window.push_notification("Nothing sent yet", cx);
+                    return;
+                };
+                if let Some(ix) = this.open(path, None, window, cx) {
+                    this.send(ix, lines, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CancelRequests, _, cx| this.cancel_all(cx)))
+            .on_action(cx.listener(|this, _: &GoToFile, window, cx| this.pick_file(window, cx)))
+            .on_action(cx.listener(|this, _: &GoToRequest, window, cx| this.pick_request(window, cx)))
+            .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.pick_command(commands(), window, cx)))
+            .on_action(cx.listener(|this, _: &PrevRequest, window, cx| this.step_request(false, window, cx)))
+            .on_action(cx.listener(|this, _: &NextRequest, window, cx| this.step_request(true, window, cx)))
             .on_action(cx.listener(|this, _: &SmartPaste, window, cx| this.smart_paste(window, cx)))
             .on_action(cx.listener(|this, _: &PasteCurl, window, cx| this.paste_curl(window, cx)))
+            .on_action(cx.listener(|this, _: &InsertFile, window, cx| this.insert_file(window, cx)))
             .on_action(cx.listener(|this, _: &CopyAsCurl, window, cx| this.copy_as_curl(window, cx)))
             .on_action(cx.listener(|this, _: &SaveFile, window, cx| this.save(window, cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
@@ -1155,9 +1369,14 @@ fn set_menus(cx: &mut App) {
         ]),
         Menu::new("Request").items([
             MenuItem::action("Run Request", RunRequest),
+            MenuItem::action("Run All in File", RunAll),
+            MenuItem::action("Run Selected", RunSelected),
+            MenuItem::action("Repeat Last", RepeatLast),
+            MenuItem::action("Cancel Running", CancelRequests),
             MenuItem::separator(),
             MenuItem::action("Paste cURL", PasteCurl),
             MenuItem::action("Copy as cURL", CopyAsCurl),
+            MenuItem::action("Insert File…", InsertFile),
             MenuItem::separator(),
             MenuItem::action("Next Environment", NextEnvironment),
         ]),
@@ -1166,7 +1385,43 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Next Tab", NextTab),
         ]),
+        Menu::new("Go").items([
+            MenuItem::action("Go to File…", GoToFile),
+            MenuItem::action("Go to Request…", GoToRequest),
+            MenuItem::action("Previous Request", PrevRequest),
+            MenuItem::action("Next Request", NextRequest),
+            MenuItem::separator(),
+            MenuItem::action("Command Palette…", CommandPalette),
+        ]),
     ]);
+}
+
+/// What Cmd+Shift+P offers: the menu commands, by their menu names.
+fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
+    vec![
+        ("Run Request", Box::new(RunRequest)),
+        ("Run All in File", Box::new(RunAll)),
+        ("Run Selected", Box::new(RunSelected)),
+        ("Repeat Last", Box::new(RepeatLast)),
+        ("Cancel Running", Box::new(CancelRequests)),
+        ("Paste cURL", Box::new(PasteCurl)),
+        ("Copy as cURL", Box::new(CopyAsCurl)),
+        ("Insert File…", Box::new(InsertFile)),
+        ("Next Environment", Box::new(NextEnvironment)),
+        ("Go to File…", Box::new(GoToFile)),
+        ("Go to Request…", Box::new(GoToRequest)),
+        ("Previous Request", Box::new(PrevRequest)),
+        ("Next Request", Box::new(NextRequest)),
+        ("History", Box::new(ToggleHistory)),
+        ("Toggle Sidebar", Box::new(ToggleSidebar)),
+        ("Next Tab", Box::new(NextTab)),
+        ("Save", Box::new(SaveFile)),
+        ("Close Tab", Box::new(CloseTab)),
+        ("Add Project…", Box::new(AddProject)),
+        ("Import…", Box::new(Import)),
+        ("Settings…", Box::new(OpenSettings)),
+        ("Quit Respite", Box::new(Quit)),
+    ]
 }
 
 /// `respite <command> …` runs the CLI without starting the GUI;
@@ -1207,10 +1462,21 @@ fn main() -> std::process::ExitCode {
         // Editor keys go in its own "Input" context (later bindings win over its cmd-enter / cmd-v).
         cx.bind_keys([
             KeyBinding::new(key("enter"), RunRequest, Some("Input")),
+            KeyBinding::new(key("shift-enter"), RunAll, Some("Input")),
+            KeyBinding::new(key("alt-enter"), RunSelected, Some("Input")),
+            KeyBinding::new(key("alt-l"), RepeatLast, Some("Input")),
+            // Over the editor's code actions (Cmd+.), which have no provider here.
+            KeyBinding::new(key("."), CancelRequests, Some("Input")),
+            KeyBinding::new("alt-up", PrevRequest, Some("Input")),
+            KeyBinding::new("alt-down", NextRequest, Some("Input")),
             KeyBinding::new(key("v"), SmartPaste, Some("Input")),
             KeyBinding::new(key("shift-v"), gpui_component::input::Paste, Some("Input")),
             KeyBinding::new(key("alt-v"), PasteCurl, Some("Input")),
             KeyBinding::new(key("shift-c"), CopyAsCurl, Some("Input")),
+            KeyBinding::new(key("i"), InsertFile, Some("Input")),
+            // The editor has these actions but no default keys.
+            KeyBinding::new("f12", gpui_component::input::GoToDefinition, Some("Input")),
+            KeyBinding::new("ctrl-space", gpui_component::input::ShowCompletions, Some("Input")),
         ]);
         for ctx in ["Respite", "Input"] {
             cx.bind_keys([
@@ -1221,23 +1487,36 @@ fn main() -> std::process::ExitCode {
                 KeyBinding::new(key(","), OpenSettings, Some(ctx)),
                 KeyBinding::new(key("alt-e"), NextEnvironment, Some(ctx)),
                 KeyBinding::new(key("y"), ToggleHistory, Some(ctx)),
+                KeyBinding::new(key("p"), GoToFile, Some(ctx)),
+                KeyBinding::new(key("shift-o"), GoToRequest, Some(ctx)),
+                KeyBinding::new(key("shift-p"), CommandPalette, Some(ctx)),
             ]);
         }
         cx.bind_keys([KeyBinding::new(key("q"), Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
         set_menus(cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1440.), px(880.)), cx)),
             titlebar: Some(TitlebarOptions { title: Some("Respite".into()), ..Default::default() }),
             ..Default::default()
         };
-        let main = cx
+        let mut view = None;
+        let handle = cx
             .open_window(options, |window, cx| {
-                let view = cx.new(|cx| Respite::new(root, open, env_name, window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
+                let v = cx.new(|cx| Respite::new(root, open, env_name, window, cx));
+                view = Some(v.downgrade());
+                cx.new(|cx| Root::new(v, window, cx))
             })
-            .unwrap()
-            .window_id();
+            .unwrap();
+        let main = handle.window_id();
+        // Quit (Cmd+Q, menu) asks about unsaved files in the main window, from any window.
+        let view = view.expect("main view");
+        cx.on_action(move |_: &Quit, cx| {
+            let view = view.clone();
+            let asked = handle.update(cx, |_, window, cx| view.update(cx, |this, cx| this.confirm_quit(window, cx)));
+            if !matches!(asked, Ok(Ok(()))) {
+                cx.quit();
+            }
+        });
         // Closing the settings window keeps the app running.
         cx.on_window_closed(move |cx, id| {
             if id == main {

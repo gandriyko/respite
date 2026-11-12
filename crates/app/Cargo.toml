@@ -12,7 +12,7 @@ respite-cli = { path = "../cli" }
 http-curl = { path = "../http-curl" }
 http-import = { path = "../http-import" }
 respite-settings = { path = "../settings" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 serde_json = "1"
 ignore = "0.4"
 jiff = "0.2"
@@ -21,6 +21,11 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features =
 # tree-sitter: JSON highlighting in the response panel; -html also covers XML-ish bodies
 gpui-component = { version = "=0.9.1", features = ["tree-sitter", "tree-sitter-html"] }
 gpui-kit-assets = "=0.9.1"
+# Same version and features as gpui-component's, so the editor's provider types match.
+lsp-types = { version = "0.97", features = ["proposed"] }
+anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Editor-level tests (`#[gpui::test]`, a real EditorState in a test window).
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
