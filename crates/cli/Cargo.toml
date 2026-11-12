@@ -9,6 +9,7 @@ http-syntax = { path = "../http-syntax" }
 http-env = { path = "../http-env" }
 http-exec = { path = "../http-exec" }
 http-curl = { path = "../http-curl" }
+http-import = { path = "../http-import" }
 respite-settings = { path = "../settings" }
 arboard = { version = "3", default-features = false }
 clap = { version = "4", features = ["derive"] }

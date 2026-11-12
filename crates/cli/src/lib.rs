@@ -49,6 +49,16 @@ enum Cmd {
     ImportCurl(curl::ImportArgs),
     /// Request → cURL command (variables substituted unless --raw)
     ExportCurl(curl::ExportArgs),
+    /// Postman / Insomnia / OpenAPI / Swagger / Bruno / HAR → .http files in a new folder
+    Import {
+        /// Export file, spec, or Bruno collection folder
+        path: PathBuf,
+        /// Where the new folder goes (default: current directory)
+        #[arg(long, default_value = ".")]
+        to: PathBuf,
+        #[arg(long, value_enum)]
+        output: Option<Format>,
+    },
     /// Diagnostics without sending anything (pre-commit / CI)
     Check {
         /// Files or directories (default: current directory)
@@ -119,7 +129,7 @@ impl Format {
 /// The GUI binary calls this first; `None` means "not a CLI command, open the GUI".
 pub fn main_if_cli() -> Option<ExitCode> {
     const COMMANDS: &[&str] = &[
-        "list", "show", "run", "import-curl", "export-curl", "check", "env", "history", "help", "--help", "-h", "--version", "-V",
+        "list", "show", "run", "import", "import-curl", "export-curl", "check", "env", "history", "help", "--help", "-h", "--version", "-V",
     ];
     let first = std::env::args().nth(1)?;
     if !COMMANDS.contains(&first.as_str()) {
@@ -127,7 +137,9 @@ pub fn main_if_cli() -> Option<ExitCode> {
     }
     let cli = Cli::parse();
     let human = match &cli.cmd {
-        Cmd::List { output, .. } | Cmd::Check { output, .. } | Cmd::History { output, .. } => Format::resolve(*output),
+        Cmd::List { output, .. } | Cmd::Check { output, .. } | Cmd::History { output, .. } | Cmd::Import { output, .. } => {
+            Format::resolve(*output)
+        }
         Cmd::Env { cmd: EnvCmd::List { output, .. } | EnvCmd::Show { output, .. } } => Format::resolve(*output),
         Cmd::Run(a) => Format::resolve(a.output),
         Cmd::Show { .. } | Cmd::ImportCurl(_) | Cmd::ExportCurl(_) => Format::Human,
@@ -148,11 +160,30 @@ fn dispatch(cli: Cli) -> Result<u8, CliError> {
         Cmd::Run(args) => run::run(args),
         Cmd::ImportCurl(args) => curl::import(args),
         Cmd::ExportCurl(args) => curl::export(args),
+        Cmd::Import { path, to, output } => import(&path, &to, Format::resolve(output)),
         Cmd::Check { paths, output } => check(&paths, Format::resolve(output)),
         Cmd::Env { cmd: EnvCmd::List { dir, output } } => env_list(&dir, Format::resolve(output)),
         Cmd::Env { cmd: EnvCmd::Show { name, dir, output } } => env_show(&name, &dir, Format::resolve(output)),
         Cmd::History { last, output } => history(last, Format::resolve(output)),
     }
+}
+
+fn import(path: &Path, to: &Path, format: Format) -> Result<u8, CliError> {
+    let c = http_import::import(path).map_err(|e| CliError::new("import_failed", e, 3))?;
+    let files = http_import::write(&c, to).map_err(|e| CliError::new("io_error", e.to_string(), 3).at(to, None))?;
+    if format == Format::Human {
+        println!("Imported {} '{}':", c.format, c.name);
+        for f in &files {
+            println!("  {}", f.display());
+        }
+        for w in &c.warnings {
+            eprintln!("  warning: {w}");
+        }
+    } else {
+        let files: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
+        println!("{}", json!({ "format": c.format, "name": c.name, "files": files, "warnings": c.warnings }));
+    }
+    Ok(0)
 }
 
 /// `{"error":{"code","message","file","line","hint"}}` in JSON mode, `error: …` otherwise.

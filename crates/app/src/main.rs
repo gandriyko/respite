@@ -23,7 +23,7 @@ use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     ActiveTheme as _, Root, Theme, ThemeMode, WindowExt as _, h_resizable,
     input::{Editor, EditorState, InputEvent, InputState, Position, RopeExt as _},
-    IconName, Sizable as _,
+    IconName, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     menu::{DropdownMenu as _, PopupMenuItem},
     resizable_panel,
@@ -36,7 +36,7 @@ use workspace::Project;
 actions!(
     respite,
     [
-        RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Quit,
+        RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Import, Quit,
         NextEnvironment, ToggleHistory
     ]
 );
@@ -268,6 +268,9 @@ impl Respite {
         }
         for exec in self.executors.values() {
             exec.set_options(respite_cli::exec_options(&s));
+        }
+        for view in [&self.resp_body, &self.resp_meta] {
+            view.update(cx, |e, cx| e.set_soft_wrap(s.response.soft_wrap, window, cx));
         }
         cx.refresh_windows();
     }
@@ -760,9 +763,19 @@ impl Respite {
                     let (view, line, running) = (write.clone(), m.line, m.running);
                     window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && hitbox.is_hovered(window) {
-                            // Painted after the editor, so this runs first; keep the click from moving the caret.
+                            // Painted after the editor, so this runs first; the editor must not also handle it.
                             cx.stop_propagation();
-                            view.update(cx, |this, cx| if running { this.cancel(ix, line, cx) } else { this.run(ix, line, cx) });
+                            view.update(cx, |this, cx| {
+                                if running {
+                                    this.cancel(ix, line, cx);
+                                    return;
+                                }
+                                // The response panel follows the caret: put it on this request.
+                                if let Some(d) = this.docs.get(ix) {
+                                    d.editor.update(cx, |s, cx| s.set_cursor_position(Position::new(line as u32 - 1, 0), window, cx));
+                                }
+                                this.run(ix, line, cx);
+                            });
                         }
                     });
                 }
@@ -858,6 +871,14 @@ impl Respite {
                             s.open_search(false, cx);
                         })
                     });
+                let wrap_on = self.settings.settings.response.soft_wrap;
+                let wrap = Button::new("response-wrap")
+                    .label("Wrap")
+                    .ghost()
+                    .xsmall()
+                    .selected(wrap_on)
+                    .tooltip(if wrap_on { "Long lines wrap — click to scroll them instead" } else { "Long lines scroll — click to wrap them" })
+                    .on_click(cx.listener(move |this, _, window, cx| this.set("response.soft_wrap", (!wrap_on).into(), window, cx)));
                 let tabs = TABS.iter().fold(
                     TabBar::new("response-tabs")
                         .underline()
@@ -867,7 +888,7 @@ impl Respite {
                             this.tab = *ix;
                             cx.notify();
                         }))
-                        .suffix(search),
+                        .suffix(div().flex().items_center().gap_1().child(wrap).child(search)),
                     |bar, t| bar.child(Tab::new().label(*t)),
                 );
                 panel
@@ -1009,6 +1030,7 @@ impl Render for Respite {
                 }
             }))
             .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
+            .on_action(cx.listener(|this, _: &Import, window, cx| this.import(window, cx)))
             .on_action(cx.listener(|this, _: &NextEnvironment, window, cx| this.next_env(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
@@ -1048,6 +1070,7 @@ fn set_menus(cx: &mut App) {
         ]),
         Menu::new("File").items([
             MenuItem::action("Add Project…", AddProject),
+            MenuItem::action("Import…", Import),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Close Tab", CloseTab),

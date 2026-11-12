@@ -90,6 +90,54 @@ impl Respite {
         .detach();
     }
 
+    /// Postman / Insomnia / OpenAPI / Bruno / HAR → a new folder in the current project.
+    pub(crate) fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dest = match self.doc() {
+            Some(d) => http_env::workspace_root(&d.path),
+            None => match self.projects.first() {
+                Some(p) => p.root.clone(),
+                None => {
+                    window.push_notification("Add a project first: imported files go into it", cx);
+                    return;
+                }
+            },
+        };
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            // Bruno collections are folders.
+            directories: true,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(src) = paths.into_iter().next() else { return };
+            this.update_in(cx, |this, window, cx| {
+                let result = http_import::import(&src).and_then(|c| http_import::write(&c, &dest).map(|f| (c, f)).map_err(|e| e.to_string()));
+                let (c, files) = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        window.push_notification(format!("Import failed: {e}"), cx);
+                        return;
+                    }
+                };
+                this.rescan_projects_of(&dest);
+                this.expanded.insert(dest.clone());
+                if let Some(first) = files.iter().find(|f| f.extension().is_some_and(|e| e == "http")).or(files.first()) {
+                    this.open(first.clone(), None, window, cx);
+                }
+                let mut msg = format!("Imported {} '{}': {} file(s)", c.format, c.name, files.len());
+                if !c.warnings.is_empty() {
+                    msg += &format!(". {} warning(s): {}", c.warnings.len(), c.warnings.join("; "));
+                }
+                window.push_notification(msg, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Drops the project from the sidebar list only; files and history stay.
     fn remove_project(&mut self, pi: usize, window: &mut Window, cx: &mut Context<Self>) {
         if pi >= self.projects.len() {

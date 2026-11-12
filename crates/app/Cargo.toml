@@ -10,6 +10,7 @@ http-env = { path = "../http-env" }
 http-exec = { path = "../http-exec" }
 respite-cli = { path = "../cli" }
 http-curl = { path = "../http-curl" }
+http-import = { path = "../http-import" }
 respite-settings = { path = "../settings" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 serde_json = "1"

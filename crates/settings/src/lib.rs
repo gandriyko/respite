@@ -33,6 +33,7 @@ pub struct Settings {
     /// Editor and response font size, px.
     pub font_size: f32,
     pub editor: Editor,
+    pub response: ResponseView,
     pub request: Request,
     pub history: History,
     pub curl: Curl,
@@ -48,6 +49,20 @@ pub struct Editor {
     pub inlay_status: bool,
     /// Background on the line under the cursor.
     pub highlight_current_line: bool,
+}
+
+/// The response panel (`"response": {…}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResponseView {
+    /// Wrap long lines (toggled from the panel's Wrap button).
+    pub soft_wrap: bool,
+}
+
+impl Default for ResponseView {
+    fn default() -> Self {
+        Self { soft_wrap: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,6 +124,7 @@ impl Default for Settings {
             font_family: String::new(),
             font_size: 14.,
             editor: Editor::default(),
+            response: ResponseView::default(),
             request: Request::default(),
             history: History::default(),
             curl: Curl::default(),
