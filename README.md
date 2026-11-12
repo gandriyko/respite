@@ -13,6 +13,8 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#install)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](Cargo.toml)
 
+<img src="docs/screenshot.png" width="900" alt="Respite: project tree, .http editor and response panel">
+
 </div>
 
 ---
