@@ -1,9 +1,13 @@
 //! `.http` highlighter on top of `http_syntax::parse`, plugged into the editor's
 //! `InputHighlighter` seam (no tree-sitter grammar needed).
-// ponytail: full reparse per edit, O(file); incremental when 5k-line files lag.
+// ponytail: full reparse per edit, O(file): ~0.7 ms for 6k lines, ~2.3 ms for 24k (release);
+// incremental only if real files outgrow that.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
+
+use http_syntax::HttpFile;
 
 use gpui::{Context, HighlightStyle, SharedString, Window};
 use gpui_component::input::{
@@ -25,6 +29,13 @@ impl InputHighlighter for HttpHighlighter {
 
     fn update(&mut self, _: Option<InputEdit>, text: &Rope, _: bool, _: &mut Window, _: &mut Context<EditorState>) {
         (self.spans, self.folds) = compute(&text.to_string());
+    }
+
+    /// Multi-cursor typing: the default calls `update` per cursor; only the final text matters.
+    fn update_batch(&mut self, edits: &[(InputEdit, Rope)], folding: bool, window: &mut Window, cx: &mut Context<EditorState>) {
+        if let Some((edit, text)) = edits.last() {
+            self.update(Some(*edit), text, folding, window, cx);
+        }
     }
 
     fn styles(&self, range: &Range<usize>, resolver: &dyn HighlightStyleResolver) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -50,8 +61,24 @@ impl InputHighlighter for HttpHighlighter {
     }
 }
 
+thread_local! {
+    static LAST: std::cell::RefCell<(String, Arc<HttpFile>)> = Default::default();
+}
+
+/// `http_syntax::parse`, memoized on the last text: the highlighter and the doc both parse
+/// after every edit, so the second one is a string compare.
+pub fn parse(src: &str) -> Arc<HttpFile> {
+    LAST.with_borrow_mut(|(text, file)| {
+        if text != src {
+            *file = Arc::new(http_syntax::parse(src));
+            *text = src.to_owned();
+        }
+        file.clone()
+    })
+}
+
 fn compute(src: &str) -> (Vec<Span>, Vec<FoldRange>) {
-    let file = http_syntax::parse(src);
+    let file = parse(src);
     let request_lines: HashSet<usize> = file.requests.iter().map(|r| r.request_line).collect();
     let header_lines: HashSet<usize> = file.requests.iter().flat_map(|r| r.headers.iter().map(|h| h.line)).collect();
     let body_lines: HashMap<usize, Body> = file
@@ -127,13 +154,21 @@ fn compute(src: &str) -> (Vec<Span>, Vec<FoldRange>) {
     }
     spans.retain(|(r, _)| !r.is_empty());
 
-    let folds = file
-        .requests
-        .iter()
-        .filter(|r| r.lines.end() > r.lines.start())
-        .map(|r| FoldRange::new(r.lines.start() - 1, r.lines.end() - 1))
-        .collect();
+    let blocks = file.requests.iter().filter(|r| r.lines.end() > r.lines.start()).map(|r| FoldRange::new(r.lines.start() - 1, r.lines.end() - 1));
+    let folds = blocks.chain(body_folds(&file)).collect();
     (spans, folds)
+}
+
+/// Body folds (0-based lines), so a big JSON hides without hiding its request. A fold keeps its
+/// first and last line (`{` … `}`).
+pub fn body_folds(file: &http_syntax::HttpFile) -> Vec<FoldRange> {
+    file.requests
+        .iter()
+        .filter_map(|r| r.body.as_ref())
+        .map(|b| (b.line - 1, b.text.lines().count()))
+        .filter(|&(_, n)| n >= 3)
+        .map(|(start, n)| FoldRange::new(start, start + n - 1))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -157,8 +192,8 @@ fn body_kind(r: &http_syntax::Request, b: &http_syntax::Body) -> Body {
     }
 }
 
-/// One line of JSON: keys, strings, numbers, literals, `{{vars}}`. Strings don't span lines.
-// ponytail: line-local lexer; a string broken across lines restarts on the next one.
+/// One line of JSON: keys, strings, numbers, literals, `{{vars}}`. Line-local on purpose: JSON
+/// strings can't hold a raw newline, so an unclosed `"` only colours the rest of its own line.
 fn json(spans: &mut Vec<Span>, line: &str, at: usize) {
     let b = line.as_bytes();
     let mut i = 0;
@@ -282,5 +317,8 @@ mod tests {
         assert_eq!(of("Content-Disposition"), Some("property"));
         assert_eq!(of("\"k\""), Some("property"));
         assert_eq!(of("< ./a.png"), Some("comment"));
+        // Only the 6-line multipart body folds (JSON and form bodies are one line); lines 0-based.
+        let f = body_folds(&http_syntax::parse(src));
+        assert_eq!(f.iter().map(|f| (f.start_line, f.end_line)).collect::<Vec<_>>(), [(15, 20)]);
     }
 }

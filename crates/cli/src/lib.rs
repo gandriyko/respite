@@ -66,7 +66,7 @@ enum Cmd {
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
-    /// Environments from http-client(.private).env.json
+    /// Environments from respite-<env>(.private).json
     Env {
         #[command(subcommand)]
         cmd: EnvCmd,
@@ -101,13 +101,13 @@ enum EnvCmd {
 
 #[derive(Args, Clone, Default)]
 pub(crate) struct EnvArgs {
-    /// Environment name from http-client.env.json
+    /// Environment name (`dev` for respite-dev.json)
     #[arg(long)]
     pub env: Option<String>,
     /// Override a variable, any level (repeatable)
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub vars: Vec<String>,
-    /// Extra env file above the chain (repeatable)
+    /// Extra env file above the chain, named respite-<env>(.private).json (repeatable)
     #[arg(long = "env-file", value_name = "PATH")]
     pub env_files: Vec<PathBuf>,
 }

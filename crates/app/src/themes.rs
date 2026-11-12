@@ -32,6 +32,20 @@ pub fn register(cx: &mut App) {
     }
 }
 
+thread_local! {
+    /// The current theme's text colour, for painters that get no `cx` (the fold placeholder).
+    static TEXT: std::cell::Cell<gpui::Hsla> = std::cell::Cell::new(gpui::white());
+}
+
+pub fn text_color() -> gpui::Hsla {
+    TEXT.with(|c| c.get())
+}
+
+/// Call after every theme or appearance change.
+pub fn sync_text_color(cx: &App) {
+    TEXT.with(|c| c.set(Theme::global(cx).foreground));
+}
+
 /// Show or hide the line-under-cursor background (`editor.highlight_current_line`).
 /// The theme supplies the colour; applying a theme or mode brings it back, so call this after.
 pub fn current_line(show: bool, cx: &mut App) {

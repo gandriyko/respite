@@ -21,9 +21,8 @@ impl Project {
     }
 }
 
-/// `~/.config/respite`: the default home of collections (one folder each), next to `settings.json`.
 pub fn collections_dir() -> PathBuf {
-    std::env::home_dir().unwrap_or_default().join(".config/respite")
+    http_env::collections_dir().unwrap_or_default()
 }
 
 /// `collections` (flat, always scanned) first, then `current` (added to the saved list if new),
@@ -113,7 +112,7 @@ pub fn save_env(base: Option<&Path>, root: &Path, env: Option<&str>) {
 
 pub use http_env::is_env_file;
 
-/// `.http` / `.rest` and env files (`*.env.json`, `respite*.json`) under `root`, respecting
+/// `.http` / `.rest` and env files (`respite*.json`) under `root`, respecting
 /// `.gitignore`. Private env files are usually git-ignored, so they are added back.
 pub fn scan(root: &Path) -> Vec<PathBuf> {
     // ponytail: depth cap guards against a root like $HOME; raise if real projects nest deeper.
@@ -197,9 +196,6 @@ mod tests {
         std::fs::write(r.join(".gitignore"), "ignored/\n*.private.*\n").unwrap();
         std::fs::create_dir(r.join(".git")).unwrap(); // .gitignore applies inside a git repo
         let rel: Vec<_> = scan(r).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect();
-        assert_eq!(rel, [
-            "a.http", "api/v2/b.rest", "http-client.env.json", "http-client.private.env.json",
-            "respite-dev.json", "respite-dev.private.json",
-        ]);
+        assert_eq!(rel, ["a.http", "api/v2/b.rest", "respite-dev.json", "respite-dev.private.json"]);
     }
 }

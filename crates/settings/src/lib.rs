@@ -167,6 +167,7 @@ impl Settings {
 }
 
 /// Both layers as written, plus the merged result.
+#[derive(Clone)]
 pub struct Loaded {
     pub global_path: Option<PathBuf>,
     pub workspace_path: Option<PathBuf>,

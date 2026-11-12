@@ -36,16 +36,21 @@ pub struct Doc {
     /// Byte range currently decorated as the active block.
     applied: Option<Range<usize>>,
     block_bar: GutterDecorationCollection,
-    // ponytail: keyed by request line, so statuses drift when lines above are edited;
-    // key by block identity once ResponseStore exists.
+    /// Keyed by request line; `reparse` moves entries along with their block.
     pub status: HashMap<usize, Status>,
-    pub tasks: HashMap<usize, Task<()>>,
+    /// Running requests: request line → (run id, task). The id finds the block again when the
+    /// response arrives, even if lines above were edited meanwhile.
+    pub tasks: HashMap<usize, (u64, Task<()>)>,
     /// Edited since load / last save.
     pub dirty: bool,
-    /// `false` for `*.env.json`: plain JSON, no requests, no ▶.
+    /// `false` for env files (`respite*.json`): plain JSON, no requests, no ▶.
     pub http: bool,
+    fold_counts: FoldCounts,
     pub _subs: Vec<Subscription>,
 }
+
+/// Body fold start row (0-based) → lines it hides; shared with the editor's fold placeholder.
+pub type FoldCounts = std::rc::Rc<std::cell::RefCell<HashMap<usize, usize>>>;
 
 impl Doc {
     pub fn new(
@@ -54,6 +59,7 @@ impl Doc {
         (env, env_names): (HashMap<String, Variable>, Vec<String>),
         exec: Arc<Executor>,
         subs: Vec<Subscription>,
+        fold_counts: FoldCounts,
         cx: &mut App,
     ) -> Self {
         let block_bar = editor.update(cx, |s, cx| s.create_gutter_decorations_collection(vec![], cx));
@@ -72,6 +78,7 @@ impl Doc {
             tasks: HashMap::new(),
             dirty: false,
             http,
+            fold_counts,
             _subs: subs,
         };
         doc.reparse(cx);
@@ -98,13 +105,21 @@ impl Doc {
         self.path.file_name().map_or_else(|| "untitled".into(), |n| n.to_string_lossy().into_owned())
     }
 
-    // ponytail: parses on every keystroke on the UI thread; move to background + 30 ms debounce
-    // when large files stutter.
+    /// Shares the highlighter's parse of the same text (see `highlight::parse`).
     pub fn reparse(&mut self, cx: &mut App) {
         if !self.http {
             return;
         }
-        self.file = Arc::new(http_syntax::parse(&self.editor.read(cx).value()));
+        let old = std::mem::replace(&mut self.file, crate::highlight::parse(&self.editor.read(cx).value()));
+        if !self.status.is_empty() || !self.tasks.is_empty() {
+            // A deleted block drops its status, and its task (which cancels the request).
+            let moved = moved_lines(&old, &self.file);
+            self.status = self.status.drain().filter_map(|(l, s)| Some((*moved.get(&l)?, s))).collect();
+            self.tasks = self.tasks.drain().filter_map(|(l, t)| Some((*moved.get(&l)?, t))).collect();
+        }
+        // A fold shows its first and last line, so it hides the ones between.
+        *self.fold_counts.borrow_mut() =
+            crate::highlight::body_folds(&self.file).iter().map(|f| (f.start_line, f.end_line - f.start_line - 1)).collect();
         self.sync_active(cx);
     }
 
@@ -132,5 +147,45 @@ impl Doc {
         // ponytail: bring a background back if the editor gains full-width line decorations.
         let bar = cx.theme().primary;
         self.block_bar.set(range.iter().map(|r| GutterDecoration::new(r.clone()).with_color(bar)).collect(), cx);
+    }
+}
+
+/// Old request line → new one after an edit. Same number of blocks: matched in order (an edit
+/// above shifts lines, editing a block's URL keeps it). Otherwise a block was added or removed:
+/// matched by label, in order; unmatched ones are gone.
+fn moved_lines(old: &HttpFile, new: &HttpFile) -> HashMap<usize, usize> {
+    if old.requests.len() == new.requests.len() {
+        return old.requests.iter().zip(&new.requests).map(|(o, n)| (o.request_line, n.request_line)).collect();
+    }
+    let mut free: Vec<(String, usize)> = new.requests.iter().map(|r| (r.label(), r.request_line)).collect();
+    old.requests
+        .iter()
+        .filter_map(|o| {
+            let label = o.label();
+            let i = free.iter().position(|(l, _)| *l == label)?;
+            Some((o.request_line, free.remove(i).1))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
+    use super::moved_lines;
+    use std::collections::HashMap;
+
+    #[test]
+    fn statuses_follow_their_block() {
+        let p = http_syntax::parse;
+        let base = p("### A\nGET /a\n\n### B\nGET /b\n");
+        // Lines inserted above: same blocks, shifted.
+        let shifted = p("# note\n\n### A\nGET /a\n\n### B\nGET /b\n");
+        assert_eq!(moved_lines(&base, &shifted), HashMap::from([(2, 4), (5, 7)]));
+        // URL edited: still the same block.
+        assert_eq!(moved_lines(&base, &p("### A\nGET /a2\n\n### B\nGET /b\n")), HashMap::from([(2, 2), (5, 5)]));
+        // Block A deleted: B moves up, A's status goes.
+        assert_eq!(moved_lines(&base, &p("### B\nGET /b\n")), HashMap::from([(5, 2)]));
+        // Block inserted above: both move down.
+        assert_eq!(moved_lines(&base, &p("### C\nGET /c\n\n### A\nGET /a\n\n### B\nGET /b\n")), HashMap::from([(2, 5), (5, 8)]));
     }
 }

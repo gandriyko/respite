@@ -92,7 +92,8 @@ impl Respite {
 
     /// Postman / Insomnia / OpenAPI / Bruno / HAR → a new folder in the collections dir.
     pub(crate) fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dest = workspace::collections_dir();
+        let collections = workspace::collections_dir();
+        let current_root = self.doc().map(|d| self.root_of(&d.path));
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             // Bruno collections are folders.
@@ -104,8 +105,18 @@ impl Respite {
             let Ok(Ok(Some(paths))) = picked.await else { return };
             let Some(src) = paths.into_iter().next() else { return };
             this.update_in(cx, |this, window, cx| {
-                let result = http_import::import(&src).and_then(|c| http_import::write(&c, &dest).map(|f| (c, f)).map_err(|e| e.to_string()));
-                let (c, files) = match result {
+                let result = http_import::import(&src).and_then(|c| {
+                    // A collection becomes a new folder in the collections dir. Environments alone
+                    // go to the open file's project, else to a collection of their own: never to
+                    // the collections dir itself, where they'd apply to nothing visible.
+                    let dest = match (http_import::render(&c).is_empty(), current_root) {
+                        (false, _) => collections.clone(),
+                        (true, Some(root)) => root,
+                        (true, None) => collections.join(http_import::sanitize(&c.name)),
+                    };
+                    http_import::write(&c, &dest).map(|f| (c, f, dest)).map_err(|e| e.to_string())
+                });
+                let (c, files, dest) = match result {
                     Ok(r) => r,
                     Err(e) => {
                         window.push_notification(format!("Import failed: {e}"), cx);
@@ -458,11 +469,7 @@ impl Respite {
             .mb_1()
             .flex()
             .gap_1()
-            .child(item("open-settings", IconName::Settings, "Settings").on_click(cx.listener(|this, _, _, cx| {
-                this.show_settings = !this.show_settings;
-                this.show_history &= !this.show_settings;
-                cx.notify();
-            })))
+            .child(item("open-settings", IconName::Settings, "Settings").on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))))
             .child(item("open-history", IconName::RotateCw, "History").on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))));
         div()
             .size_full()

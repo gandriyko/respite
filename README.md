@@ -30,7 +30,7 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 | | |
 |---|---|
 | **Editor** | `.http` syntax highlighting, a ▶ run button in the gutter, per-request status inline, folding |
-| **Variables** | File variables, `http-client.env.json` environments with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
+| **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
 | **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, …) |
 | **Responses** | Body with highlighting and search, headers, the request as it was sent, timings |
 | **History** | Every run is stored per project and can be browsed, filtered and reopened |
@@ -107,7 +107,7 @@ respite check        Diagnostics without sending anything (pre-commit / CI)
 respite import       Postman / Insomnia / OpenAPI / Swagger / Bruno / HAR → .http files
 respite import-curl  cURL from stdin or the clipboard → request block(s)
 respite export-curl  Request → cURL command
-respite env          Environments from http-client(.private).env.json
+respite env          Environments from respite-<env>(.private).json
 respite history      Past executions of this workspace
 ```
 
@@ -122,20 +122,20 @@ respite run api.http --jsonpath '$.items[*].id'      # print only the matching v
 
 ## Environments
 
-Respite reads the same environment files as JetBrains HTTP Client. Keep secrets in the `.private` file and git-ignore it:
+One flat file per environment, found in every folder from the workspace root down to the `.http` file (deeper folders win). `respite.json` holds values shared by all environments. Keep secrets in `.private` files and git-ignore them:
 
 ```jsonc
-// http-client.env.json
-{
-  "dev":  { "host": "http://localhost:8080" },
-  "prod": { "host": "https://api.example.com" }
-}
+// respite-dev.json
+{ "host": "http://localhost:8080" }
 
-// http-client.private.env.json  (git-ignored)
-{
-  "prod": { "token": "…" }
-}
+// respite-prod.json
+{ "host": "https://api.example.com" }
+
+// respite-prod.private.json  (git-ignored)
+{ "token": "…" }
 ```
+
+The workspace root, shared by the app and the CLI, is the first of: the deepest project folder added to the sidebar, the nearest folder with `.git` or `.respite`, the collection folder (`~/.config/respite/<name>`), the `.http` file's own folder. History and saved state are kept per root in `~/.respite`.
 
 ## Project layout
 

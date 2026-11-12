@@ -1,4 +1,4 @@
-//! Import API collections from other tools into `.http` files + `http-client.env.json`.
+//! Import API collections from other tools into `.http` files + `respite-<env>.json` env files.
 //!
 //! Formats (auto-detected): Postman collection v2.0/v2.1 and environment, Insomnia export
 //! v4 (JSON) and v5 (YAML), OpenAPI 3 / Swagger 2 (JSON or YAML), Bruno collection folder,
@@ -24,7 +24,7 @@ pub struct Collection {
     pub root: Folder,
     /// Environment name (`$shared` for variables of every environment) → variables.
     pub envs: BTreeMap<String, Vec<(String, String)>>,
-    /// Same, for secrets (written to `http-client.private.env.json`).
+    /// Same, for secrets (written to `respite-<env>.private.json`).
     pub private_envs: BTreeMap<String, Vec<(String, String)>>,
     /// What could not be converted (scripts, unsupported auth, …).
     pub warnings: Vec<String>,
@@ -158,22 +158,39 @@ pub fn block(r: &Req) -> String {
     s
 }
 
-fn env_json(envs: &BTreeMap<String, Vec<(String, String)>>) -> Value {
-    let mut root = Map::new();
-    for (env, vars) in envs {
-        root.insert(env.clone(), Value::Object(vars.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect()));
+/// Env file of an environment: `respite.json` for `$shared`, else `respite-<env>.json`.
+fn env_file(env: &str, private: bool) -> String {
+    let stem = if env == "$shared" { "respite".to_string() } else { format!("respite-{}", sanitize(env)) };
+    format!("{stem}{}.json", if private { ".private" } else { "" })
+}
+
+/// One env file per environment (public and private) in `dir`. An environment whose files
+/// already exist gets the next free name (`dev-2`, …): nothing is replaced.
+fn write_envs(c: &Collection, dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let taken = |env: &str| [false, true].iter().any(|p| dir.join(env_file(env, *p)).exists());
+    let mut written = vec![];
+    for env in c.envs.keys().chain(c.private_envs.keys()).collect::<std::collections::BTreeSet<_>>() {
+        let name = (1..).map(|n| if n == 1 { env.clone() } else { format!("{env}-{n}") }).find(|n| !taken(n)).unwrap();
+        for (private, envs) in [(false, &c.envs), (true, &c.private_envs)] {
+            if let Some(vars) = envs.get(env) {
+                let json: Map<String, Value> = vars.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+                let path = dir.join(env_file(&name, private));
+                std::fs::write(&path, serde_json::to_string_pretty(&json)? + "\n")?;
+                written.push(path);
+            }
+        }
     }
-    Value::Object(root)
+    Ok(written)
 }
 
 /// Write the collection into a new folder under `dest` (`<dest>/<name>`, `-2`, `-3`… if taken).
-/// An environment-only import (a Postman environment file) is merged into
-/// `<dest>/http-client.env.json` instead, without replacing existing environments.
-/// Returns the files written.
+/// An environment-only import (a Postman environment file) goes to `dest` itself instead,
+/// without replacing existing environments. Returns the files written.
 pub fn write(c: &Collection, dest: &Path) -> io::Result<Vec<PathBuf>> {
     let files = render(c);
-    if files.is_empty() && !c.envs.is_empty() {
-        return merge_envs(c, dest);
+    if files.is_empty() && !(c.envs.is_empty() && c.private_envs.is_empty()) {
+        std::fs::create_dir_all(dest)?;
+        return write_envs(c, dest);
     }
     let base = dest.join(sanitize(&c.name));
     let dir = (1..).map(|n| if n == 1 { base.clone() } else { PathBuf::from(format!("{}-{n}", base.display())) }).find(|d| !d.exists()).unwrap();
@@ -185,27 +202,8 @@ pub fn write(c: &Collection, dest: &Path) -> io::Result<Vec<PathBuf>> {
         written.push(path);
     }
     std::fs::create_dir_all(&dir)?;
-    for (name, envs) in [("http-client.env.json", &c.envs), ("http-client.private.env.json", &c.private_envs)] {
-        if !envs.is_empty() {
-            let path = dir.join(name);
-            std::fs::write(&path, serde_json::to_string_pretty(&env_json(envs))? + "\n")?;
-            written.push(path);
-        }
-    }
+    written.extend(write_envs(c, &dir)?);
     Ok(written)
-}
-
-fn merge_envs(c: &Collection, dest: &Path) -> io::Result<Vec<PathBuf>> {
-    let path = dest.join("http-client.env.json");
-    let mut existing: Map<String, Value> =
-        std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    for (env, vars) in c.envs.iter().chain(&c.private_envs) {
-        let name = (1..).map(|n| if n == 1 { env.clone() } else { format!("{env}-{n}") }).find(|k| !existing.contains_key(k)).unwrap();
-        existing.insert(name, env_json(&BTreeMap::from([(String::new(), vars.clone())]))[""].clone());
-    }
-    std::fs::create_dir_all(dest)?;
-    std::fs::write(&path, serde_json::to_string_pretty(&Value::Object(existing))? + "\n")?;
-    Ok(vec![path])
 }
 
 /// File / folder name from a collection or folder name.

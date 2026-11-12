@@ -168,7 +168,7 @@ pub fn collection(dir: &Path) -> Result<Collection, String> {
             .map(|(list, _)| list.split([',', '\n']).map(|s| s.trim().trim_start_matches('~')).filter(|s| !s.is_empty()).map(|s| (s.to_string(), String::new())).collect())
             .unwrap_or_default();
         if !secrets.is_empty() {
-            warnings.push(format!("{env}: secret values are not exported by Bruno; fill them in http-client.private.env.json"));
+            warnings.push(format!("{env}: secret values are not exported by Bruno; fill them in respite-{}.private.json", crate::sanitize(&env)));
             c.private_envs.insert(env, secrets);
         }
     }

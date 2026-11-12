@@ -105,6 +105,7 @@ paths:
       requestBody: {content: {application/json: {schema: {$ref: "#/components/schemas/Pet"}}}}
   /health:
     get: {summary: Health, security: []}
+    post: {summary: Ping, security: [], requestBody: {content: {}}}
 "##;
     let c = import_str(yaml, "x").unwrap();
     assert_eq!(c.envs["$shared"], [("baseUrl".to_string(), "https://api.pets.dev/v1".to_string())]);
@@ -116,6 +117,8 @@ paths:
     assert_eq!(pets.matches("@petId").count(), 1, "{pets}");
     assert!(pets.contains("### updatePet") && pets.contains("\"id\": \"{{$uuid}}\"") && pets.contains("\"name\": \"Rex\""), "{pets}");
     assert!(file(&files, "default.http").contains("GET {{baseUrl}}/health\n"));
+    // `content: {}` means no body, not a panic.
+    assert!(file(&files, "default.http").contains("### Ping\nPOST {{baseUrl}}/health\n"), "{}", file(&files, "default.http"));
 
     let swagger = r#"{"swagger": "2.0", "info": {"title": "Old"}, "host": "old.dev", "basePath": "/api", "schemes": ["http"],
       "paths": {"/items": {"post": {"tags": ["items"], "parameters": [{"in": "body", "name": "b", "schema": {"type": "object", "properties": {"n": {"type": "integer"}}}},
@@ -162,16 +165,22 @@ fn har_and_write() {
     let files = assert_valid(&c);
     assert_eq!(files[0].1, "### POST /api/items\n# recorded response: 201\nPOST https://x.dev/api/items?a=1\naccept: */*\nContent-Type: application/json\n\n{\n  \"q\": 1\n}\n");
 
-    // write(): new folder, never overwrites; env-only imports merge into the root env file.
+    // write(): new folder, never overwrites; env-only imports go next to existing env files.
     let dest = tempfile::tempdir().unwrap();
     let first = write(&c, dest.path()).unwrap();
     let second = write(&c, dest.path()).unwrap();
     assert!(first[0].starts_with(dest.path().join("har-import")) && second[0].starts_with(dest.path().join("har-import-2")));
-    let env = import_str(r#"{"name": "dev", "_postman_variable_scope": "environment", "values": [{"key": "a", "value": "1"}]}"#, "x").unwrap();
-    std::fs::write(dest.path().join("http-client.env.json"), r#"{"dev": {"keep": "me"}}"#).unwrap();
-    write(&env, dest.path()).unwrap();
-    let merged: Value = serde_json::from_str(&std::fs::read_to_string(dest.path().join("http-client.env.json")).unwrap()).unwrap();
-    assert_eq!(merged, serde_json::json!({"dev": {"keep": "me"}, "dev-2": {"a": "1"}}));
+    let env = import_str(
+        r#"{"name": "dev", "_postman_variable_scope": "environment", "values": [{"key": "a", "value": "1"}, {"key": "t", "value": "s", "type": "secret"}]}"#,
+        "x",
+    )
+    .unwrap();
+    std::fs::write(dest.path().join("respite-dev.json"), r#"{"keep": "me"}"#).unwrap();
+    let written = write(&env, dest.path()).unwrap();
+    let read = |name: &str| serde_json::from_str::<Value>(&std::fs::read_to_string(dest.path().join(name)).unwrap()).unwrap();
+    assert_eq!(written, [dest.path().join("respite-dev-2.json"), dest.path().join("respite-dev-2.private.json")]);
+    assert_eq!(read("respite-dev.json"), serde_json::json!({"keep": "me"}));
+    assert_eq!((read("respite-dev-2.json"), read("respite-dev-2.private.json")), (serde_json::json!({"a": "1"}), serde_json::json!({"t": "s"})));
 
     assert!(import_str("{\"hello\": 1}", "x").is_err());
 }

@@ -137,8 +137,10 @@ fn operation(
 
     // OpenAPI 3 request body: first JSON-ish content type, else the first one.
     let body = resolve(root, &op["requestBody"]);
-    if let Some(content) = body["content"].as_object() {
-        let (ct, media) = content.iter().find(|(k, _)| k.contains("json")).or_else(|| content.iter().next()).unwrap();
+    // `"content": {}` declares no body at all.
+    if let Some(content) = body["content"].as_object()
+        && let Some((ct, media)) = content.iter().find(|(k, _)| k.contains("json")).or_else(|| content.iter().next())
+    {
         req.default_header("Content-Type", ct.clone());
         let example = media["example"].clone();
         let example = if example.is_null() { media["examples"].as_object().and_then(|m| m.values().next()).map(|e| resolve(root, e)["value"].clone()).unwrap_or_default() } else { example };

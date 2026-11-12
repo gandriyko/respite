@@ -17,7 +17,6 @@ impl Respite {
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         self.show_history = !self.show_history;
         if self.show_history {
-            self.show_settings = false;
             self.reload_history();
         }
         cx.notify();

@@ -43,12 +43,7 @@ actions!(
 
 const SAMPLE: &str = include_str!("../sample.http");
 
-/// Starting points for "Create …" in the environment menu (JetBrains format).
-const ENV_TEMPLATES: [(&str, &str); 2] = [
-    ("http-client.env.json", "{\n  \"$shared\": {},\n  \"dev\": {\n    \"baseUrl\": \"http://localhost:8080\"\n  }\n}\n"),
-    // Secrets go here; keep this file out of git.
-    ("http-client.private.env.json", "{\n  \"dev\": {\n    \"token\": \"\"\n  }\n}\n"),
-];
+/// Starting point for "Create …" in the environment menu (only the Respite format is offered).
 const RESPITE_TEMPLATE: &str = "{\n  \"baseUrl\": \"http://localhost:8080\"\n}\n";
 const TABS: [&str; 3] = ["Body", "Headers", "Request"];
 
@@ -90,7 +85,7 @@ struct Respite {
     /// (exchange pointer, tab) currently loaded into the response editors.
     shown: Option<(usize, usize)>,
     settings: respite_settings::Loaded,
-    show_settings: bool,
+    settings_window: Option<WindowHandle<Root>>,
     show_history: bool,
     /// Current project's history, newest first; reloaded when the page opens and after runs.
     history: Vec<http_exec::Entry>,
@@ -98,8 +93,6 @@ struct Respite {
     history_rows: Vec<usize>,
     history_pick: Option<(http_exec::Entry, Arc<Exchange>)>,
     history_filter: Entity<InputState>,
-    font_input: Entity<InputState>,
-    timeout_input: Entity<InputState>,
     /// Theme's own monospace font, used when `font_family` is empty.
     default_mono: SharedString,
     _subs: Vec<Subscription>,
@@ -134,23 +127,8 @@ impl Respite {
         for e in &settings.errors {
             window.push_notification(format!("Settings: {e}"), cx);
         }
-        let s = &settings.settings;
-        let font_input = cx.new(|cx| InputState::new(window, cx).placeholder("Default monospace font").default_value(s.font_family.clone()));
-        let timeout_input = cx.new(|cx| InputState::new(window, cx).placeholder("0 = no limit").default_value(s.request.timeout_ms.to_string()));
         let history_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: method, URL, name, file, status"));
         let _subs = vec![
-            cx.subscribe_in(&font_input, window, |this, input, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    let v = input.read(cx).value().to_string();
-                    this.set("font_family", v.trim().into(), window, cx);
-                }
-            }),
-            cx.subscribe_in(&timeout_input, window, |this, input, ev: &InputEvent, window, cx| {
-                // Invalid numbers are ignored until they parse.
-                if let (InputEvent::Change, Ok(ms)) = (ev, input.read(cx).value().trim().parse::<u64>()) {
-                    this.set("request.timeout_ms", ms.into(), window, cx);
-                }
-            }),
             cx.subscribe_in(&history_filter, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
@@ -166,19 +144,18 @@ impl Respite {
                     Theme::sync_system_appearance(Some(window), cx);
                     // Switching mode reloads the highlight theme; re-apply the option.
                     themes::current_line(this.settings.settings.editor.highlight_current_line, cx);
+                    themes::sync_text_color(cx);
                 }
             }),
         ];
         let mut this = Self {
             settings,
-            show_settings: false,
+            settings_window: None,
             show_history: false,
             history: vec![],
             history_rows: vec![],
             history_pick: None,
             history_filter,
-            font_input,
-            timeout_input,
             default_mono: cx.theme().mono_font_family.clone(),
             _subs,
             env_name,
@@ -256,6 +233,7 @@ impl Respite {
             A::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
         }
         themes::current_line(s.editor.highlight_current_line, cx);
+        themes::sync_text_color(cx);
         let t = Theme::global_mut(cx);
         t.font_size = px(s.ui_font_size);
         t.mono_font_size = px(s.font_size);
@@ -287,7 +265,7 @@ impl Respite {
                         return None;
                     }
                 };
-                let root = http_env::workspace_root(&path);
+                let root = self.root_of(&path);
                 // ponytail: env loaded when the file opens; reload on env-file change comes with `notify` watching.
                 let env = self.env_for(&path, &root);
                 let st = &self.settings.settings;
@@ -295,6 +273,8 @@ impl Respite {
                 let exec = self.executor(&root);
                 // Env files are plain JSON (tree-sitter highlighting, no requests).
                 let http = !workspace::is_env_file(&path);
+                // Folded row → hidden lines, kept current by the doc; read by the fold placeholder.
+                let fold_counts = doc::FoldCounts::default();
                 let editor = cx.new(|cx| {
                     let mut s = EditorState::new(window, cx)
                         .language(if http { "http" } else { "json" })
@@ -305,6 +285,34 @@ impl Respite {
                     if http {
                         s.set_highlighter_factory(Rc::new(|_: &str| Some(Box::new(highlight::HttpHighlighter::default()) as _)), cx);
                         s.set_gutter_decorations_width(px(3.), cx);
+                        // After a folded line (e.g. a long body's preview); clicking it unfolds.
+                        // The text colour, for contrast in every theme (`primary` / `muted` are grey in some).
+                        // Read at paint time: the first editor is built before the theme is applied.
+                        let counts = fold_counts.clone();
+                        s.set_fold_placeholder_renderer(
+                            Some(Rc::new(move |row| {
+                                let accent = themes::text_color();
+                                let label = match counts.borrow().get(&row) {
+                                    Some(1) => "⋯ 1 more line".to_string(),
+                                    Some(n) => format!("⋯ {n} more lines"),
+                                    None => "⋯".to_string(),
+                                };
+                                div()
+                                    .ml_2()
+                                    .px_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(accent.opacity(0.45))
+                                    .bg(accent.opacity(0.1))
+                                    .hover(move |s| s.bg(accent.opacity(0.22)))
+                                    .text_color(accent)
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .into_any_element()
+                            })),
+                            cx,
+                        );
                     }
                     s
                 });
@@ -323,7 +331,7 @@ impl Respite {
                         cx.notify();
                     }),
                 ];
-                self.docs.push(Doc::new(path.clone(), editor, env, exec, subs, cx));
+                self.docs.push(Doc::new(path.clone(), editor, env, exec, subs, fold_counts, cx));
                 if let Some(e) = Environments::load(&path, &root, &[]).errors.first() {
                     window.push_notification(format!("Env file skipped: {}: {}", e.0.display(), e.1), cx);
                 }
@@ -335,6 +343,11 @@ impl Respite {
         self.docs[ix].editor.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
         Some(ix)
+    }
+
+    /// Root of `path`'s env chain, history and saved state; the same one the CLI uses.
+    fn root_of(&self, path: &Path) -> PathBuf {
+        http_env::workspace_root(path)
     }
 
     fn doc(&self) -> Option<&Doc> {
@@ -362,7 +375,7 @@ impl Respite {
                 if workspace::is_env_file(&path) {
                     // New variables / environments apply to every open request file right away.
                     self.select_env(self.env_name.clone(), cx);
-                    let root = http_env::workspace_root(&path);
+                    let root = self.root_of(&path);
                     if let Some((p, e)) = Environments::load(&path, &root, &[]).errors.into_iter().find(|(p, _)| *p == path) {
                         window.push_notification(format!("{} is not valid JSON, so it is skipped: {e}", p.display()), cx);
                     }
@@ -377,7 +390,7 @@ impl Respite {
     fn remember_position(&self, cx: &App) {
         let Some(d) = self.doc() else { return };
         let pos = d.editor.read(cx).cursor_position();
-        let root = http_env::workspace_root(&d.path);
+        let root = self.root_of(&d.path);
         workspace::save_last_file(Store::default_base().as_deref(), &root, &d.path, pos.line, pos.character);
     }
 
@@ -415,6 +428,7 @@ impl Respite {
             s.set_cursor_position(Position::new(line.saturating_sub(1) as u32, 0), window, cx);
             s.focus(window, cx);
         });
+        center_line(self.docs[ix].editor.clone(), line.saturating_sub(1), true, window, cx);
         if run {
             self.run(ix, line, cx);
         }
@@ -432,28 +446,31 @@ impl Respite {
             exec.run(&cx, index).await
         });
         let abort = AbortOnDrop(handle.abort_handle());
+        static RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = RUN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         d.status.insert(request_line, Status::Running);
-        d.tasks.insert(
-            request_line,
-            cx.spawn(async move |this, cx| {
-                let _abort = abort;
-                let status = match handle.await {
-                    Ok(Ok(ex)) => Status::Done(Arc::new(ex)),
-                    Ok(Err(e)) => Status::Failed(e.to_string()),
-                    Err(e) => Status::Failed(e.to_string()),
-                };
-                this.update(cx, |this, cx| {
-                    if let Some(d) = this.docs.iter_mut().find(|d| d.path == key) {
-                        d.status.insert(request_line, status);
-                    }
-                    if this.show_history {
-                        this.reload_history();
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }),
-        );
+        let task = cx.spawn(async move |this, cx| {
+            let _abort = abort;
+            let status = match handle.await {
+                Ok(Ok(ex)) => Status::Done(Arc::new(ex)),
+                Ok(Err(e)) => Status::Failed(e.to_string()),
+                Err(e) => Status::Failed(e.to_string()),
+            };
+            this.update(cx, |this, cx| {
+                // The block's line now: edits above may have moved it since the run started.
+                if let Some(d) = this.docs.iter_mut().find(|d| d.path == key)
+                    && let Some(line) = d.tasks.iter().find(|(_, (t, _))| *t == id).map(|(l, _)| *l)
+                {
+                    d.status.insert(line, status);
+                }
+                if this.show_history {
+                    this.reload_history();
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        d.tasks.insert(request_line, (id, task));
         cx.notify();
     }
 
@@ -553,13 +570,13 @@ impl Respite {
     fn select_env(&mut self, name: Option<String>, cx: &mut Context<Self>) {
         self.env_name = name;
         if let Some(d) = self.doc() {
-            let root = http_env::workspace_root(&d.path);
+            let root = self.root_of(&d.path);
             workspace::save_env(Store::default_base().as_deref(), &root, self.env_name.as_deref());
         }
         self.executors.clear();
         for ix in 0..self.docs.len() {
             let path = self.docs[ix].path.clone();
-            let root = http_env::workspace_root(&path);
+            let root = self.root_of(&path);
             let (env, names) = self.env_for(&path, &root);
             let exec = self.executor(&root);
             let d = &mut self.docs[ix];
@@ -612,7 +629,6 @@ impl Respite {
                             return;
                         }
                         view.update(cx, |this, cx| {
-                            this.show_settings = false;
                             if template.is_some() {
                                 this.rescan_projects_of(&path);
                             }
@@ -630,26 +646,31 @@ impl Respite {
                     menu.item(PopupMenuItem::new(n.clone()).checked(current.as_deref() == Some(n)).on_click(pick(Some(n.clone()))))
                 });
                 // Edit / create env files of the current file's chain (read only when the menu opens).
-                let Some(path) = view.upgrade().and_then(|v| v.read(cx).doc().map(|d| (*d.path).clone())) else { return menu };
-                let root = http_env::workspace_root(&path);
+                let Some((path, root)) = view.upgrade().and_then(|v| {
+                    let this = v.read(cx);
+                    this.doc().map(|d| ((*d.path).clone(), this.root_of(&d.path)))
+                }) else {
+                    return menu;
+                };
                 menu = menu.separator();
                 for p in Environments::load(&path, &root, &[]).paths() {
                     let shown = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
                     menu = menu.item(PopupMenuItem::new(format!("Edit {shown}")).on_click(edit(p, None)));
                 }
-                // New files go to the workspace root (nearest folder with .git / .respite); say which.
-                let dir = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-                for (name, template) in ENV_TEMPLATES {
-                    let p = root.join(name);
-                    if !p.exists() {
-                        menu = menu.item(PopupMenuItem::new(format!("Create {name} in {dir}/")).on_click(edit(p, Some(template))));
-                    }
-                }
-                // Respite format: one flat file per environment.
+                // New files go to the project root (applies to every subfolder) or next to the
+                // file (only its folder and below); say which.
                 let name = format!("respite-{}.json", current.as_deref().unwrap_or("dev"));
-                let p = root.join(&name);
-                if !p.exists() {
-                    menu = menu.item(PopupMenuItem::new(format!("Create {name} in {dir}/")).on_click(edit(p, Some(RESPITE_TEMPLATE))));
+                let root_name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
+                let here = path.parent().unwrap_or(&root).to_path_buf();
+                let dirs = if here == root { vec![root.clone()] } else { vec![root.clone(), here] };
+                for dir in dirs {
+                    let p = dir.join(&name);
+                    if !p.exists() {
+                        // `join("")` (the root itself) leaves a trailing `/`.
+                        let shown = Path::new(&root_name).join(dir.strip_prefix(&root).unwrap_or(&dir)).display().to_string();
+                        let shown = shown.trim_end_matches('/');
+                        menu = menu.item(PopupMenuItem::new(format!("Create {name} in {shown}/")).on_click(edit(p, Some(RESPITE_TEMPLATE))));
+                    }
                 }
                 menu
             })
@@ -680,9 +701,6 @@ impl Respite {
     }
 
     fn center(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.show_settings {
-            return self.settings_page(cx);
-        }
         if self.show_history {
             return self.history_page(cx);
         }
@@ -703,8 +721,8 @@ impl Respite {
     /// ▶ / ◼ and status hints for the visible request lines, from the editor's layout as it
     /// is *now* — call during prepaint, after the editor laid out this frame.
     fn marks(&self, cx: &App) -> Option<(usize, Vec<Mark>)> {
-        // The editor is not on screen behind the settings / history page.
-        let (false, false, Some(ix), Some(d)) = (self.show_settings, self.show_history, self.current, self.doc()) else { return None };
+        // The editor is not on screen behind the history page.
+        let (false, Some(ix), Some(d)) = (self.show_history, self.current, self.doc()) else { return None };
         if !d.http {
             return None;
         }
@@ -1006,6 +1024,25 @@ fn paint_text(text: &str, origin: Point<Pixels>, color: Hsla, line_height: Pixel
     let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
 }
 
+/// Scroll so 0-based `line` sits mid-viewport, unless it's already well inside it (the editor
+/// alone only scrolls it into view, onto the bottom row). A just-opened editor has no layout
+/// yet: `retry` waits one frame for it.
+fn center_line(editor: Entity<EditorState>, line: usize, retry: bool, window: &mut Window, cx: &mut App) {
+    let done = editor.update(cx, |s, cx| {
+        let (Some(lh), Some(bounds)) = (s.line_height(), s.text_bounds()) else { return false };
+        let row = s.display_map().buffer_line_to_display_row(line);
+        if s.visible_row_range().is_some_and(|r| r.start + 2 < row && row + 3 < r.end) {
+            return true;
+        }
+        let y = (bounds.size.height - lh) / 2. - lh * row as f32;
+        s.set_scroll_offset(point(px(0.), y.min(px(0.))), cx);
+        true
+    });
+    if !done && retry {
+        window.on_next_frame(move |window, cx| center_line(editor, line, false, window, cx));
+    }
+}
+
 /// `200 OK · 142 ms · 3.4 KB`
 fn summary(ex: &Exchange) -> String {
     let r = &ex.response;
@@ -1066,11 +1103,7 @@ impl Render for Respite {
             .on_action(cx.listener(|this, _: &Import, window, cx| this.import(window, cx)))
             .on_action(cx.listener(|this, _: &NextEnvironment, window, cx| this.next_env(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.show_settings = !this.show_settings;
-                this.show_history &= !this.show_settings;
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar = !this.sidebar;
                 cx.notify();
@@ -1198,12 +1231,20 @@ fn main() -> std::process::ExitCode {
             titlebar: Some(TitlebarOptions { title: Some("Respite".into()), ..Default::default() }),
             ..Default::default()
         };
-        cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| Respite::new(root, open, env_name, window, cx));
-            cx.new(|cx| Root::new(view, window, cx))
+        let main = cx
+            .open_window(options, |window, cx| {
+                let view = cx.new(|cx| Respite::new(root, open, env_name, window, cx));
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .unwrap()
+            .window_id();
+        // Closing the settings window keeps the app running.
+        cx.on_window_closed(move |cx, id| {
+            if id == main {
+                cx.quit();
+            }
         })
-        .unwrap();
-        cx.on_window_closed(|cx, _| cx.quit()).detach();
+        .detach();
         cx.activate(true);
     });
     std::process::ExitCode::SUCCESS
