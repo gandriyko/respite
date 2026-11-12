@@ -1,19 +1,21 @@
 //! Settings window (Cmd+,): edits the global settings file, applied live in the main window.
 
-use gpui::{prelude::FluentBuilder as _, *};
+use gpui::*;
 use gpui_component::{
     ActiveTheme as _, Root,
     button::Button,
+    menu::{DropdownMenu as _, PopupMenuItem},
     input::{Input, InputEvent, InputState},
     switch::Switch,
     tab::{Tab, TabBar},
 };
-use respite_settings::{Appearance, Loaded};
+use respite_settings::{Appearance, Keymap, Loaded};
 use serde_json::json;
 
 use crate::{CloseTab, Respite, themes::FAMILIES};
 
 const APPEARANCES: [(&str, Appearance); 3] = [("System", Appearance::System), ("Light", Appearance::Light), ("Dark", Appearance::Dark)];
+const KEYMAPS: [(&str, Keymap); 3] = [("Respite", Keymap::Default), ("VS Code", Keymap::Vscode), ("JetBrains", Keymap::Jetbrains)];
 
 impl Respite {
     /// Bring the settings window forward, opening it if it is not open.
@@ -157,27 +159,29 @@ impl Render for SettingsWindow {
             })),
             |bar, (label, _)| bar.child(Tab::new().label(*label)),
         );
-        let (border, accent, hover) = (cx.theme().border, cx.theme().primary, cx.theme().accent);
-        let families = div().flex().flex_wrap().justify_end().gap_2().max_w(px(380.)).children(FAMILIES.iter().map(|(name, light, dark)| {
-            let selected = s.theme == *name;
-            div()
-                .id(*name)
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(if selected { accent } else { border })
-                .when(selected, |d| d.bg(hover))
-                .cursor_pointer()
-                .hover(move |d| d.bg(hover))
-                .text_sm()
-                .child(match (light, dark) {
-                    (None, Some(_)) => format!("{name} (dark only)"),
-                    (Some(_), None) => format!("{name} (light only)"),
-                    _ => name.to_string(),
-                })
-                .on_click(cx.listener(move |this, _, _, cx| this.set("theme", json!(name), cx)))
-        }));
+        let keymap_ix = KEYMAPS.iter().position(|(_, k)| *k == s.keymap).unwrap_or(0);
+        let keymap = KEYMAPS.iter().fold(
+            TabBar::new("keymap").segmented().selected_index(keymap_ix).on_click(cx.listener(|this, ix: &usize, _, cx| {
+                this.set("keymap", json!(KEYMAPS[*ix].1), cx);
+            })),
+            |bar, (label, _)| bar.child(Tab::new().label(*label)),
+        );
+        let label = |name: &str, light: &Option<&str>, dark: &Option<&str>| match (light, dark) {
+            (None, Some(_)) => format!("{name} (dark only)"),
+            (Some(_), None) => format!("{name} (light only)"),
+            _ => name.to_string(),
+        };
+        let current = FAMILIES.iter().find(|f| f.0 == s.theme).map_or(s.theme.clone(), |(n, l, d)| label(n, l, d));
+        let view = cx.entity().downgrade();
+        let selected = s.theme.clone();
+        let families = Button::new("theme").label(current).dropdown_caret(true).outline().w(px(260.)).dropdown_menu(move |menu, _, _| {
+            FAMILIES.iter().fold(menu.scrollable(true).max_h(px(420.)), |menu, (name, light, dark)| {
+                let view = view.clone();
+                menu.item(PopupMenuItem::new(label(name, light, dark)).checked(selected == *name).on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.set("theme", json!(name), cx)).ok();
+                }))
+            })
+        });
 
         let path = l.global_path.as_ref().map_or("—".into(), |p| p.display().to_string());
         let body = div()
@@ -193,14 +197,16 @@ impl Render for SettingsWindow {
             .child(section("Editor"))
             .child(Self::row(&l, "Line numbers", "editor.line_numbers", switch("editor.line_numbers", s.editor.line_numbers, cx), cx))
             .child(Self::row(&l, "Soft wrap", "editor.soft_wrap", switch("editor.soft_wrap", s.editor.soft_wrap, cx), cx))
-            .child(Self::row(&l, "Status after the request line", "editor.inlay_status", switch("editor.inlay_status", s.editor.inlay_status, cx), cx))
-            .child(Self::row(
+            .child(Self::row(&l, "Status after the request line", "editor.inlay_status", switch("editor.inlay_status", s.editor.inlay_status, cx), cx))            .child(Self::row(
                 &l,
                 "Highlight the current line",
                 "editor.highlight_current_line",
                 switch("editor.highlight_current_line", s.editor.highlight_current_line, cx),
                 cx,
             ))
+            .child(section("Keyboard"))
+            .child(Self::row(&l, "Extra shortcuts", "keymap", keymap.into_any_element(), cx))
+            .child(div().text_xs().text_color(muted).child("Your own: keymap.json next to the settings file (Zed's format)."))
             .child(section("Requests"))
             .child(Self::row(&l, "Default timeout, ms", "request.timeout_ms", Input::new(&self.timeout_input).w(px(160.)).into_any_element(), cx))
             .child(Self::row(&l, "Follow redirects", "request.follow_redirects", switch("request.follow_redirects", s.request.follow_redirects, cx), cx))

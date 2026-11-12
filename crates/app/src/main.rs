@@ -5,13 +5,17 @@
 
 mod attach;
 mod doc;
+mod fixes;
 mod highlight;
 mod history_page;
+mod keymap;
 mod lang;
 mod palette;
+mod rename;
 mod runs;
 mod settings_page;
 mod sidebar;
+mod templates;
 mod themes;
 mod workspace;
 
@@ -42,11 +46,24 @@ actions!(
     [
         RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Import, Quit,
         NextEnvironment, ToggleHistory, InsertFile, RunAll, RunSelected, RepeatLast, CancelRequests, GoToFile, GoToRequest,
-        CommandPalette, PrevRequest, NextRequest
+        CommandPalette, PrevRequest, NextRequest, QuickFix, RenameSymbol, GoToWorkspaceRequest, FocusEditor, FocusResponse,
+        ExpandTemplate
     ]
 );
 
 const SAMPLE: &str = include_str!("../sample.http");
+
+/// A notification that is safe while the window is still being built (no `Root` yet: an
+/// immediate one panics), so startup paths use this.
+fn notify_later(window: &mut Window, cx: &mut App, msg: impl Into<SharedString>) {
+    let msg = msg.into();
+    window.defer(cx, move |window, cx| window.push_notification(msg, cx));
+}
+
+/// The user's `keymap.json`, next to the global `settings.json`.
+fn keymap_path(s: &respite_settings::Loaded) -> Option<PathBuf> {
+    Some(s.global_path.as_ref()?.parent()?.join("keymap.json"))
+}
 
 /// Starting point for "Create …" in the environment menu (only the Respite format is offered).
 /// The file to edit for environment `name` (`None` = Shared, `respite.json`): public before
@@ -117,6 +134,14 @@ struct Respite {
     history_filter: Entity<InputState>,
     /// Theme's own monospace font, used when `font_family` is empty.
     default_mono: SharedString,
+    /// Env files of the open tabs' chains at the last check; a change reloads the environments.
+    env_files_seen: Option<Vec<(PathBuf, Option<std::time::SystemTime>)>>,
+    /// Tabs, most recently used first (Ctrl+Tab).
+    mru: Vec<PathBuf>,
+    /// Ctrl+Tab held down: the MRU order when it started and how far it has gone.
+    tab_cycle: Option<(Vec<PathBuf>, usize)>,
+    /// A live template's remaining fields (Tab jumps to the next).
+    template: Option<templates::Session>,
     _subs: Vec<Subscription>,
 }
 
@@ -147,7 +172,7 @@ impl Respite {
         };
         let settings = respite_settings::Loaded::load(Some(&root));
         for e in &settings.errors {
-            window.push_notification(format!("Settings: {e}"), cx);
+            notify_later(window, cx, format!("Settings: {e}"));
         }
         let history_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: method, URL, name, file, status"));
         // The close button: with unsaved files, ask (as Quit does) instead of closing.
@@ -191,6 +216,10 @@ impl Respite {
             history_pick: None,
             history_filter,
             default_mono: cx.theme().mono_font_family.clone(),
+            env_files_seen: None,
+            mru: vec![],
+            tab_cycle: None,
+            template: None,
             _subs,
             env_name,
             executors: HashMap::new(),
@@ -239,11 +268,73 @@ impl Respite {
         this
     }
 
+    /// Open files changed on disk: an unedited tab takes the new text (as an undoable edit), an
+    /// edited one keeps the user's text and says so. A changed env file reloads the environments.
+    fn check_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for ix in 0..self.docs.len() {
+            let d = &mut self.docs[ix];
+            let now = doc::mtime(&d.path);
+            if now.is_none() || now == d.mtime {
+                continue;
+            }
+            d.mtime = now;
+            if d.dirty {
+                window.push_notification(format!("{} changed on disk; your unsaved edits are kept (saving overwrites it)", d.name()), cx);
+                continue;
+            }
+            let Ok(disk) = std::fs::read_to_string(&*d.path) else { continue };
+            let editor = d.editor.clone();
+            editor.update(cx, |s, cx| {
+                let old = s.value().to_string();
+                if old == disk {
+                    return;
+                }
+                let (range, text) = rename::changed(&old, &disk);
+                let rope = s.text();
+                let range = lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end));
+                s.apply_lsp_edits(&vec![lsp_types::TextEdit { range, new_text: text }], window, cx);
+            });
+            // The edit marks it dirty; it matches the disk.
+            self.docs[ix].dirty = false;
+            self.outlines.remove(&*self.docs[ix].path.clone());
+        }
+        let envs = self.env_stamp();
+        if self.env_files_seen.as_ref().is_some_and(|seen| *seen != envs) {
+            self.select_env(self.env_name.clone(), cx);
+        }
+        self.env_files_seen = Some(envs);
+    }
+
+    /// Env files (and their mtimes) in the chains of the open files, plus `env.files`.
+    fn env_stamp(&self) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+        let mut dirs: Vec<PathBuf> = vec![];
+        for d in &self.docs {
+            let root = self.root_of(&d.path);
+            dirs.extend(d.path.parent().into_iter().flat_map(Path::ancestors).take_while(|a| a.starts_with(&root)).map(Path::to_path_buf));
+            dirs.extend(self.settings.settings.env_files(&root));
+        }
+        dirs.sort();
+        dirs.dedup();
+        let mut out: Vec<_> = dirs
+            .iter()
+            .flat_map(|p| match std::fs::read_dir(p) {
+                Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| workspace::is_env_file(p)).collect(),
+                Err(_) => vec![p.clone()], // an `env.files` entry (a file, maybe missing)
+            })
+            .map(|p| {
+                let t = doc::mtime(&p);
+                (p, t)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Re-read the settings files when they change on disk (edited by hand, another window).
-    // ponytail: polls mtimes every second; switch to `notify` when file watching lands for .http/env files.
+    // ponytail: polls mtimes every second (with the open files); `notify` if this ever shows up in a profile.
     fn watch_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
         let stamp = |l: &respite_settings::Loaded| {
-            [&l.global_path, &l.workspace_path].map(|p| p.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
+            [&l.global_path, &l.workspace_path, &keymap_path(l)].map(|p| p.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
         };
         let mut last = stamp(&self.settings);
         cx.spawn_in(window, async move |this, cx| {
@@ -251,6 +342,7 @@ impl Respite {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                 let alive = this.update_in(cx, |this, window, cx| {
                     let now = stamp(&this.settings);
+                    this.check_files(window, cx);
                     if now == last {
                         return;
                     }
@@ -329,6 +421,10 @@ impl Respite {
         for view in [&self.resp_body, &self.resp_meta] {
             view.update(cx, |e, cx| e.set_soft_wrap(s.response.soft_wrap, window, cx));
         }
+        for e in keymap::apply(s.keymap, keymap_path(&self.settings).as_deref(), cx) {
+            notify_later(window, cx, e);
+        }
+        set_menus(cx); // the menus show the current shortcuts
         cx.refresh_windows();
     }
 
@@ -340,12 +436,11 @@ impl Respite {
                 let text = match text.map(Ok).unwrap_or_else(|| std::fs::read_to_string(&path)) {
                     Ok(t) => t,
                     Err(e) => {
-                        window.push_notification(format!("{}: {e}", path.display()), cx);
+                        notify_later(window, cx, format!("{}: {e}", path.display()));
                         return None;
                     }
                 };
                 let root = self.root_of(&path);
-                // ponytail: env loaded when the file opens; reload on env-file change comes with `notify` watching.
                 let env = self.env_for(&path, &root);
                 let st = &self.settings.settings;
                 let (line_numbers, soft_wrap) = (st.editor.line_numbers, st.editor.soft_wrap);
@@ -421,12 +516,13 @@ impl Respite {
                 ];
                 self.docs.push(Doc::new(path.clone(), editor, env, exec, subs, fold_counts, cx));
                 if let Some(e) = Environments::load(&path, &root, &[]).errors.first() {
-                    window.push_notification(format!("Env file skipped: {}: {}", e.0.display(), e.1), cx);
+                    notify_later(window, cx, format!("Env file skipped: {}: {}", e.0.display(), e.1));
                 }
                 self.docs.len() - 1
             }
         };
         self.current = Some(ix);
+        self.touch_mru();
         self.expanded.insert(path);
         // Now, not only on quit: closing the window or killing the process skips the quit hook.
         self.remember_position(cx);
@@ -444,9 +540,38 @@ impl Respite {
         self.current.map(|ix| &self.docs[ix])
     }
 
+    /// Any request running in the current tab (or a batch).
+    fn running(&self) -> bool {
+        self.batch.is_some() || self.doc().is_some_and(|d| !d.tasks.is_empty())
+    }
+
+    /// The current tab goes first in the Ctrl+Tab order (not while Ctrl+Tab is cycling).
+    fn touch_mru(&mut self) {
+        let Some(path) = self.doc().map(|d| (*d.path).clone()) else { return };
+        if self.tab_cycle.is_none() {
+            self.mru.retain(|p| *p != path);
+            self.mru.insert(0, path);
+        }
+    }
+
+    /// Ctrl+Tab: the previously used tab; again (Ctrl still held) the one before it, and so on.
+    fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open: Vec<PathBuf> = self.mru.iter().filter(|p| self.docs.iter().any(|d| *d.path == **p)).cloned().collect();
+        if open.len() < 2 {
+            return;
+        }
+        let (order, at) = self.tab_cycle.get_or_insert((open, 0));
+        *at = (*at + 1) % order.len();
+        let path = order[*at].clone();
+        if let Some(ix) = self.docs.iter().position(|d| *d.path == path) {
+            self.select(ix, window, cx);
+        }
+    }
+
     fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.docs.len() {
             self.current = Some(ix);
+            self.touch_mru();
             self.remember_position(cx);
             self.docs[ix].editor.update(cx, |s, cx| s.focus(window, cx));
             cx.notify();
@@ -499,6 +624,7 @@ impl Respite {
         match saved {
             Ok(()) => {
                 d.dirty = false;
+                d.mtime = doc::mtime(&d.path);
                 let path = (*d.path).clone();
                 self.outlines.remove(&path);
                 // A new file (e.g. the untitled sample) shows up in its project.
@@ -727,7 +853,7 @@ impl Respite {
     /// Merged variables for the selected environment, plus every environment name the file can see.
     fn env_for(&self, path: &Path, root: &Path) -> doc::EnvView {
         let envs = Environments::load(path, root, &self.settings.settings.env_files(root));
-        (envs.variables(self.env_name.as_deref()), envs.names(), envs.all_variables())
+        (envs.variables(self.env_name.as_deref()), envs.names(), envs.all_variables(), self.env_name.clone())
     }
 
     /// Switch every open file to `name` (`None` = no environment) and remember it for the
@@ -1335,6 +1461,40 @@ impl Render for Respite {
                 }
             }))
             .on_action(cx.listener(|this, _: &CancelRequests, _, cx| this.cancel_all(cx)))
+            // Cmd+.: a running request is cancelled; otherwise the editor's quick fixes open.
+            .on_action(cx.listener(|this, _: &QuickFix, window, cx| {
+                if this.running() {
+                    this.cancel_all(cx);
+                } else {
+                    window.dispatch_action(Box::new(gpui_component::input::ToggleCodeActions), cx);
+                }
+            }))
+            // Esc reaches here only when the editor had nothing of its own to close.
+            // ponytail: Esc that closes the completion menu also gets here (the menu propagates it).
+            .on_action(cx.listener(|this, _: &gpui_component::input::Escape, _, cx| {
+                if this.running() {
+                    this.cancel_all(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RenameSymbol, window, cx| this.rename_symbol(window, cx)))
+            .on_action(cx.listener(|this, _: &ExpandTemplate, window, cx| this.tab(window, cx)))
+            .on_action(cx.listener(|this, _: &GoToWorkspaceRequest, window, cx| this.pick_workspace_request(window, cx)))
+            .on_action(cx.listener(|this, _: &FocusEditor, window, cx| {
+                if let Some(d) = this.doc() {
+                    d.editor.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusResponse, window, cx| {
+                let view = if this.tab == 0 { &this.resp_body } else { &this.resp_meta };
+                view.update(cx, |s, cx| s.focus(window, cx));
+            }))
+            // Ctrl+Tab cycles in most-recently-used order while Ctrl is held; letting go commits.
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, _, _| {
+                if this.tab_cycle.is_some() && !ev.modifiers.modified() {
+                    this.tab_cycle = None;
+                    this.touch_mru();
+                }
+            }))
             .on_action(cx.listener(|this, _: &GoToFile, window, cx| this.pick_file(window, cx)))
             .on_action(cx.listener(|this, _: &GoToRequest, window, cx| this.pick_request(window, cx)))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.pick_command(commands(), window, cx)))
@@ -1359,11 +1519,7 @@ impl Render for Respite {
                 this.sidebar = !this.sidebar;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
-                if let Some(ix) = this.current {
-                    this.select((ix + 1) % this.docs.len(), window, cx);
-                }
-            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.next_tab(window, cx)))
             .child(
                 h_resizable("main")
                     .child(resizable_panel().size(px(260.)).size_range(px(160.)..px(520.)).visible(self.sidebar).child(sidebar))
@@ -1403,6 +1559,9 @@ fn set_menus(cx: &mut App) {
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
             MenuItem::separator(),
             MenuItem::action("Find", Search),
+            MenuItem::separator(),
+            MenuItem::action("Quick Fix…", QuickFix),
+            MenuItem::action("Rename…", RenameSymbol),
         ]),
         Menu::new("Request").items([
             MenuItem::action("Run Request", RunRequest),
@@ -1421,10 +1580,14 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("History", ToggleHistory),
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Next Tab", NextTab),
+            MenuItem::separator(),
+            MenuItem::action("Focus Editor", FocusEditor),
+            MenuItem::action("Focus Response", FocusResponse),
         ]),
         Menu::new("Go").items([
             MenuItem::action("Go to File…", GoToFile),
             MenuItem::action("Go to Request…", GoToRequest),
+            MenuItem::action("Go to Request in Workspace…", GoToWorkspaceRequest),
             MenuItem::action("Previous Request", PrevRequest),
             MenuItem::action("Next Request", NextRequest),
             MenuItem::separator(),
@@ -1447,6 +1610,11 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Next Environment", Box::new(NextEnvironment)),
         ("Go to File…", Box::new(GoToFile)),
         ("Go to Request…", Box::new(GoToRequest)),
+        ("Go to Request in Workspace…", Box::new(GoToWorkspaceRequest)),
+        ("Quick Fix…", Box::new(QuickFix)),
+        ("Rename…", Box::new(RenameSymbol)),
+        ("Focus Editor", Box::new(FocusEditor)),
+        ("Focus Response", Box::new(FocusResponse)),
         ("Previous Request", Box::new(PrevRequest)),
         ("Next Request", Box::new(NextRequest)),
         ("History", Box::new(ToggleHistory)),
@@ -1493,44 +1661,8 @@ fn main() -> std::process::ExitCode {
     gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx); // theme and fonts come from settings (Respite::apply_settings)
         themes::register(cx);
-        // `secondary-` is not supported by this GPUI version.
-        let m = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
-        let key = |k: &str| -> &'static str { format!("{m}-{k}").leak() };
-        // Editor keys go in its own "Input" context (later bindings win over its cmd-enter / cmd-v).
-        cx.bind_keys([
-            KeyBinding::new(key("enter"), RunRequest, Some("Input")),
-            KeyBinding::new(key("shift-enter"), RunAll, Some("Input")),
-            KeyBinding::new(key("alt-enter"), RunSelected, Some("Input")),
-            KeyBinding::new(key("alt-l"), RepeatLast, Some("Input")),
-            // Over the editor's code actions (Cmd+.), which have no provider here.
-            KeyBinding::new(key("."), CancelRequests, Some("Input")),
-            KeyBinding::new("alt-up", PrevRequest, Some("Input")),
-            KeyBinding::new("alt-down", NextRequest, Some("Input")),
-            KeyBinding::new(key("v"), SmartPaste, Some("Input")),
-            KeyBinding::new(key("shift-v"), gpui_component::input::Paste, Some("Input")),
-            KeyBinding::new(key("alt-v"), PasteCurl, Some("Input")),
-            KeyBinding::new(key("shift-c"), CopyAsCurl, Some("Input")),
-            KeyBinding::new(key("i"), InsertFile, Some("Input")),
-            // The editor has these actions but no default keys.
-            KeyBinding::new("f12", gpui_component::input::GoToDefinition, Some("Input")),
-            KeyBinding::new("ctrl-space", gpui_component::input::ShowCompletions, Some("Input")),
-        ]);
-        for ctx in ["Respite", "Input"] {
-            cx.bind_keys([
-                KeyBinding::new(key("s"), SaveFile, Some(ctx)),
-                KeyBinding::new(key("w"), CloseTab, Some(ctx)),
-                KeyBinding::new(key("b"), ToggleSidebar, Some(ctx)),
-                KeyBinding::new("ctrl-tab", NextTab, Some(ctx)),
-                KeyBinding::new(key(","), OpenSettings, Some(ctx)),
-                KeyBinding::new(key("alt-e"), NextEnvironment, Some(ctx)),
-                KeyBinding::new(key("y"), ToggleHistory, Some(ctx)),
-                KeyBinding::new(key("p"), GoToFile, Some(ctx)),
-                KeyBinding::new(key("shift-o"), GoToRequest, Some(ctx)),
-                KeyBinding::new(key("shift-p"), CommandPalette, Some(ctx)),
-            ]);
-        }
-        cx.bind_keys([KeyBinding::new(key("q"), Quit, None)]);
-        set_menus(cx);
+        // Shortcuts themselves are bound by `Respite::apply_settings` (they depend on settings).
+        keymap::init(cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1440.), px(880.)), cx)),
             titlebar: Some(TitlebarOptions { title: Some("Respite".into()), ..Default::default() }),

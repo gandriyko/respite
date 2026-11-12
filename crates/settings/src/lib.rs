@@ -20,10 +20,21 @@ pub enum Appearance {
     Dark,
 }
 
+/// Extra shortcuts on top of Respite's own; `keymap.json` next to the settings file wins over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Keymap {
+    #[default]
+    Default,
+    Vscode,
+    Jetbrains,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
+    pub keymap: Keymap,
     /// Theme family (`"Gruvbox"`, `"Catppuccin"`, …); `"Default"` = built-in.
     pub theme: String,
     /// UI text size, px.
@@ -119,6 +130,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             appearance: Appearance::System,
+            keymap: Keymap::Default,
             theme: "Default".into(),
             ui_font_size: 14.,
             font_family: String::new(),

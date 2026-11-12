@@ -19,6 +19,8 @@ pub struct Ctx {
     pub env: Arc<HashMap<String, Variable>>,
     /// Every environment: completion and diagnostics (a name defined in any of them is fine).
     pub all: Arc<HashMap<String, Variable>>,
+    /// The selected environment: where quick fixes define a missing variable.
+    pub env_name: Option<String>,
 }
 
 pub type Shared = Rc<RefCell<Ctx>>;
@@ -471,7 +473,7 @@ mod tests {
         let var = |v: &str, secret| Variable { value: v.into(), source: PathBuf::from("/p/respite-dev.json"), secret };
         let env = HashMap::from([("host".to_string(), var("http://x", false)), ("token".to_string(), var("s3cret", true))]);
         let all = Arc::new(env.clone());
-        Lang(Rc::new(RefCell::new(Ctx { path: Arc::new(PathBuf::from("/p/a.http")), env: Arc::new(env), all })))
+        Lang(Rc::new(RefCell::new(Ctx { path: Arc::new(PathBuf::from("/p/a.http")), env: Arc::new(env), all, env_name: None })))
     }
 
     fn labels(l: &Lang, src: &str) -> Vec<String> {

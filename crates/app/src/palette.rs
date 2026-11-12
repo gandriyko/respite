@@ -177,6 +177,31 @@ impl Respite {
         self.open_picker("Go to request…", items, window, cx);
     }
 
+    /// Cmd+T: requests of every request file in every project (open tabs: their unsaved text).
+    // ponytail: parses every file per open; cache by mtime if workspaces grow to thousands of files.
+    pub(crate) fn pick_workspace_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut items = vec![];
+        let projects: Vec<_> = self.projects.iter_mut().map(|p| (p.root.clone(), p.files.get_or_insert_with(|| crate::workspace::scan(&p.root)).clone())).collect();
+        for (root, files) in projects {
+            for f in files.into_iter().filter(|f| !crate::workspace::is_env_file(f)) {
+                let file = match self.docs.iter().find(|d| *d.path == f) {
+                    Some(d) => d.file.clone(),
+                    None => std::sync::Arc::new(http_syntax::parse(&std::fs::read_to_string(&f).unwrap_or_default())),
+                };
+                let rel = f.strip_prefix(&root).unwrap_or(&f).display().to_string();
+                for r in &file.requests {
+                    let (path, line) = (f.clone(), r.request_line);
+                    items.push(Item {
+                        label: r.label(),
+                        detail: format!("{} {} · {rel}", r.method, r.url),
+                        run: Rc::new(move |this, window, cx| this.go_to(path.clone(), line, false, window, cx)),
+                    });
+                }
+            }
+        }
+        self.open_picker("Go to request in workspace…", items, window, cx);
+    }
+
     /// Cmd+Shift+P: menu commands, by name.
     pub(crate) fn pick_command(&mut self, commands: Vec<(&'static str, Box<dyn Action>)>, window: &mut Window, cx: &mut Context<Self>) {
         let items = commands

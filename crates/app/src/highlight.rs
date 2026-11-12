@@ -108,6 +108,8 @@ fn compute(src: &str) -> (Vec<Span>, Vec<FoldRange>) {
                 match kind {
                     Body::Json => json(&mut spans, line, off),
                     Body::Form => form(&mut spans, line, off),
+                    Body::Xml => xml(&mut spans, line, off),
+                    Body::Code(lang) => code(&mut spans, line, off, *lang),
                     Body::Multipart if t.starts_with("--") => {
                         part_headers = true;
                         spans.push((base..end, Some("keyword")));
@@ -176,19 +178,149 @@ enum Body {
     Json,
     Form,
     Multipart,
+    Xml,
+    Code(Lang),
     Plain,
 }
 
-/// From `Content-Type`; without one, a body that opens with `{` / `[` is JSON.
+#[derive(Clone, Copy, PartialEq)]
+enum Lang {
+    GraphQl,
+    Js,
+}
+
+/// From `Content-Type` (or VS Code's `X-Request-Type: GraphQL`); without one, a body that opens
+/// with `{` / `[` is JSON and one that opens with a tag is XML.
 fn body_kind(r: &http_syntax::Request, b: &http_syntax::Body) -> Body {
-    let ct = r.headers.iter().find(|h| h.name.eq_ignore_ascii_case("content-type")).map(|h| h.value.to_ascii_lowercase());
-    match ct.as_deref() {
+    let header = |n: &str| r.headers.iter().find(|h| h.name.eq_ignore_ascii_case(n)).map(|h| h.value.to_ascii_lowercase());
+    if header("x-request-type").is_some_and(|v| v == "graphql") {
+        return Body::Code(Lang::GraphQl);
+    }
+    let t = b.text.trim_start();
+    match header("content-type").as_deref() {
+        Some(c) if c.contains("graphql") && !c.contains("json") => Body::Code(Lang::GraphQl),
         Some(c) if c.contains("json") => Body::Json,
         Some(c) if c.starts_with("multipart/") => Body::Multipart,
         Some(c) if c.contains("x-www-form-urlencoded") => Body::Form,
+        Some(c) if c.contains("xml") || c.contains("html") => Body::Xml,
+        Some(c) if c.contains("javascript") || c.contains("ecmascript") => Body::Code(Lang::Js),
         Some(_) => Body::Plain,
-        None if b.text.trim_start().starts_with(['{', '[']) => Body::Json,
+        None if t.starts_with(['{', '[']) => Body::Json,
+        None if t.starts_with('<') && t[1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '?' || c == '!') => Body::Xml,
         None => Body::Plain,
+    }
+}
+
+/// One line of XML / HTML: tags, attributes, values, comments, `{{vars}}` in text. Line-local:
+/// a tag or comment spanning lines is coloured on its first line only.
+fn xml(spans: &mut Vec<Span>, line: &str, at: usize) {
+    let mut i = 0;
+    while i < line.len() {
+        let rest = &line[i..];
+        if rest.starts_with("<!--") {
+            let end = rest.find("-->").map_or(line.len(), |p| i + p + 3);
+            spans.push((at + i..at + end, Some("comment")));
+            i = end;
+        } else if rest.starts_with('<') && !rest.starts_with("< ") {
+            // `<name` or `</name` / `<?xml`, then attributes up to `>`.
+            let name_end = rest[1..].find(|c: char| c.is_whitespace() || c == '>' || c == '/' && !rest[1..].starts_with('/')).map_or(line.len(), |p| i + 1 + p);
+            spans.push((at + i..at + name_end, Some("tag")));
+            i = name_end;
+            while i < line.len() && !line[i..].starts_with('>') {
+                let r = &line[i..];
+                if r.starts_with('"') || r.starts_with('\'') {
+                    let q = &r[..1];
+                    let end = r[1..].find(q).map_or(line.len(), |p| i + p + 2);
+                    vars(spans, &line[i..end], at + i, Some("string"));
+                    i = end;
+                } else if r.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == ':') {
+                    let end = r.find(|c: char| !(c.is_alphanumeric() || "_:-.".contains(c))).map_or(line.len(), |p| i + p);
+                    spans.push((at + i..at + end, Some("attribute")));
+                    i = end;
+                } else {
+                    let n = r.chars().next().map_or(1, char::len_utf8);
+                    spans.push((at + i..at + i + n, Some("tag")));
+                    i += n;
+                }
+            }
+            if i < line.len() {
+                spans.push((at + i..at + i + 1, Some("tag")));
+                i += 1;
+            }
+        } else {
+            let end = rest[1..].find('<').map_or(line.len(), |p| i + 1 + p);
+            vars(spans, &line[i..end], at + i, None);
+            i = end;
+        }
+    }
+}
+
+const GRAPHQL_KEYWORDS: &[&str] = &[
+    "query", "mutation", "subscription", "fragment", "on", "true", "false", "null", "schema", "type", "input", "enum", "interface", "union", "scalar",
+    "directive", "extend", "implements",
+];
+const JS_KEYWORDS: &[&str] = &[
+    "const", "let", "var", "function", "return", "if", "else", "for", "while", "do", "break", "continue", "new", "this", "typeof", "instanceof", "in",
+    "of", "class", "extends", "import", "export", "from", "default", "async", "await", "try", "catch", "finally", "throw", "switch", "case", "true",
+    "false", "null", "undefined", "yield", "delete", "void", "static",
+];
+
+/// One line of GraphQL or JavaScript: keywords, strings, numbers, comments, calls, `$vars`.
+fn code(spans: &mut Vec<Span>, line: &str, at: usize, lang: Lang) {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        let rest = &line[i..];
+        if (lang == Lang::GraphQl && rest.starts_with('#')) || (lang == Lang::Js && rest.starts_with("//")) {
+            spans.push((at + i..at + line.len(), Some("comment")));
+            return;
+        }
+        match b[i] {
+            q @ (b'"' | b'\'' | b'`') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                vars(spans, &line[start..i], at + start, Some("string"));
+            }
+            b'{' if b.get(i + 1) == Some(&b'{') => {
+                i = rest.find("}}").map_or(b.len(), |p| i + p + 2);
+                spans.push((at + start..at + i, Some("variable")));
+            }
+            b'0'..=b'9' => {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.') {
+                    i += 1;
+                }
+                spans.push((at + start..at + i, Some("number")));
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c == b'@' => {
+                i += 1;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                    i += 1;
+                }
+                let word = &line[start..i];
+                let keywords = if lang == Lang::GraphQl { GRAPHQL_KEYWORDS } else { JS_KEYWORDS };
+                let style = if keywords.contains(&word) {
+                    Some("keyword")
+                } else if word.starts_with('$') && lang == Lang::GraphQl {
+                    Some("variable")
+                } else if word.starts_with('@') {
+                    Some("attribute")
+                } else if line[i..].trim_start().starts_with('(') {
+                    Some("function")
+                } else if word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    Some("type")
+                } else if lang == Lang::GraphQl && line[i..].trim_start().starts_with(':') {
+                    Some("property")
+                } else {
+                    None
+                };
+                spans.push((at + start..at + i, style));
+            }
+            _ => i += rest.chars().next().map_or(1, char::len_utf8),
+        }
     }
 }
 
@@ -320,5 +452,31 @@ mod tests {
         // Only the 6-line multipart body folds (JSON and form bodies are one line); lines 0-based.
         let f = body_folds(&http_syntax::parse(src));
         assert_eq!(f.iter().map(|f| (f.start_line, f.end_line)).collect::<Vec<_>>(), [(15, 20)]);
+    }
+
+    #[test]
+    fn xml_graphql_js_bodies() {
+        let src = "### X\nPOST /x\nContent-Type: application/xml\n\n<?xml version=\"1.0\"?>\n<user id=\"{{id}}\"><!-- c --><name>Ada</name></user>\n\n\
+                   ### G\nPOST /g\nX-Request-Type: GraphQL\n\nquery Q($id: ID!) { user(id: $id) { name } } # c\n\n\
+                   ### J\nPOST /j\nContent-Type: text/javascript\n\nconst x = f(\"s\", 1); // c\n";
+        let (spans, _) = compute(src);
+        assert!(spans.windows(2).all(|w| w[0].0.end <= w[1].0.start));
+        let of = |s: &str| spans.iter().find(|(r, _)| &src[r.clone()] == s).and_then(|(_, n)| *n);
+        assert_eq!(of("<?xml"), Some("tag"));
+        assert_eq!(of("<user"), Some("tag"));
+        assert_eq!(of("id"), Some("attribute"));
+        assert_eq!(of("{{id}}"), Some("variable"));
+        assert_eq!(of("<!-- c -->"), Some("comment"));
+        assert_eq!(of("</name"), Some("tag"));
+        assert_eq!(of("Ada"), None);
+        assert_eq!(of("query"), Some("keyword"));
+        assert_eq!(of("$id"), Some("variable"));
+        assert_eq!(of("ID"), Some("type"));
+        assert_eq!(of("user"), Some("function"));
+        assert_eq!(of("# c"), Some("comment"));
+        assert_eq!(of("const"), Some("keyword"));
+        assert_eq!(of("f"), Some("function"));
+        assert_eq!(of("\"s\""), Some("string"));
+        assert_eq!(of("// c"), Some("comment"));
     }
 }

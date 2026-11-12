@@ -43,6 +43,8 @@ pub struct Doc {
     pub tasks: HashMap<usize, (u64, Task<()>)>,
     /// Edited since load / last save.
     pub dirty: bool,
+    /// The file's mtime when it was last read or written: a newer one means it changed on disk.
+    pub mtime: Option<std::time::SystemTime>,
     /// `false` for env files (`respite*.json`): plain JSON, no requests, no ▶.
     pub http: bool,
     fold_counts: FoldCounts,
@@ -55,14 +57,14 @@ pub struct Doc {
 pub type FoldCounts = std::rc::Rc<std::cell::RefCell<HashMap<usize, usize>>>;
 
 /// A file's environment: the selected one's variables, every environment name, and the
-/// variables of all environments together.
-pub type EnvView = (HashMap<String, Variable>, Vec<String>, HashMap<String, Variable>);
+/// variables of all environments together, and the selected environment's name.
+pub type EnvView = (HashMap<String, Variable>, Vec<String>, HashMap<String, Variable>, Option<String>);
 
 impl Doc {
     pub fn new(
         path: PathBuf,
         editor: Entity<EditorState>,
-        (env, env_names, all): EnvView,
+        (env, env_names, all, env_name): EnvView,
         exec: Arc<Executor>,
         subs: Vec<Subscription>,
         fold_counts: FoldCounts,
@@ -71,16 +73,18 @@ impl Doc {
         let block_bar = editor.update(cx, |s, cx| s.create_gutter_decorations_collection(vec![], cx));
         let http = !crate::workspace::is_env_file(&path);
         let (path, env) = (Arc::new(path), Arc::new(env));
-        let lang = std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { path: path.clone(), env: env.clone(), all: Arc::new(all) }));
-        if http {
-            let provider = std::rc::Rc::new(crate::lang::Lang(lang.clone()));
-            editor.update(cx, |s, _| {
-                let lsp = s.lsp_mut();
+        let lang = std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { path: path.clone(), env: env.clone(), all: Arc::new(all), env_name }));
+        let fixes = std::rc::Rc::new(crate::fixes::Fixes(lang.clone()));
+        editor.update(cx, |s, _| {
+            let lsp = s.lsp_mut();
+            lsp.code_action_providers.push(fixes);
+            if http {
+                let provider = std::rc::Rc::new(crate::lang::Lang(lang.clone()));
                 lsp.completion_provider = Some(provider.clone());
                 lsp.hover_provider = Some(provider.clone());
                 lsp.definition_provider = Some(provider);
-            });
-        }
+            }
+        });
         let mut doc = Self {
             path,
             editor,
@@ -94,11 +98,13 @@ impl Doc {
             status: HashMap::new(),
             tasks: HashMap::new(),
             dirty: false,
+            mtime: None,
             http,
             fold_counts,
             lang,
             _subs: subs,
         };
+        doc.mtime = mtime(&doc.path);
         doc.reparse(cx);
         doc.restore_responses();
         doc
@@ -126,6 +132,7 @@ impl Doc {
     /// Shares the highlighter's parse of the same text (see `highlight::parse`).
     pub fn reparse(&mut self, cx: &mut App) {
         if !self.http {
+            self.publish_json_error(cx);
             return;
         }
         let old = std::mem::replace(&mut self.file, crate::highlight::parse(&self.editor.read(cx).value()));
@@ -158,12 +165,35 @@ impl Doc {
         });
     }
 
+    /// Env file: a JSON error underlined where the parser stopped (the file is skipped until fixed).
+    fn publish_json_error(&self, cx: &mut App) {
+        let err = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&self.editor.read(cx).value()).err();
+        self.editor.update(cx, |s, cx| {
+            let Some(set) = s.diagnostics_mut() else { return };
+            set.clear();
+            if let Some(e) = err {
+                let (line, col) = (e.line().saturating_sub(1) as u32, e.column().saturating_sub(1) as u32);
+                let msg = e.to_string();
+                let msg = msg.rsplit_once(" at line ").map_or(msg.as_str(), |(m, _)| m);
+                set.push(lsp_types::Diagnostic {
+                    range: lsp_types::Range::new(lsp_types::Position::new(line, col), lsp_types::Position::new(line, col + 1)),
+                    severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                    code: Some(lsp_types::NumberOrString::String("invalid_json".into())),
+                    source: Some("respite".into()),
+                    message: format!("invalid JSON, the file is skipped: {msg}"),
+                    ..Default::default()
+                });
+            }
+            cx.notify();
+        });
+    }
+
     /// After an environment switch: new values for run, hover and diagnostics.
-    pub fn set_env(&mut self, (env, env_names, all): EnvView, exec: Arc<Executor>, cx: &mut App) {
+    pub fn set_env(&mut self, (env, env_names, all, env_name): EnvView, exec: Arc<Executor>, cx: &mut App) {
         (self.env, self.env_names, self.exec) = (Arc::new(env), env_names, exec);
         {
             let mut lang = self.lang.borrow_mut();
-            (lang.env, lang.all) = (self.env.clone(), Arc::new(all));
+            (lang.env, lang.all, lang.env_name) = (self.env.clone(), Arc::new(all), env_name);
         }
         if self.http {
             self.publish_diagnostics(cx);
@@ -195,6 +225,10 @@ impl Doc {
         let bar = cx.theme().primary;
         self.block_bar.set(range.iter().map(|r| GutterDecoration::new(r.clone()).with_color(bar)).collect(), cx);
     }
+}
+
+pub fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// Old request line → new one after an edit. Same number of blocks: matched in order (an edit

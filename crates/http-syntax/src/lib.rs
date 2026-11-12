@@ -159,6 +159,46 @@ fn diag(idx_or_line: usize, severity: Severity, code: &'static str, message: Str
     Diagnostic { line: idx_or_line, severity, code, message }
 }
 
+/// `{{var}}` replaced by `0` padded with spaces: valid both inside a string and as a bare value,
+/// and every byte keeps its line and column.
+pub fn mask_vars(text: &str) -> String {
+    let (mut out, mut rest) = (String::with_capacity(text.len()), text);
+    while let Some(open) = rest.find("{{") {
+        let Some(close) = rest[open..].find("}}").map(|c| c + open + 2).filter(|&c| !rest[open..c].contains('\n')) else { break };
+        out.push_str(&rest[..open]);
+        out.push('0');
+        out.extend(std::iter::repeat_n(' ', close - open - 1));
+        rest = &rest[close..];
+    }
+    out + rest
+}
+
+/// JSON error as (1-based line within `text`, message without position); `{{vars}}` allowed.
+pub fn check_json(text: &str) -> Result<(), (usize, String)> {
+    json_error(text).map_or(Ok(()), |(line, _, msg)| Err((line, msg)))
+}
+
+/// (1-based line, 1-based byte column, message) of the first JSON error; `{{vars}}` allowed.
+pub fn json_error(text: &str) -> Option<(usize, usize, String)> {
+    let e = serde_json::from_str::<serde_json::Value>(&mask_vars(text)).err()?;
+    let msg = e.to_string();
+    let msg = msg.rsplit_once(" at line ").map_or(msg.as_str(), |(m, _)| m).to_string();
+    Some((e.line().max(1), e.column().max(1), msg))
+}
+
+/// Byte offset of the comma a "trailing comma" error is about.
+pub fn trailing_comma(text: &str) -> Option<usize> {
+    let (line, col, msg) = json_error(text)?;
+    if !msg.starts_with("trailing comma") {
+        return None;
+    }
+    let start: usize = text.split_inclusive('\n').take(line - 1).map(str::len).sum();
+    // The error points at (or just past) the closing bracket.
+    let before = text[..(start + col).min(text.len())].trim_end();
+    let before = before.strip_suffix(['}', ']']).unwrap_or(before).trim_end();
+    before.ends_with(',').then(|| before.len() - 1)
+}
+
 fn comment(t: &str) -> Option<&str> {
     t.strip_prefix("//").or_else(|| t.strip_prefix('#')).map(str::trim)
 }
@@ -278,6 +318,12 @@ fn parse_block(
     }
     let body = (body_end > body_start)
         .then(|| Body { text: lines[body_start..body_end].join("\n"), line: body_start + 1 });
+    let json = headers.iter().any(|h| h.name.eq_ignore_ascii_case("content-type") && h.value.to_ascii_lowercase().contains("json"));
+    if let Some(b) = body.as_ref().filter(|b| json && !b.text.trim_start().starts_with('<'))
+        && let Err((line, message)) = check_json(&b.text)
+    {
+        file.diagnostics.push(diag(b.line + line - 1, Severity::Error, "invalid_json", format!("invalid JSON body: {message}")));
+    }
 
     // Tail: handler scripts and output redirect.
     let mut output = None;
@@ -401,6 +447,21 @@ mod tests {
             (17, "duplicate_name"),
             (19, "scripts_not_supported"),
         ]);
+    }
+
+    #[test]
+    fn invalid_json_body() {
+        let f = parse("POST /a\nContent-Type: application/json\n\n{\n  \"a\": {{n}},\n  \"b\": \"{{s}}\",\n}\n");
+        let d: Vec<_> = f.diagnostics.iter().map(|d| (d.line, d.code, d.message.as_str())).collect();
+        assert_eq!(d, [(7, "invalid_json", "invalid JSON body: trailing comma")]);
+        // Not JSON by Content-Type, or a file reference: not checked.
+        assert!(parse("POST /a\n\n{ broken\n").diagnostics.is_empty());
+        assert!(parse("POST /a\nContent-Type: application/json\n\n< ./a.json\n").diagnostics.is_empty());
+
+        let body = "{\n  \"a\": {{n}},\n  \"b\": [1, 2,]\n,}";
+        assert_eq!(trailing_comma(body), Some(body.find("2,").unwrap() + 1));
+        assert_eq!(trailing_comma("{\"a\": 1 , \n }"), Some(8));
+        assert_eq!(trailing_comma("{\"a\" 1}"), None);
     }
 
     #[test]
