@@ -11,7 +11,7 @@ use std::{
 };
 
 use gpui::{prelude::FluentBuilder as _, *};
-use gpui_component::{ActiveTheme as _, Icon, IconName, WindowExt as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, input::Input};
 use http_exec::Store;
 
 use crate::{
@@ -233,13 +233,27 @@ impl Respite {
         }
     }
 
-    fn build_rows(&mut self) -> Vec<Row> {
+    fn build_rows(&mut self, query: &str) -> Vec<Row> {
         let mut rows = vec![];
         for pi in 0..self.projects.len() {
+            // Files are scanned lazily on expand; searching needs them all.
+            if !query.is_empty() && self.projects[pi].files.is_none() {
+                self.projects[pi].files = Some(workspace::scan(&self.projects[pi].root));
+            }
             let p = &self.projects[pi];
             let (root, files, flat) = (p.root.clone(), p.files.clone().unwrap_or_default(), p.flat);
             if flat {
-                self.emit(&Tree::build(&root, &files), &root, 0, &mut rows);
+                self.emit(&Tree::build(&root, &files), &root, 0, query, &mut rows);
+                continue;
+            }
+            if !query.is_empty() {
+                // Searching: only projects with matches, always expanded.
+                let mut found = vec![];
+                self.emit(&Tree::build(&root, &files), &root, 1, query, &mut found);
+                if !found.is_empty() {
+                    rows.push(Row::Project(pi));
+                    rows.extend(found);
+                }
                 continue;
             }
             rows.push(Row::Project(pi));
@@ -249,12 +263,13 @@ impl Respite {
             if files.is_empty() {
                 rows.push(Row::Note { text: "No .http or .rest files", depth: 1 });
             }
-            self.emit(&Tree::build(&root, &files), &root, 1, &mut rows);
+            self.emit(&Tree::build(&root, &files), &root, 1, query, &mut rows);
         }
         rows
     }
 
-    fn emit(&mut self, tree: &Tree, base: &Path, depth: usize, rows: &mut Vec<Row>) {
+    fn emit(&mut self, tree: &Tree, base: &Path, depth: usize, query: &str, rows: &mut Vec<Row>) {
+        let searching = !query.is_empty();
         for (name, node) in &tree.dirs {
             // Compact folders: a chain of single-child folders shows as `a/b/c`.
             let (mut node, mut path, mut label) = (node, base.join(name), name.clone());
@@ -264,17 +279,40 @@ impl Respite {
             }
             // `Demo/Demo.http` alone in its folder (an imported collection) shows as just the file.
             if node.dirs.is_empty() && node.files.len() == 1 && node.files[0].file_stem() == path.file_name() {
-                self.emit(node, &path, depth, rows);
+                self.emit(node, &path, depth, query, rows);
+                continue;
+            }
+            if searching {
+                let mut found = vec![];
+                self.emit(node, &path, depth + 1, query, &mut found);
+                if !found.is_empty() {
+                    rows.push(Row::Dir { path: path.clone(), name: label, depth });
+                    rows.extend(found);
+                }
                 continue;
             }
             rows.push(Row::Dir { path: path.clone(), name: label, depth });
             if !self.collapsed_dirs.contains(&path) {
-                self.emit(node, &path, depth + 1, rows);
+                self.emit(node, &path, depth + 1, query, rows);
             }
         }
         for f in &tree.files {
             let outline = if workspace::is_env_file(f) { vec![] } else { self.outline_of(f) };
             let name = f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            if searching {
+                // A file-name match keeps all its requests; otherwise only the matching ones.
+                let file_hit = name.to_lowercase().contains(query);
+                let hits: Vec<_> = outline
+                    .into_iter()
+                    .filter(|(_, m, l)| file_hit || l.to_lowercase().contains(query) || m.to_lowercase().contains(query))
+                    .collect();
+                if hits.is_empty() && !file_hit {
+                    continue;
+                }
+                rows.push(Row::File { path: f.clone(), name, depth, requests: hits.len() });
+                rows.extend(hits.into_iter().map(|(line, method, label)| Row::Request { path: f.clone(), line, method, label, depth: depth + 1 }));
+                continue;
+            }
             rows.push(Row::File { path: f.clone(), name, depth, requests: outline.len() });
             if self.expanded.contains(f) {
                 rows.extend(outline.into_iter().map(|(line, method, label)| Row::Request { path: f.clone(), line, method, label, depth: depth + 1 }));
@@ -423,8 +461,28 @@ impl Respite {
         div().w_full().px_1().child(row).into_any_element()
     }
 
+    /// ↑/↓ in the search field: select the previous / next request row, keeping focus in the field.
+    fn step_search_hit(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let reqs: Vec<(PathBuf, usize)> =
+            self.rows.iter().filter_map(|r| if let Row::Request { path, line, .. } = r { Some((path.clone(), *line)) } else { None }).collect();
+        if reqs.is_empty() {
+            return;
+        }
+        let cur = self.doc().and_then(|d| d.active.map(|l| (d.path.to_path_buf(), l)));
+        let next = match cur.and_then(|c| reqs.iter().position(|r| *r == c)) {
+            Some(i) => (i as isize + step).clamp(0, reqs.len() as isize - 1) as usize,
+            None if step > 0 => 0,
+            None => reqs.len() - 1,
+        };
+        let (path, line) = reqs[next].clone();
+        self.go_to(path, line, false, window, cx);
+        self.sidebar_filter.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
     pub(crate) fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.rows = self.build_rows();
+        let query = self.sidebar_filter.read(cx).value().trim().to_lowercase();
+        self.rows = self.build_rows(&query);
         let list = uniform_list("sidebar", self.rows.len(), cx.processor(|this, range: Range<usize>, _, cx| {
             range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
         }));
@@ -446,6 +504,15 @@ impl Respite {
             .text_color(muted)
             .child("PROJECTS")
             .child(icon_button("add-project", IconName::Plus).on_click(cx.listener(|this, _, _, cx| this.add_project(cx))));
+        let search = div().flex_none().px_2().pb_1p5().capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+            let step = match ev.keystroke.key.as_str() {
+                "up" => -1,
+                "down" => 1,
+                _ => return,
+            };
+            cx.stop_propagation();
+            this.step_search_hit(step, window, cx);
+        })).child(Input::new(&self.sidebar_filter).small().cleanable(true));
         let item = |id: &'static str, icon: IconName, label: &'static str| {
             div()
                 .id(id)
@@ -478,6 +545,7 @@ impl Respite {
             .bg(t.sidebar)
             .text_color(t.sidebar_foreground)
             .child(header)
+            .child(search)
             .child(div().flex_1().min_h_0().child(list.size_full()))
             .child(div().flex_none().h(px(1.)).mx_2().bg(t.sidebar_border))
             .child(footer)

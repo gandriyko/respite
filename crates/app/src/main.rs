@@ -103,6 +103,7 @@ struct Respite {
     /// `(request_line, method, label)` of files that are not open, parsed when expanded.
     outlines: HashMap<PathBuf, Vec<(usize, String, String)>>,
     rows: Vec<sidebar::Row>,
+    sidebar_filter: Entity<InputState>,
     /// Folders are open by default; this holds the collapsed ones.
     collapsed_dirs: HashSet<PathBuf>,
     sidebar: bool,
@@ -213,6 +214,7 @@ impl Respite {
             notify_later(window, cx, format!("Settings: {e}"));
         }
         let history_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: method, URL, name, file, status"));
+        let sidebar_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search requests"));
         let body_filter = cx.new(|cx| InputState::new(window, cx).placeholder("JSONPath filter, e.g. $.items[*].id"));
         // The close button: with unsaved files, ask (as Quit does) instead of closing.
         let view = cx.entity().downgrade();
@@ -228,6 +230,11 @@ impl Respite {
         });
         let _subs = vec![
             cx.subscribe_in(&history_filter, window, |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&sidebar_filter, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
@@ -259,6 +266,7 @@ impl Respite {
             history_rows: vec![],
             history_pick: None,
             history_filter,
+            sidebar_filter,
             default_mono: cx.theme().mono_font_family.clone(),
             env_files_seen: None,
             mru: vec![],
