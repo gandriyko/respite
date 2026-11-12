@@ -35,6 +35,8 @@ pub struct Doc {
     pub active: Option<usize>,
     /// Byte range currently decorated as the active block.
     applied: Option<Range<usize>>,
+    /// 0-based first / last line of the active block, for its background tint.
+    block_lines: Option<(usize, usize)>,
     block_bar: GutterDecorationCollection,
     /// Keyed by request line; `reparse` moves entries along with their block.
     pub status: HashMap<usize, Status>,
@@ -94,6 +96,7 @@ impl Doc {
             exec,
             active: None,
             applied: None,
+            block_lines: None,
             block_bar,
             status: HashMap::new(),
             tasks: HashMap::new(),
@@ -208,6 +211,7 @@ impl Doc {
     pub fn sync_active(&mut self, cx: &mut App) {
         let req = self.cursor_request(cx).map(|r| (r.request_line, r.lines.clone()));
         self.active = req.as_ref().map(|r| r.0);
+        self.block_lines = req.as_ref().map(|(_, l)| (l.start() - 1, l.end() - 1));
         let range = req.map(|(_, lines)| {
             let t = self.editor.read(cx).text();
             t.line_start_offset(lines.start() - 1)..t.line_end_offset(lines.end() - 1)
@@ -218,12 +222,33 @@ impl Doc {
             return;
         }
         self.applied = range.clone();
-        // Only a gutter bar marks the block (as in Zed / JetBrains): gpui-component has no
-        // full-width line background, and a text-range fill paints a ragged edge plus an extra
-        // cell for every line's `\n`.
-        // ponytail: bring a background back if the editor gains full-width line decorations.
         let bar = cx.theme().primary;
         self.block_bar.set(range.iter().map(|r| GutterDecoration::new(r.clone()).with_color(bar)).collect(), cx);
+    }
+
+    /// A faint full-width tint over the active block, laid over the editor (whose own range
+    /// fill is ragged: it follows each line's text). Geometry is read at paint time, after the
+    /// editor's prepaint, so it tracks scrolling and wrapping.
+    pub fn block_tint(&self) -> impl IntoElement {
+        let (editor, lines) = (self.editor.clone(), self.block_lines);
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                let Some((first, last)) = lines else { return };
+                let s = editor.read(cx);
+                let Some(vis) = s.visible_row_range().filter(|v| first < v.end && last >= v.start) else { return };
+                let text = s.text();
+                // An offset above the viewport resolves to the first visible line, so `top` clamps.
+                let Some(top) = s.range_to_bounds(&(text.line_start_offset(first)..text.line_start_offset(first))) else { return };
+                let end = text.line_end_offset(last);
+                let bottom = (last < vis.end).then(|| s.range_to_bounds(&(end..end))).flatten().map_or(bounds.bottom(), |b| b.bottom());
+                let left = top.left().max(bounds.left());
+                let rect = Bounds::from_corners(point(left, top.top().max(bounds.top())), point(bounds.right(), bottom.min(bounds.bottom())));
+                window.paint_quad(fill(rect, cx.theme().primary.opacity(0.07)));
+            },
+        )
+        .absolute()
+        .inset_0()
     }
 }
 

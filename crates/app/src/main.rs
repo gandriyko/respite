@@ -1106,7 +1106,7 @@ impl Respite {
             return self.history_page(cx);
         }
         let body = match self.doc() {
-            Some(d) => div().flex_1().min_h_0().child(Editor::new(&d.editor).size_full()),
+            Some(d) => div().flex_1().min_h_0().relative().child(Editor::new(&d.editor).size_full()).child(d.block_tint()),
             None => div()
                 .flex_1()
                 .flex()
