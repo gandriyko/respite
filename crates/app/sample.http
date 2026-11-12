@@ -1,0 +1,26 @@
+@baseUrl = https://httpbin.org
+
+### List users
+# @name listUsers
+GET {{baseUrl}}/get
+    ?page=1
+    &limit=20
+Accept: application/json
+
+### Create user
+# @name createUser
+# @timeout 10 s
+POST {{baseUrl}}/post HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "id": "{{$uuid}}",
+  "name": "Anya"
+}
+
+### Delete
+DELETE {{baseUrl}}/delete
+
+### Unnamed
+{{baseUrl}}/status/418
