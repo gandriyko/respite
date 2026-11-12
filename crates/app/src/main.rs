@@ -235,7 +235,44 @@ impl Respite {
             }
         }
         this.apply_settings(window, cx);
+        this.watch_settings(window, cx);
         this
+    }
+
+    /// Re-read the settings files when they change on disk (edited by hand, another window).
+    // ponytail: polls mtimes every second; switch to `notify` when file watching lands for .http/env files.
+    fn watch_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let stamp = |l: &respite_settings::Loaded| {
+            [&l.global_path, &l.workspace_path].map(|p| p.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
+        };
+        let mut last = stamp(&self.settings);
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    let now = stamp(&this.settings);
+                    if now == last {
+                        return;
+                    }
+                    last = now;
+                    let fresh = respite_settings::Loaded::load_from(this.settings.global_path.clone(), this.settings.workspace_path.clone());
+                    // A half-written or broken file keeps the current settings.
+                    if !fresh.errors.is_empty() {
+                        for e in &fresh.errors {
+                            window.push_notification(format!("Settings: {e}"), cx);
+                        }
+                        return;
+                    }
+                    this.settings = fresh;
+                    this.apply_settings(window, cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn executor(&mut self, root: &Path) -> Arc<Executor> {

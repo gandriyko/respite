@@ -4,24 +4,41 @@
 use gpui::App;
 use gpui_component::{Theme, ThemeMode, ThemeRegistry};
 
-const SETS: [&str; 6] = [
+const SETS: [&str; 14] = [
     include_str!("../themes/gruvbox.json"),
     include_str!("../themes/catppuccin.json"),
     include_str!("../themes/tokyonight.json"),
     include_str!("../themes/ayu.json"),
     include_str!("../themes/everforest.json"),
     include_str!("../themes/solarized.json"),
+    include_str!("../themes/flexoki.json"),
+    include_str!("../themes/hybrid.json"),
+    include_str!("../themes/macos-classic.json"),
+    include_str!("../themes/mellifluous.json"),
+    include_str!("../themes/molokai.json"),
+    include_str!("../themes/aurora.json"),
+    include_str!("../themes/jellybeans.json"),
+    include_str!("../themes/spaceduck.json"),
 ];
 
 /// (family, light variant, dark variant); `None` falls back to the built-in theme of that mode.
-pub const FAMILIES: [(&str, Option<&str>, Option<&str>); 7] = [
+pub const FAMILIES: [(&str, Option<&str>, Option<&str>); 16] = [
     ("Default", None, None),
+    ("macOS Classic", Some("macOS Classic Light"), Some("macOS Classic Dark")),
     ("Gruvbox", Some("Gruvbox Light"), Some("Gruvbox Dark")),
     ("Catppuccin", Some("Catppuccin Latte"), Some("Catppuccin Mocha")),
-    ("Tokyo Night", None, Some("Tokyo Night")),
+    ("Solarized", Some("Solarized Light"), Some("Solarized Dark")),
     ("Ayu", Some("Ayu Light"), Some("Ayu Dark")),
     ("Everforest", Some("Everforest Light"), Some("Everforest Dark")),
-    ("Solarized", Some("Solarized Light"), Some("Solarized Dark")),
+    ("Flexoki", Some("Flexoki Light"), Some("Flexoki Dark")),
+    ("Hybrid", Some("Hybrid Light"), Some("Hybrid Dark")),
+    ("Mellifluous", Some("Mellifluous Light"), Some("Mellifluous Dark")),
+    ("Molokai", Some("Molokai Light"), Some("Molokai Dark")),
+    ("Aurora", Some("Aurora Light"), None),
+    ("Tokyo Night", None, Some("Tokyo Night")),
+    ("Tokyo Storm", None, Some("Tokyo Storm")),
+    ("Jellybeans", None, Some("Jellybeans")),
+    ("Spaceduck", None, Some("Spaceduck")),
 ];
 
 pub fn register(cx: &mut App) {
@@ -34,7 +51,7 @@ pub fn register(cx: &mut App) {
 
 thread_local! {
     /// The current theme's text colour, for painters that get no `cx` (the fold placeholder).
-    static TEXT: std::cell::Cell<gpui::Hsla> = std::cell::Cell::new(gpui::white());
+    static TEXT: std::cell::Cell<gpui::Hsla> = const { std::cell::Cell::new(gpui::white()) };
 }
 
 pub fn text_color() -> gpui::Hsla {

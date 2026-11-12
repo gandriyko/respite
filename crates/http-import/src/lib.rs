@@ -159,8 +159,11 @@ pub fn block(r: &Req) -> String {
 }
 
 /// Env file of an environment: `respite.json` for `$shared`, else `respite-<env>.json`.
-fn env_file(env: &str, private: bool) -> String {
-    let stem = if env == "$shared" { "respite".to_string() } else { format!("respite-{}", sanitize(env)) };
+pub(crate) fn env_file(env: &str, private: bool) -> String {
+    // `x.private` would read back as the private env `x`: write it as `x-private`.
+    let env = sanitize(env);
+    let env = env.strip_suffix(".private").map_or(env.clone(), |x| format!("{x}-private"));
+    let stem = if env == "$shared" { "respite".to_string() } else { format!("respite-{env}") };
     format!("{stem}{}.json", if private { ".private" } else { "" })
 }
 

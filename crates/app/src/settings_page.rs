@@ -62,23 +62,43 @@ impl SettingsWindow {
         let s = app.upgrade().map(|a| a.read(cx).settings.settings.clone()).unwrap_or_default();
         let font_input = cx.new(|cx| InputState::new(window, cx).placeholder("Default monospace font").default_value(s.font_family.clone()));
         let timeout_input = cx.new(|cx| InputState::new(window, cx).placeholder("0 = no limit").default_value(s.request.timeout_ms.to_string()));
-        let _subs = vec![
+        // Only real edits are written: syncing an input from the file must not write it back
+        // (a project override would land in the global file).
+        let mut _subs = vec![
             cx.subscribe(&font_input, |this, input, ev: &InputEvent, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    let v = input.read(cx).value().to_string();
-                    this.set("font_family", v.trim().into(), cx);
+                let v = input.read(cx).value().trim().to_string();
+                if matches!(ev, InputEvent::Change) && Some(&v) != this.current(cx).map(|s| s.font_family).as_ref() {
+                    this.set("font_family", v.into(), cx);
                 }
             }),
             cx.subscribe(&timeout_input, |this, input, ev: &InputEvent, cx| {
                 // Invalid numbers are ignored until they parse.
-                if let (InputEvent::Change, Ok(ms)) = (ev, input.read(cx).value().trim().parse::<u64>()) {
+                if let (InputEvent::Change, Ok(ms)) = (ev, input.read(cx).value().trim().parse::<u64>())
+                    && Some(ms) != this.current(cx).map(|s| s.request.timeout_ms)
+                {
                     this.set("request.timeout_ms", ms.into(), cx);
                 }
             }),
         ];
+        // Settings changed elsewhere (the file on disk): refresh the text inputs not being edited.
+        if let Some(entity) = app.upgrade() {
+            _subs.push(cx.observe_in(&entity, window, |this, app, window, cx| {
+                let s = app.read(cx).settings.settings.clone();
+                for (input, value) in [(&this.font_input, s.font_family), (&this.timeout_input, s.request.timeout_ms.to_string())] {
+                    if !input.focus_handle(cx).is_focused(window) && input.read(cx).value() != value {
+                        input.update(cx, |i, cx| i.set_value(value, window, cx));
+                    }
+                }
+                cx.notify();
+            }));
+        }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         Self { app, main, focus, font_input, timeout_input, _subs }
+    }
+
+    fn current(&self, cx: &App) -> Option<respite_settings::Settings> {
+        self.app.upgrade().map(|a| a.read(cx).settings.settings.clone())
     }
 
     fn set(&mut self, key: &str, value: serde_json::Value, cx: &mut Context<Self>) {
@@ -138,7 +158,7 @@ impl Render for SettingsWindow {
             |bar, (label, _)| bar.child(Tab::new().label(*label)),
         );
         let (border, accent, hover) = (cx.theme().border, cx.theme().primary, cx.theme().accent);
-        let families = div().flex().flex_wrap().justify_end().gap_2().max_w(px(380.)).children(FAMILIES.iter().map(|(name, light, _)| {
+        let families = div().flex().flex_wrap().justify_end().gap_2().max_w(px(380.)).children(FAMILIES.iter().map(|(name, light, dark)| {
             let selected = s.theme == *name;
             div()
                 .id(*name)
@@ -151,7 +171,11 @@ impl Render for SettingsWindow {
                 .cursor_pointer()
                 .hover(move |d| d.bg(hover))
                 .text_sm()
-                .child(if light.is_none() && *name != "Default" { format!("{name} (dark only)") } else { name.to_string() })
+                .child(match (light, dark) {
+                    (None, Some(_)) => format!("{name} (dark only)"),
+                    (Some(_), None) => format!("{name} (light only)"),
+                    _ => name.to_string(),
+                })
                 .on_click(cx.listener(move |this, _, _, cx| this.set("theme", json!(name), cx)))
         }));
 

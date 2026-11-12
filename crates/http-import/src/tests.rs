@@ -184,3 +184,10 @@ fn har_and_write() {
 
     assert!(import_str("{\"hello\": 1}", "x").is_err());
 }
+
+#[test]
+fn env_named_like_private_file() {
+    assert_eq!(env_file("x.private", false), "respite-x-private.json");
+    assert_eq!(env_file("x.private", true), "respite-x-private.private.json");
+    assert_eq!(env_file("$shared", true), "respite.private.json");
+}

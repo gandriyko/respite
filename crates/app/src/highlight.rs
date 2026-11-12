@@ -303,7 +303,7 @@ mod tests {
                    ### M\nPOST /m\nContent-Type: multipart/form-data; boundary=B\n\n--B\nContent-Disposition: form-data; name=\"f\"\n\n{\"k\": 1}\n< ./a.png\n--B--\n";
         let (spans, _) = compute(src);
         assert!(spans.windows(2).all(|w| w[0].0.end <= w[1].0.start));
-        let of = |s: &str| spans.iter().find(|(r, _)| &src[r.clone()] == s).map(|(_, n)| *n).flatten();
+        let of = |s: &str| spans.iter().find(|(r, _)| &src[r.clone()] == s).and_then(|(_, n)| *n);
         assert_eq!(of("\"id\""), Some("property"));
         assert_eq!(of("12"), Some("number"));
         assert_eq!(of("true"), Some("boolean"));
