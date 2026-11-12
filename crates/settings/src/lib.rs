@@ -35,6 +35,10 @@ pub enum Keymap {
 pub struct Settings {
     pub appearance: Appearance,
     pub keymap: Keymap,
+    /// Cmd+\ toggles it.
+    pub split: Split,
+    /// The editor's share of the editor + response area, 0.2–0.8.
+    pub split_ratio: f32,
     /// Theme family (`"Gruvbox"`, `"Catppuccin"`, …); `"Default"` = built-in.
     pub theme: String,
     /// UI text size, px.
@@ -56,8 +60,6 @@ pub struct Settings {
 pub struct Editor {
     pub line_numbers: bool,
     pub soft_wrap: bool,
-    /// `200 OK · 142 ms · 3.4 KB` after the request line.
-    pub inlay_status: bool,
     /// Background on the line under the cursor.
     pub highlight_current_line: bool,
 }
@@ -68,12 +70,25 @@ pub struct Editor {
 pub struct ResponseView {
     /// Wrap long lines (toggled from the panel's Wrap button).
     pub soft_wrap: bool,
+    /// Bigger bodies are shown as is, without pretty-printing.
+    pub format_limit_mb: f64,
+    /// Bigger bodies are not shown at all, only saved to a file.
+    pub preview_limit_mb: f64,
 }
 
 impl Default for ResponseView {
     fn default() -> Self {
-        Self { soft_wrap: true }
+        Self { soft_wrap: true, format_limit_mb: 10., preview_limit_mb: 100. }
     }
+}
+
+/// Editor and response panel side by side (`horizontal`) or stacked (`vertical`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Split {
+    #[default]
+    Horizontal,
+    Vertical,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +146,8 @@ impl Default for Settings {
         Self {
             appearance: Appearance::System,
             keymap: Keymap::Default,
+            split: Split::Horizontal,
+            split_ratio: 0.55,
             theme: "Default".into(),
             ui_font_size: 14.,
             font_family: String::new(),
@@ -147,7 +164,7 @@ impl Default for Settings {
 
 impl Default for Editor {
     fn default() -> Self {
-        Self { line_numbers: true, soft_wrap: false, inlay_status: true, highlight_current_line: false }
+        Self { line_numbers: true, soft_wrap: false, highlight_current_line: false }
     }
 }
 

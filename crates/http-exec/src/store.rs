@@ -41,6 +41,14 @@ pub struct Entry {
     pub total_ms: u64,
     pub size_bytes: usize,
     pub dependencies: Vec<String>,
+    /// Final URL after redirects (absent in older entries).
+    #[serde(default)]
+    pub response_url: String,
+    #[serde(default)]
+    pub redirects: Vec<crate::Redirect>,
+    /// Names of the cookies sent; values are masked like the `Cookie` header.
+    #[serde(default)]
+    pub cookies_sent: Vec<String>,
 }
 
 pub struct Store {
@@ -119,6 +127,9 @@ impl Store {
             total_ms: rs.total.as_millis() as u64,
             size_bytes: rs.body.len(),
             dependencies: ex.dependencies.clone(),
+            response_url: mask(&rs.url),
+            redirects: rs.redirects.iter().map(|r| crate::Redirect { status: r.status, from: mask(&r.from), to: mask(&r.to) }).collect(),
+            cookies_sent: rs.cookies_sent.iter().map(|(n, _)| n.clone()).collect(),
         };
         std::fs::write(self.dir.join(format!("{id}.body")), &rs.body)?;
         std::fs::write(self.dir.join(format!("{id}.json")), serde_json::to_vec_pretty(&entry).map_err(io::Error::other)?)?;
@@ -183,6 +194,9 @@ impl Store {
                 body,
                 ttfb: Duration::from_millis(entry.ttfb_ms),
                 total: Duration::from_millis(entry.total_ms),
+                url: entry.response_url,
+                redirects: entry.redirects,
+                cookies_sent: entry.cookies_sent.into_iter().map(|n| (n, MASK.into())).collect(),
             },
             dependencies: entry.dependencies,
             history_id: Some(entry.id),
@@ -255,6 +269,7 @@ mod tests {
                 body: b"{\"a\":1}".to_vec(),
                 ttfb: Duration::from_millis(5),
                 total: Duration::from_millis(9),
+                ..Default::default()
             },
             dependencies: vec![],
             history_id: None,

@@ -80,6 +80,19 @@ async fn bodies_auth_graphql_redirect() {
 }
 
 #[tokio::test]
+async fn redirect_chain_recorded() {
+    let server = MockServer::start().await;
+    Mock::given(path("/a")).respond_with(ResponseTemplate::new(301).insert_header("location", "/b")).mount(&server).await;
+    Mock::given(path("/b")).respond_with(ResponseTemplate::new(302).insert_header("location", "/c")).mount(&server).await;
+    Mock::given(path("/c")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+    let base = server.uri();
+    let r = run("GET {{baseUrl}}/a\n", Path::new("/tmp"), &base, 0).await.unwrap().response;
+    assert_eq!((r.status, r.url.as_str()), (200, format!("{base}/c").as_str()));
+    let hops: Vec<_> = r.redirects.iter().map(|h| (h.status, h.from.as_str(), h.to.as_str())).collect();
+    assert_eq!(hops, [(301, format!("{base}/a").as_str(), format!("{base}/b").as_str()), (302, format!("{base}/b").as_str(), format!("{base}/c").as_str())]);
+}
+
+#[tokio::test]
 async fn history_cache_and_cookies_survive_restart() {
     let server = MockServer::start().await;
     Mock::given(path("/auth"))

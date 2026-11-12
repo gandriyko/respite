@@ -9,12 +9,13 @@ use gpui_component::{
     switch::Switch,
     tab::{Tab, TabBar},
 };
-use respite_settings::{Appearance, Keymap, Loaded};
+use respite_settings::{Appearance, Keymap, Loaded, Split};
 use serde_json::json;
 
 use crate::{CloseTab, Respite, themes::FAMILIES};
 
 const APPEARANCES: [(&str, Appearance); 3] = [("System", Appearance::System), ("Light", Appearance::Light), ("Dark", Appearance::Dark)];
+const SPLITS: [(&str, Split); 2] = [("Side by side", Split::Horizontal), ("Stacked", Split::Vertical)];
 const KEYMAPS: [(&str, Keymap); 3] = [("Respite", Keymap::Default), ("VS Code", Keymap::Vscode), ("JetBrains", Keymap::Jetbrains)];
 
 impl Respite {
@@ -159,6 +160,13 @@ impl Render for SettingsWindow {
             })),
             |bar, (label, _)| bar.child(Tab::new().label(*label)),
         );
+        let split_ix = SPLITS.iter().position(|(_, k)| *k == s.split).unwrap_or(0);
+        let split = SPLITS.iter().fold(
+            TabBar::new("split").segmented().selected_index(split_ix).on_click(cx.listener(|this, ix: &usize, _, cx| {
+                this.set("split", json!(SPLITS[*ix].1), cx);
+            })),
+            |bar, (label, _)| bar.child(Tab::new().label(*label)),
+        );
         let keymap_ix = KEYMAPS.iter().position(|(_, k)| *k == s.keymap).unwrap_or(0);
         let keymap = KEYMAPS.iter().fold(
             TabBar::new("keymap").segmented().selected_index(keymap_ix).on_click(cx.listener(|this, ix: &usize, _, cx| {
@@ -197,13 +205,17 @@ impl Render for SettingsWindow {
             .child(section("Editor"))
             .child(Self::row(&l, "Line numbers", "editor.line_numbers", switch("editor.line_numbers", s.editor.line_numbers, cx), cx))
             .child(Self::row(&l, "Soft wrap", "editor.soft_wrap", switch("editor.soft_wrap", s.editor.soft_wrap, cx), cx))
-            .child(Self::row(&l, "Status after the request line", "editor.inlay_status", switch("editor.inlay_status", s.editor.inlay_status, cx), cx))            .child(Self::row(
+            .child(Self::row(
                 &l,
                 "Highlight the current line",
                 "editor.highlight_current_line",
                 switch("editor.highlight_current_line", s.editor.highlight_current_line, cx),
                 cx,
             ))
+            .child(section("Response"))
+            .child(Self::row(&l, "Layout", "split", split.into_any_element(), cx))
+            .child(Self::row(&l, "Pretty-print bodies up to, MB", "response.format_limit_mb", Self::stepper("response.format_limit_mb", s.response.format_limit_mb, 5., 1., 1000., cx), cx))
+            .child(Self::row(&l, "Show bodies up to, MB", "response.preview_limit_mb", Self::stepper("response.preview_limit_mb", s.response.preview_limit_mb, 10., 1., 2000., cx), cx))
             .child(section("Keyboard"))
             .child(Self::row(&l, "Extra shortcuts", "keymap", keymap.into_any_element(), cx))
             .child(div().text_xs().text_color(muted).child("Your own: keymap.json next to the settings file (Zed's format)."))

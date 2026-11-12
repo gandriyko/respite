@@ -1,7 +1,5 @@
 //! Respite GUI: sidebar (projects → .http files → requests), tabs of open files,
-//! editor with ▶ / status overlays, response panel.
-//! ▶ and the status inlay are overlays positioned from the editor's last layout
-//! (gpui-component has no custom gutter elements or inlay hints).
+//! a plain-text editor (no run buttons or statuses in its lines), response panel.
 
 mod attach;
 mod doc;
@@ -12,6 +10,7 @@ mod keymap;
 mod lang;
 mod palette;
 mod rename;
+mod response;
 mod runs;
 mod settings_page;
 mod sidebar;
@@ -29,9 +28,9 @@ use std::{
 use doc::{Doc, Status};
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, Icon, Root, Theme, ThemeMode, WindowExt as _, h_flex, h_resizable,
+    ActiveTheme as _, Icon, Root, Theme, ThemeMode, WindowExt as _, h_flex, h_resizable, v_resizable,
     input::{Editor, EditorState, InputEvent, InputState, Position, RopeExt as _},
-    IconName, Selectable as _, Sizable as _,
+    IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     menu::{DropdownMenu as _, PopupMenuItem},
     resizable_panel,
@@ -47,7 +46,7 @@ actions!(
         RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Import, Quit,
         NextEnvironment, ToggleHistory, InsertFile, RunAll, RunSelected, RepeatLast, CancelRequests, GoToFile, GoToRequest,
         CommandPalette, PrevRequest, NextRequest, QuickFix, RenameSymbol, GoToWorkspaceRequest, FocusEditor, FocusResponse,
-        ExpandTemplate
+        ExpandTemplate, CopyJsonPath, ToggleResponse, ToggleSplit
     ]
 );
 
@@ -78,7 +77,6 @@ fn env_file(paths: &[PathBuf], name: Option<&str>) -> Option<PathBuf> {
 /// The env picker's "no named environment" entry: only `respite.json` (shared values) applies.
 const SHARED: &str = "Shared";
 const RESPITE_TEMPLATE: &str = "{\n  \"baseUrl\": \"http://localhost:8080\"\n}\n";
-const TABS: [&str; 3] = ["Body", "Headers", "Request"];
 
 /// reqwest needs tokio; GPUI has its own executor. Requests run here, results are awaited from GPUI.
 static RT: LazyLock<tokio::runtime::Runtime> =
@@ -121,8 +119,12 @@ struct Respite {
     resp_body: Entity<EditorState>,
     resp_meta: Entity<EditorState>,
     tab: usize,
-    /// (exchange pointer, tab) currently loaded into the response editors.
-    shown: Option<(usize, usize)>,
+    /// What the response editors hold — body: (exchange pointer, raw, filter); other tabs:
+    /// (exchange pointer, tab). Reloaded only on a change: `set_value` resets selection and scroll.
+    shown: Option<(usize, bool, String)>,
+    shown_meta: Option<(usize, usize)>,
+    /// The shown body is JSON (filter field, Copy JSON Path).
+    body_json: bool,
     settings: respite_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
     show_history: bool,
@@ -142,7 +144,43 @@ struct Respite {
     tab_cycle: Option<(Vec<PathBuf>, usize)>,
     /// A live template's remaining fields (Tab jumps to the next).
     template: Option<templates::Session>,
+    /// Cmd+J hides the response panel.
+    response_open: bool,
+    /// Pinned: the panel keeps showing this instead of following the cursor.
+    pinned: Option<Shown>,
+    /// An older run of the request under the cursor, picked with ‹ ›; dropped when a new run lands.
+    older: Option<Older>,
+    /// History of the request the panel shows (newest first), loaded when that request changes.
+    runs: Option<(Arc<Exchange>, Vec<http_exec::Entry>)>,
+    /// Body tab: as received instead of pretty-printed.
+    raw: bool,
+    /// JSONPath typed under a JSON body.
+    body_filter: Entity<InputState>,
+    /// What the Body tab shows other than the text editor (image, binary, too big).
+    body_other: Option<BodyOther>,
     _subs: Vec<Subscription>,
+}
+
+/// What the response panel shows: title (method, label), its state, and whether it has scripts.
+#[derive(Clone)]
+struct Shown {
+    head: (String, String),
+    /// `None`: not run yet.
+    status: Option<Status>,
+    has_scripts: bool,
+}
+
+struct Older {
+    /// The run it replaced on screen; a newer run of that request drops it.
+    latest: Arc<Exchange>,
+    ex: Arc<Exchange>,
+}
+
+#[derive(Clone)]
+enum BodyOther {
+    Image(Arc<gpui::Image>),
+    Binary,
+    TooBig,
 }
 
 impl Respite {
@@ -175,6 +213,7 @@ impl Respite {
             notify_later(window, cx, format!("Settings: {e}"));
         }
         let history_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: method, URL, name, file, status"));
+        let body_filter = cx.new(|cx| InputState::new(window, cx).placeholder("JSONPath filter, e.g. $.items[*].id"));
         // The close button: with unsaved files, ask (as Quit does) instead of closing.
         let view = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -189,6 +228,11 @@ impl Respite {
         });
         let _subs = vec![
             cx.subscribe_in(&history_filter, window, |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&body_filter, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
@@ -220,6 +264,13 @@ impl Respite {
             mru: vec![],
             tab_cycle: None,
             template: None,
+            response_open: true,
+            pinned: None,
+            older: None,
+            runs: None,
+            raw: false,
+            body_filter,
+            body_other: None,
             _subs,
             env_name,
             executors: HashMap::new(),
@@ -239,6 +290,8 @@ impl Respite {
             resp_meta: readonly(true, window, cx),
             tab: 0,
             shown: None,
+            shown_meta: None,
+            body_json: false,
         };
         // An explicit file wins; else the file (and cursor) last used in this project — or in any
         // project, on a plain launch (no folder given); else the first one.
@@ -1067,310 +1120,6 @@ impl Respite {
         div().size_full().flex().flex_col().children(tabs).children(crumbs).child(body).into_any_element()
     }
 
-    /// ▶ / ◼ and status hints for the visible request lines, from the editor's layout as it
-    /// is *now* — call during prepaint, after the editor laid out this frame.
-    fn marks(&self, cx: &App) -> Option<(usize, Vec<Mark>)> {
-        // The editor is not on screen behind the history page.
-        let (false, Some(ix), Some(d)) = (self.show_history, self.current, self.doc()) else { return None };
-        if !d.http {
-            return None;
-        }
-        let s = d.editor.read(cx);
-        let (text, bounds) = (s.text(), s.input_bounds());
-        let mut marks = vec![];
-        for r in &d.file.requests {
-            let line = r.request_line;
-            let (start, end) = (text.line_start_offset(line - 1), text.line_end_offset(line - 1));
-            let Some(lb) = s.range_to_bounds(&(start..start)) else { continue };
-            if lb.top() < bounds.top() || lb.bottom() > bounds.bottom() {
-                continue; // scrolled out or folded
-            }
-            let status = d.status.get(&line).cloned();
-            let hint = match &status {
-                _ if !self.settings.settings.editor.inlay_status => None,
-                Some(Status::Done(ex)) => Some((summary(ex), self.status_color(ex.response.status, cx))),
-                Some(Status::Failed(e)) => Some((format!("✕ {}", truncate(e, 80)), cx.theme().danger)),
-                _ => None,
-            };
-            let hint = hint.zip(s.range_to_bounds(&(end..end))).map(|((t, c), eb)| (t, c, point(eb.right() + px(24.), eb.top())));
-            marks.push(Mark {
-                line,
-                running: matches!(status, Some(Status::Running)),
-                // At the editor's right edge (clear of the scrollbar), far from the fold chevrons in the
-                // gutter, and fixed under horizontal scroll.
-                at: point(bounds.right() - px(RUN_INSET), lb.top()),
-                line_height: lb.size.height,
-                hint,
-            });
-        }
-        Some((ix, marks))
-    }
-
-    /// Run buttons and status hints painted over the editor. A canvas, not child elements:
-    /// its prepaint runs after the editor's in the same frame, so positions never lag a
-    /// frame behind while scrolling.
-    fn overlay(&self, cx: &Context<Self>) -> impl IntoElement {
-        let (read, write) = (cx.entity(), cx.entity());
-        canvas(
-            move |_, window, cx| {
-                let Some((ix, marks)) = read.read(cx).marks(cx) else { return vec![] };
-                marks
-                    .into_iter()
-                    .map(|m| (ix, window.insert_hitbox(Bounds::new(m.at, size(px(14.), m.line_height)), HitboxBehavior::Normal), m))
-                    .collect::<Vec<_>>()
-            },
-            move |_, marks, window, cx| {
-                let (run, stop, bg) = (cx.theme().success, cx.theme().warning, cx.theme().background);
-                for (ix, hitbox, m) in marks {
-                    if let Some((text, color, at)) = &m.hint {
-                        // Clipped short of ▶, so it never spills over the response panel.
-                        let mask = ContentMask { bounds: Bounds::from_corners(point(px(0.), px(0.)), point(m.at.x - px(8.), px(1e6))) };
-                        window.with_content_mask(Some(mask), |window| paint_text(text, *at, *color, m.line_height, window, cx));
-                    }
-                    // Backdrop: a long line runs under the button.
-                    window.paint_quad(fill(Bounds::new(point(m.at.x - px(4.), m.at.y), size(px(22.), m.line_height)), bg));
-                    paint_text(if m.running { "◼" } else { "▶" }, m.at, if m.running { stop } else { run }, m.line_height, window, cx);
-                    window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
-                    let (view, line, running) = (write.clone(), m.line, m.running);
-                    window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
-                        if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && hitbox.is_hovered(window) {
-                            // Painted after the editor, so this runs first; the editor must not also handle it.
-                            cx.stop_propagation();
-                            view.update(cx, |this, cx| {
-                                if running {
-                                    this.cancel(ix, line, cx);
-                                    return;
-                                }
-                                // The response panel follows the caret: put it on this request.
-                                if let Some(d) = this.docs.get(ix) {
-                                    d.editor.update(cx, |s, cx| s.set_cursor_position(Position::new(line as u32 - 1, 0), window, cx));
-                                }
-                                this.send(ix, vec![line], window, cx);
-                            });
-                        }
-                    });
-                }
-            },
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-    }
-
-    // ---- response ----
-
-    /// Two compact rows: `METHOD name …… [200 OK] 564 ms · 277 B · HTTP/2`, then tabs + search.
-    fn response_panel(&self, cx: &Context<Self>) -> impl IntoElement {
-        let t = cx.theme();
-        let muted = t.muted_foreground;
-        // (method, label) of what the panel shows: the picked history entry while History is
-        // open, else the request under the cursor.
-        let (head, status) = if self.show_history {
-            match &self.history_pick {
-                Some((e, ex)) => (Some((e.method.clone(), e.label.clone())), Some(Status::Done(ex.clone()))),
-                None => (None, None),
-            }
-        } else {
-            let d = self.doc();
-            let req = d.and_then(|d| d.active.and_then(|l| d.file.requests.iter().find(|r| r.request_line == l)));
-            (req.map(|r| (r.method.clone(), r.label())), req.and_then(|r| d?.status.get(&r.request_line)).cloned())
-        };
-
-        let has_head = head.is_some();
-        let title = div().flex_1().min_w_0().flex().items_center().gap_1p5().text_sm();
-        let title = match head {
-            Some((method, label)) => {
-                // Imported blocks are titled "METHOD /path" already.
-                let label = label.strip_prefix(&format!("{method} ")).map(str::to_string).unwrap_or(label);
-                title
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.))
-                            .font_weight(FontWeight::BOLD)
-                            .font_family(t.mono_font_family.clone())
-                            .text_color(sidebar::method_color(&method, cx))
-                            .child(method),
-                    )
-                    .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(label))
-            }
-            None if self.show_history => title.text_color(muted).child("Pick an entry"),
-            None => title.text_color(muted).child("No request under the cursor"),
-        };
-        let pill = |text: String, color: Hsla| {
-            div().flex_none().px_1p5().rounded_sm().bg(color.opacity(0.15)).text_color(color).text_xs().font_weight(FontWeight::BOLD).child(text)
-        };
-        let right = match &status {
-            None if self.show_history => div(),
-            None => div().text_xs().text_color(muted).child("Cmd+Enter to send"),
-            Some(Status::Running) => div().text_xs().text_color(t.warning).child("Running…"),
-            Some(Status::Failed(_)) => pill("Error".into(), t.danger),
-            Some(Status::Done(ex)) => {
-                let r = &ex.response;
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .child(pill(format!("{} {}", r.status, r.reason), self.status_color(r.status, cx)))
-                    .child(div().text_xs().text_color(muted).child(format!(
-                        "{} ms · {} · {}",
-                        r.total.as_millis(),
-                        size_label(r.body.len()),
-                        r.http_version
-                    )))
-            }
-        };
-        // Re-run / stop the request under the cursor; not on the History page (an entry is not a request).
-        let running = matches!(status, Some(Status::Running));
-        let run = (!self.show_history && has_head).then(|| {
-            Button::new("response-run")
-                .label(if running { "◼ Stop" } else { "▶ Run" })
-                .primary()
-                .small()
-                .tooltip(if running { "Stop" } else { "Run again (Cmd+Enter)" })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let Some((ix, line)) = this.current.zip(this.doc().and_then(|d| d.active)) else { return };
-                    if running { this.cancel(ix, line, cx) } else { this.send(ix, vec![line], window, cx) }
-                }))
-        });
-        // Title (+ run) on one row, status on its own row below, so neither squeezes the other.
-        // A hairline under the status keeps it apart from the tabs below.
-        let header = div()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .pb_2()
-            .mb_1()
-            .border_b_1()
-            .border_color(t.border)
-            .child(div().h(px(28.)).flex().items_center().gap_2().child(title).children(run))
-            .child(div().h(px(20.)).flex().items_center().child(right));
-        let panel = div().size_full().px_3().pt_2().flex().flex_col().gap_1().bg(t.background).child(header);
-        match status {
-            None | Some(Status::Running) => panel,
-            Some(Status::Failed(e)) => panel.child(div().text_sm().text_color(t.danger).child(e)),
-            Some(Status::Done(ex)) => {
-                let deps = (!ex.dependencies.is_empty())
-                    .then(|| div().text_xs().text_color(muted).child(format!("Ran first: {}", ex.dependencies.join(", "))));
-                let view = if self.tab == 0 { &self.resp_body } else { &self.resp_meta };
-                // Same panel as Cmd+F inside the response (find, next/prev, match case, regex).
-                let target = view.clone();
-                let search = Button::new("response-search")
-                    .icon(IconName::Search)
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Search response (Cmd+F)")
-                    .on_click(move |_, window, cx| {
-                        target.update(cx, |s, cx| {
-                            s.focus(window, cx);
-                            s.open_search(false, cx);
-                        })
-                    });
-                let wrap_on = self.settings.settings.response.soft_wrap;
-                let wrap = Button::new("response-wrap")
-                    .label("Wrap")
-                    .ghost()
-                    .xsmall()
-                    .selected(wrap_on)
-                    .tooltip(if wrap_on { "Long lines wrap — click to scroll them instead" } else { "Long lines scroll — click to wrap them" })
-                    .on_click(cx.listener(move |this, _, window, cx| this.set("response.soft_wrap", (!wrap_on).into(), window, cx)));
-                let tabs = TABS.iter().fold(
-                    TabBar::new("response-tabs")
-                        .underline()
-                        .small()
-                        .selected_index(self.tab)
-                        .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                            this.tab = *ix;
-                            cx.notify();
-                        }))
-                        .suffix(div().flex().items_center().gap_1().child(wrap).child(search)),
-                    |bar, t| bar.child(Tab::new().label(*t)),
-                );
-                panel
-                    .children(deps)
-                    .child(tabs)
-                    .child(div().flex_1().min_h_0().child(Editor::new(view).size_full().bordered(false)))
-            }
-        }
-    }
-
-    /// Load the active block's exchange into the response editors (only when it or the tab changed:
-    /// `set_value` resets selection and scroll).
-    fn sync_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ex = if self.show_history {
-            self.history_pick.as_ref().map(|(_, ex)| ex.clone())
-        } else {
-            self.doc().and_then(|d| match d.status.get(&d.active?) {
-                Some(Status::Done(ex)) => Some(ex.clone()),
-                _ => None,
-            })
-        };
-        let Some(ex) = ex else {
-            self.shown = None;
-            return;
-        };
-        let key = (Arc::as_ptr(&ex) as usize, self.tab);
-        if self.shown == Some(key) {
-            return;
-        }
-        if self.shown.map(|k| k.0) != Some(key.0) {
-            let (lang, text) = (body_language(&ex.response), pretty_body(&ex.response.body));
-            self.resp_body.update(cx, |s, cx| {
-                s.set_highlighter(SharedString::from(lang), cx);
-                s.set_value(text, window, cx);
-            });
-        }
-        self.shown = Some(key);
-        let meta = match self.tab {
-            1 => {
-                let r = &ex.response;
-                let headers: String = r.headers.iter().map(|(n, v)| format!("{n}: {v}\n")).collect();
-                format!("{} {} {}\n{headers}", r.http_version, r.status, r.reason)
-            }
-            2 => {
-                let q = &ex.request;
-                let headers: String = q.headers.iter().map(|(n, v)| format!("{n}: {v}\n")).collect();
-                let body = String::from_utf8_lossy(&q.body);
-                let body = if body.is_empty() { String::new() } else { format!("\n{body}\n") };
-                format!("{} {}\n{headers}{body}", q.method, q.url)
-            }
-            _ => return,
-        };
-        self.resp_meta.update(cx, |s, cx| s.set_value(meta, window, cx));
-    }
-}
-
-/// Highlighter language for a response body.
-fn body_language(r: &http_exec::Response) -> &'static str {
-    let ct = r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.to_ascii_lowercase());
-    match ct.as_deref() {
-        Some(c) if c.contains("json") => "json",
-        Some(c) if c.contains("html") || c.contains("xml") => "html",
-        _ if serde_json::from_slice::<serde_json::Value>(&r.body).is_ok() => "json",
-        _ => "text",
-    }
-}
-
-/// One request line's ▶ / ◼ and its status hint, in window coordinates.
-/// ▶ distance from the editor's right edge (leaves room for the scrollbar).
-const RUN_INSET: f32 = 30.;
-
-struct Mark {
-    line: usize,
-    running: bool,
-    at: Point<Pixels>,
-    line_height: Pixels,
-    hint: Option<(String, Hsla, Point<Pixels>)>,
-}
-
-/// Paint one line of UI text at `origin` (top-left of an editor line `line_height` tall).
-fn paint_text(text: &str, origin: Point<Pixels>, color: Hsla, line_height: Pixels, window: &mut Window, cx: &mut App) {
-    let font_size = px(13.);
-    let run = TextRun { len: text.len(), font: window.text_style().font(), color, background_color: None, underline: None, strikethrough: None };
-    let shaped = window.text_system().shape_line(SharedString::from(text.to_string()), font_size, &[run], None);
-    let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
 }
 
 /// Scroll so 0-based `line` sits mid-viewport, unless it's already well inside it (the editor
@@ -1392,12 +1141,6 @@ fn center_line(editor: Entity<EditorState>, line: usize, retry: bool, window: &m
     }
 }
 
-/// `200 OK · 142 ms · 3.4 KB`
-fn summary(ex: &Exchange) -> String {
-    let r = &ex.response;
-    format!("{} {} · {} ms · {}", r.status, r.reason, r.total.as_millis(), size_label(r.body.len()))
-}
-
 fn size_label(n: usize) -> String {
     match n {
         n if n < 1024 => format!("{n} B"),
@@ -1406,22 +1149,32 @@ fn size_label(n: usize) -> String {
     }
 }
 
-/// JSON pretty-printed, else lossy UTF-8; capped so a huge body can't freeze the layout.
-fn pretty_body(body: &[u8]) -> String {
-    const CAP: usize = 256 * 1024;
-    let text = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
-    match text.len() > CAP {
-        true => format!("{}\n… (truncated, {} B)", truncate(&text, CAP), text.len()),
-        false => text,
+impl Respite {
+    /// Editor and response side by side or stacked (`split`, Cmd+\), sized by `split_ratio`;
+    /// dragging the divider saves the new ratio. Cmd+J hides the response.
+    fn editor_and_response(&self, center: AnyElement, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let s = &self.settings.settings;
+        let vertical = s.split == respite_settings::Split::Vertical;
+        let ratio = s.split_ratio.clamp(0.2, 0.8);
+        // Initial sizes only: the group keeps what the user drags. A separate id per
+        // orientation gives a switch fresh sizes.
+        let vp = window.viewport_size();
+        let total = if vertical { vp.height - px(40.) } else { vp.width - if self.sidebar { px(260.) } else { px(0.) } };
+        let group = if vertical { v_resizable("split-v") } else { h_resizable("split-h") };
+        let (view, open) = (cx.entity().downgrade(), self.response_open);
+        group
+            .on_resize(move |state, window, cx| {
+                let sizes = state.read(cx).sizes().clone();
+                if !open || sizes.len() != 2 || sizes[0] + sizes[1] <= px(0.) {
+                    return;
+                }
+                let r = ((sizes[0] / (sizes[0] + sizes[1])) * 100.).round() / 100.;
+                view.update(cx, |this, cx| this.set("split_ratio", serde_json::json!(r), window, cx)).ok();
+            })
+            .child(resizable_panel().size(total * ratio).child(center))
+            .child(resizable_panel().size(total * (1. - ratio)).visible(self.response_open).child(self.response_panel(cx)))
+            .into_any_element()
     }
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    let end = (0..=max.min(s.len())).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-    &s[..end]
 }
 
 impl Render for Respite {
@@ -1520,13 +1273,21 @@ impl Render for Respite {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.next_tab(window, cx)))
+            .on_action(cx.listener(|this, _: &CopyJsonPath, window, cx| this.copy_json_path(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleResponse, _, cx| {
+                this.response_open = !this.response_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
+                use respite_settings::Split;
+                let next = if this.settings.settings.split == Split::Vertical { Split::Horizontal } else { Split::Vertical };
+                this.set("split", serde_json::json!(next), window, cx);
+            }))
             .child(
                 h_resizable("main")
                     .child(resizable_panel().size(px(260.)).size_range(px(160.)..px(520.)).visible(self.sidebar).child(sidebar))
-                    .child(resizable_panel().child(center))
-                    .child(resizable_panel().size(px(420.)).child(self.response_panel(cx))),
+                    .child(resizable_panel().child(self.editor_and_response(center, window, cx))),
             )
-            .child(self.overlay(cx))
     }
 }
 
@@ -1579,6 +1340,8 @@ fn set_menus(cx: &mut App) {
         Menu::new("View").items([
             MenuItem::action("History", ToggleHistory),
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::action("Toggle Response Panel", ToggleResponse),
+            MenuItem::action("Toggle Split Orientation", ToggleSplit),
             MenuItem::action("Next Tab", NextTab),
             MenuItem::separator(),
             MenuItem::action("Focus Editor", FocusEditor),
@@ -1615,6 +1378,9 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Rename…", Box::new(RenameSymbol)),
         ("Focus Editor", Box::new(FocusEditor)),
         ("Focus Response", Box::new(FocusResponse)),
+        ("Toggle Response Panel", Box::new(ToggleResponse)),
+        ("Toggle Split Orientation", Box::new(ToggleSplit)),
+        ("Copy JSON Path", Box::new(CopyJsonPath)),
         ("Previous Request", Box::new(PrevRequest)),
         ("Next Request", Box::new(NextRequest)),
         ("History", Box::new(ToggleHistory)),

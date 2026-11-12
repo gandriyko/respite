@@ -24,6 +24,9 @@ gpui-kit-assets = "=0.9.1"
 # Same version and features as gpui-component's, so the editor's provider types match.
 lsp-types = { version = "0.97", features = ["proposed"] }
 anyhow = "1"
+# Both already built for other crates: response JSONPath filter and "Compare with previous".
+serde_json_path = "0.7"
+similar = "2"
 
 [dev-dependencies]
 tempfile = "3"

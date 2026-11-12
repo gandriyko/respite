@@ -5864,6 +5864,8 @@ dependencies = [
  "respite-cli",
  "respite-settings",
  "serde_json",
+ "serde_json_path",
+ "similar",
  "tempfile",
  "tokio",
 ]

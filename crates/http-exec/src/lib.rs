@@ -40,7 +40,7 @@ pub struct SentRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Response {
     pub status: u16,
     pub reason: String,
@@ -51,6 +51,20 @@ pub struct Response {
     /// Until status line + headers arrived.
     pub ttfb: Duration,
     pub total: Duration,
+    /// Where the response came from (after redirects); empty in old history entries.
+    pub url: String,
+    /// Redirects followed, in order.
+    pub redirects: Vec<Redirect>,
+    /// Cookies the jar sent with the first request (name, value).
+    pub cookies_sent: Vec<(String, String)>,
+}
+
+/// One followed redirect: `status` from `from` sent the client to `to`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Redirect {
+    pub status: u16,
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone)]
@@ -428,10 +442,24 @@ async fn send(
     options: &Options,
 ) -> Result<Response, Error> {
     let has = |d: &str| req.directive(d).is_some();
+    // Each followed hop is recorded for the Timeline.
+    let hops: Arc<Mutex<Vec<Redirect>>> = Arc::default();
     let redirect = if has("no-redirect") || !options.follow_redirects {
         reqwest::redirect::Policy::none()
     } else {
-        reqwest::redirect::Policy::limited(options.max_redirects)
+        let (max, hops) = (options.max_redirects, hops.clone());
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > max {
+                return attempt.error(format!("too many redirects (more than {max})"));
+            }
+            let from = attempt.previous().last().map(|u| u.to_string()).unwrap_or_default();
+            hops.lock().unwrap().push(Redirect { status: attempt.status().as_u16(), from, to: attempt.url().to_string() });
+            attempt.follow()
+        })
+    };
+    let cookies_sent = match (has("no-cookie-jar"), reqwest::Url::parse(&sent.url)) {
+        (false, Ok(url)) => cookies.lock().unwrap().matches(&url).into_iter().map(|c| (c.name().to_string(), c.value().to_string())).collect(),
+        _ => vec![],
     };
     // ponytail: a client per run (redirect/TLS/connect-timeout are client-level in reqwest),
     // so no connection reuse between runs; cache clients by settings if latency matters.
@@ -474,8 +502,10 @@ async fn send(
         .iter()
         .map(|(n, v)| (n.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
         .collect();
+    let url = resp.url().to_string();
     // ponytail: buffered; stream chunks to the UI when big bodies need it.
     let body = resp.bytes().await?.to_vec();
+    let redirects = std::mem::take(&mut *hops.lock().unwrap());
     Ok(Response {
         status: status.as_u16(),
         reason: status.canonical_reason().unwrap_or("").to_string(),
@@ -484,6 +514,9 @@ async fn send(
         body,
         ttfb,
         total: start.elapsed(),
+        url,
+        redirects,
+        cookies_sent,
     })
 }
 

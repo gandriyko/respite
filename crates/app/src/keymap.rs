@@ -80,6 +80,8 @@ fn defaults() -> Vec<Spec> {
         spec(key("shift-p"), CommandPalette, Both),
         spec(key("1"), FocusEditor, Both),
         spec(key("2"), FocusResponse, Both),
+        spec(key("j"), ToggleResponse, Both),
+        spec(key("\\"), ToggleSplit, Both),
         spec(key("q"), Quit, Global),
     ]
 }

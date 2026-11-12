@@ -45,7 +45,7 @@ pub struct Doc {
     pub dirty: bool,
     /// The file's mtime when it was last read or written: a newer one means it changed on disk.
     pub mtime: Option<std::time::SystemTime>,
-    /// `false` for env files (`respite*.json`): plain JSON, no requests, no ▶.
+    /// `false` for env files (`respite*.json`): plain JSON, no requests.
     pub http: bool,
     fold_counts: FoldCounts,
     /// Shared with the editor's completion / hover / definition providers.

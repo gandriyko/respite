@@ -29,10 +29,10 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 
 | | |
 |---|---|
-| **Editor** | `.http` syntax highlighting, a ▶ run button in the gutter, per-request status inline, folding |
+| **Editor** | `.http` syntax highlighting (JSON, XML, GraphQL and JS bodies), completion, diagnostics with quick fixes, rename, live templates, folding |
+| **Response** | Body, headers, cookies, the request as sent, timeline with redirects; images, JSONPath filter, run history ‹ › with diff, pin |
 | **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
 | **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, …) |
-| **Responses** | Body with highlighting and search, headers, the request as it was sent, timings |
 | **History** | Every run is stored per project and can be browsed, filtered and reopened |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
 | **Workspace** | Collections in `~/.config/respite` plus any project folders, light and dark themes, settings, state restored on launch |
@@ -78,7 +78,7 @@ scripts/bundle-macos.sh --install
 cargo install --path crates/app
 ```
 
-You need a recent stable Rust toolchain (edition 2024).
+You need a recent stable Rust toolchain (edition 2024); see [Development setup](#development-setup-macos) for installing it with Homebrew.
 
 ## Desktop app
 
@@ -151,7 +151,46 @@ crates/
   settings/     ~/.config/respite/settings.json plus per-project overrides
 ```
 
-Run `cargo test --workspace` to test everything.
+## Development setup (macOS)
+
+Everything comes from [Homebrew](https://brew.sh) plus Apple's Command Line Tools; full Xcode is not needed.
+
+```sh
+# Compiler, linker and the macOS SDK (iconutil for the app icon is included)
+xcode-select --install
+
+# Rust toolchain; cmake builds aws-lc (TLS), librsvg is only for regenerating the icon
+brew install rust cmake librsvg
+
+git clone git@github.com:gandriyko/respite.git
+cd respite
+cargo run -p respite                      # the app, opening ~/.config/respite
+cargo run -p respite -- path/to/api.http  # the app on a file or folder
+cargo run -p respite -- run api.http      # the CLI
+```
+
+Before committing:
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets   # expected to be warning-free
+```
+
+Other tasks:
+
+```sh
+scripts/bundle-macos.sh       # target/release/Respite.app
+scripts/make-icon.sh          # crates/app/assets/icon.svg → Respite.icns
+```
+
+`scripts/bundle-macos.sh --universal` builds for both Apple Silicon and Intel and needs rustup instead of Homebrew's `rust`:
+
+```sh
+brew uninstall rust && brew install rustup
+export PATH="$(brew --prefix rustup)/bin:$PATH"   # keg-only; add this line to ~/.zshrc
+rustup default stable
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
+```
 
 ## Roadmap
 
