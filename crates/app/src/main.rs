@@ -729,9 +729,9 @@ impl Respite {
             marks.push(Mark {
                 line,
                 running: matches!(status, Some(Status::Running)),
-                // Between line numbers and text (fold chevrons sit on `###` lines, not request lines).
-                // ponytail: follows horizontal scroll; pin to text_bounds().left() if that bothers.
-                at: point(lb.left() - px(16.), lb.top()),
+                // At the editor's right edge (clear of the scrollbar), far from the fold chevrons in the
+                // gutter, and fixed under horizontal scroll.
+                at: point(bounds.right() - px(RUN_INSET), lb.top()),
                 line_height: lb.size.height,
                 hint,
             });
@@ -753,12 +753,16 @@ impl Respite {
                     .collect::<Vec<_>>()
             },
             move |_, marks, window, cx| {
-                let (run, stop) = (cx.theme().success, cx.theme().warning);
+                let (run, stop, bg) = (cx.theme().success, cx.theme().warning, cx.theme().background);
                 for (ix, hitbox, m) in marks {
-                    paint_text(if m.running { "◼" } else { "▶" }, m.at, if m.running { stop } else { run }, m.line_height, window, cx);
                     if let Some((text, color, at)) = &m.hint {
-                        paint_text(text, *at, *color, m.line_height, window, cx);
+                        // Clipped short of ▶, so it never spills over the response panel.
+                        let mask = ContentMask { bounds: Bounds::from_corners(point(px(0.), px(0.)), point(m.at.x - px(8.), px(1e6))) };
+                        window.with_content_mask(Some(mask), |window| paint_text(text, *at, *color, m.line_height, window, cx));
                     }
+                    // Backdrop: a long line runs under the button.
+                    window.paint_quad(fill(Bounds::new(point(m.at.x - px(4.), m.at.y), size(px(22.), m.line_height)), bg));
+                    paint_text(if m.running { "◼" } else { "▶" }, m.at, if m.running { stop } else { run }, m.line_height, window, cx);
                     window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
                     let (view, line, running) = (write.clone(), m.line, m.running);
                     window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
@@ -806,6 +810,7 @@ impl Respite {
             (req.map(|r| (r.method.clone(), r.label())), req.and_then(|r| d?.status.get(&r.request_line)).cloned())
         };
 
+        let has_head = head.is_some();
         let title = div().flex_1().min_w_0().flex().items_center().gap_1p5().text_sm();
         let title = match head {
             Some((method, label)) => {
@@ -849,8 +854,33 @@ impl Respite {
                     )))
             }
         };
-        let header = div().flex_none().h(px(30.)).flex().items_center().gap_2().child(title).child(right);
-        let panel = div().size_full().px_3().pt_1().flex().flex_col().gap_1().bg(t.background).child(header);
+        // Re-run / stop the request under the cursor; not on the History page (an entry is not a request).
+        let running = matches!(status, Some(Status::Running));
+        let run = (!self.show_history && has_head).then(|| {
+            Button::new("response-run")
+                .label(if running { "◼ Stop" } else { "▶ Run" })
+                .primary()
+                .small()
+                .tooltip(if running { "Stop" } else { "Run again (Cmd+Enter)" })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let Some((ix, line)) = this.current.zip(this.doc().and_then(|d| d.active)) else { return };
+                    if running { this.cancel(ix, line, cx) } else { this.run(ix, line, cx) }
+                }))
+        });
+        // Title (+ run) on one row, status on its own row below, so neither squeezes the other.
+        // A hairline under the status keeps it apart from the tabs below.
+        let header = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pb_2()
+            .mb_1()
+            .border_b_1()
+            .border_color(t.border)
+            .child(div().h(px(28.)).flex().items_center().gap_2().child(title).children(run))
+            .child(div().h(px(20.)).flex().items_center().child(right));
+        let panel = div().size_full().px_3().pt_2().flex().flex_col().gap_1().bg(t.background).child(header);
         match status {
             None | Some(Status::Running) => panel,
             Some(Status::Failed(e)) => panel.child(div().text_sm().text_color(t.danger).child(e)),
@@ -957,6 +987,9 @@ fn body_language(r: &http_exec::Response) -> &'static str {
 }
 
 /// One request line's ▶ / ◼ and its status hint, in window coordinates.
+/// ▶ distance from the editor's right edge (leaves room for the scrollbar).
+const RUN_INSET: f32 = 30.;
+
 struct Mark {
     line: usize,
     running: bool,

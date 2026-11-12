@@ -75,7 +75,23 @@ impl Doc {
             _subs: subs,
         };
         doc.reparse(cx);
+        doc.restore_responses();
         doc
+    }
+
+    /// Each request's newest recorded response, so the panel shows it before the first run.
+    /// Matched by label (name / title / `METHOD url`); among equal labels, the same line wins.
+    fn restore_responses(&mut self) {
+        let Some(store) = self.exec.store() else { return };
+        for e in store.entries_of(&self.path) {
+            let same: Vec<usize> = self.file.requests.iter().filter(|r| r.label() == e.label).map(|r| r.request_line).collect();
+            let Some(line) = same.iter().copied().find(|&l| l == e.line).or(same.first().copied()) else { continue };
+            if !self.status.contains_key(&line)
+                && let Some(ex) = store.exchange(e)
+            {
+                self.status.insert(line, Status::Done(Arc::new(ex)));
+            }
+        }
     }
 
     pub fn name(&self) -> String {

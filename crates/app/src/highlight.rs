@@ -2,7 +2,7 @@
 //! `InputHighlighter` seam (no tree-sitter grammar needed).
 // ponytail: full reparse per edit, O(file); incremental when 5k-line files lag.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use gpui::{Context, HighlightStyle, SharedString, Window};
@@ -54,12 +54,14 @@ fn compute(src: &str) -> (Vec<Span>, Vec<FoldRange>) {
     let file = http_syntax::parse(src);
     let request_lines: HashSet<usize> = file.requests.iter().map(|r| r.request_line).collect();
     let header_lines: HashSet<usize> = file.requests.iter().flat_map(|r| r.headers.iter().map(|h| h.line)).collect();
-    let body_lines: HashSet<usize> = file
+    let body_lines: HashMap<usize, Body> = file
         .requests
         .iter()
-        .filter_map(|r| r.body.as_ref())
-        .flat_map(|b| b.line..b.line + b.text.lines().count())
+        .filter_map(|r| r.body.as_ref().map(|b| (b, body_kind(r, b))))
+        .flat_map(|(b, kind)| (b.line..b.line + b.text.lines().count()).map(move |l| (l, kind)))
         .collect();
+    // Multipart: the lines between a `--boundary` and the first blank line are part headers.
+    let mut part_headers = false;
     let var_lines: HashSet<usize> = file.variables.iter().map(|v| v.line).collect();
 
     let mut spans = vec![];
@@ -72,8 +74,28 @@ fn compute(src: &str) -> (Vec<Span>, Vec<FoldRange>) {
         let end = off + line.len();
         if line.starts_with("###") {
             spans.push((off..end, Some("title")));
-        } else if body_lines.contains(&ln) {
-            vars(&mut spans, line, off, None);
+        } else if let Some(kind) = body_lines.get(&ln) {
+            if t.starts_with("< ") || t.starts_with("<@") {
+                spans.push((base..end, Some("comment"))); // body from a file
+            } else {
+                match kind {
+                    Body::Json => json(&mut spans, line, off),
+                    Body::Form => form(&mut spans, line, off),
+                    Body::Multipart if t.starts_with("--") => {
+                        part_headers = true;
+                        spans.push((base..end, Some("keyword")));
+                    }
+                    Body::Multipart if t.is_empty() => part_headers = false,
+                    Body::Multipart if part_headers => {
+                        let colon = t.find(':').unwrap_or(t.len());
+                        spans.push((base..base + colon, Some("property")));
+                        vars(&mut spans, &t[colon..], base + colon, None);
+                    }
+                    // A part's content: JSON parts look like JSON, the rest stays plain.
+                    Body::Multipart if t.starts_with(['{', '[', '"', '}', ']']) => json(&mut spans, line, off),
+                    Body::Multipart | Body::Plain => vars(&mut spans, line, off, None),
+                }
+            }
         } else if request_lines.contains(&ln) {
             for (j, (at, tok)) in tokens(line).into_iter().enumerate() {
                 let style = if j == 0 && tok.bytes().all(|b| b.is_ascii_uppercase()) && tok.len() > 1 {
@@ -112,6 +134,81 @@ fn compute(src: &str) -> (Vec<Span>, Vec<FoldRange>) {
         .map(|r| FoldRange::new(r.lines.start() - 1, r.lines.end() - 1))
         .collect();
     (spans, folds)
+}
+
+#[derive(Clone, Copy)]
+enum Body {
+    Json,
+    Form,
+    Multipart,
+    Plain,
+}
+
+/// From `Content-Type`; without one, a body that opens with `{` / `[` is JSON.
+fn body_kind(r: &http_syntax::Request, b: &http_syntax::Body) -> Body {
+    let ct = r.headers.iter().find(|h| h.name.eq_ignore_ascii_case("content-type")).map(|h| h.value.to_ascii_lowercase());
+    match ct.as_deref() {
+        Some(c) if c.contains("json") => Body::Json,
+        Some(c) if c.starts_with("multipart/") => Body::Multipart,
+        Some(c) if c.contains("x-www-form-urlencoded") => Body::Form,
+        Some(_) => Body::Plain,
+        None if b.text.trim_start().starts_with(['{', '[']) => Body::Json,
+        None => Body::Plain,
+    }
+}
+
+/// One line of JSON: keys, strings, numbers, literals, `{{vars}}`. Strings don't span lines.
+// ponytail: line-local lexer; a string broken across lines restarts on the next one.
+fn json(spans: &mut Vec<Span>, line: &str, at: usize) {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                let key = line[i..].trim_start().starts_with(':');
+                vars(spans, &line[start..i], at + start, Some(if key { "property" } else { "string" }));
+            }
+            b'{' if b.get(i + 1) == Some(&b'{') => {
+                i = line[i..].find("}}").map_or(b.len(), |p| i + p + 2);
+                spans.push((at + start..at + i, Some("variable")));
+            }
+            b'-' | b'0'..=b'9' => {
+                while i < b.len() && matches!(b[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                    i += 1;
+                }
+                spans.push((at + start..at + i, Some("number")));
+            }
+            c if c.is_ascii_alphabetic() => {
+                while i < b.len() && b[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                let style = match &line[start..i] {
+                    "true" | "false" => Some("boolean"),
+                    "null" => Some("constant"),
+                    _ => None,
+                };
+                spans.push((at + start..at + i, style));
+            }
+            _ => i += line[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+}
+
+/// `a=1&b={{x}}`: names as properties, values as strings.
+fn form(spans: &mut Vec<Span>, line: &str, at: usize) {
+    let mut pos = 0;
+    for pair in line.split_inclusive('&') {
+        let eq = pair.find('=').unwrap_or(pair.len());
+        vars(spans, &pair[..eq], at + pos, Some("property"));
+        vars(spans, &pair[eq..], at + pos + eq, Some("string"));
+        pos += pair.len();
+    }
 }
 
 /// Whitespace-separated tokens with their byte offsets.
@@ -162,5 +259,28 @@ mod tests {
         assert_eq!(of("Accept"), Some(Some("property")));
         assert_eq!(of("{{$uuid}}"), Some(Some("variable")));
         assert_eq!(folds.len(), 1);
+    }
+
+    #[test]
+    fn bodies_by_content_type() {
+        let src = "### J\nPOST /j\n\n{\"id\": 12, \"ok\": true, \"n\": null, \"s\": \"x {{v}}\", \"c\": {{c}}}\n\n\
+                   ### F\nPOST /f\nContent-Type: application/x-www-form-urlencoded\n\nname=Ada&id={{id}}\n\n\
+                   ### M\nPOST /m\nContent-Type: multipart/form-data; boundary=B\n\n--B\nContent-Disposition: form-data; name=\"f\"\n\n{\"k\": 1}\n< ./a.png\n--B--\n";
+        let (spans, _) = compute(src);
+        assert!(spans.windows(2).all(|w| w[0].0.end <= w[1].0.start));
+        let of = |s: &str| spans.iter().find(|(r, _)| &src[r.clone()] == s).map(|(_, n)| *n).flatten();
+        assert_eq!(of("\"id\""), Some("property"));
+        assert_eq!(of("12"), Some("number"));
+        assert_eq!(of("true"), Some("boolean"));
+        assert_eq!(of("null"), Some("constant"));
+        assert_eq!(of("\"x "), Some("string"));
+        assert_eq!(of("{{v}}"), Some("variable"));
+        assert_eq!(of("{{c}}"), Some("variable"));
+        assert_eq!(of("name"), Some("property"));
+        assert_eq!(of("=Ada&"), Some("string"));
+        assert_eq!(of("--B"), Some("keyword"));
+        assert_eq!(of("Content-Disposition"), Some("property"));
+        assert_eq!(of("\"k\""), Some("property"));
+        assert_eq!(of("< ./a.png"), Some("comment"));
     }
 }

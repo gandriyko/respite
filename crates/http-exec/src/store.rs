@@ -154,6 +154,12 @@ impl Store {
         self.exchange(self.list().into_iter().find(|e| e.file == rel && e.name.as_deref() == Some(name))?)
     }
 
+    /// Entries recorded for `file`, newest first.
+    pub fn entries_of(&self, file: &Path) -> Vec<Entry> {
+        let rel = self.relative(file);
+        self.list().into_iter().filter(|e| e.file == rel).collect()
+    }
+
     /// Workspace root; `Entry::file` is relative to it.
     pub fn root(&self) -> &Path {
         &self.root
