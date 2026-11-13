@@ -45,6 +45,42 @@ async fn dependency_auto_run_and_jsonpath() {
 }
 
 #[tokio::test]
+async fn asserts() {
+    let server = MockServer::start().await;
+    Mock::given(path("/u"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 7, "name": "Ann", "tags": ["a"], "on": false})))
+        .mount(&server).await;
+    let src = "@who = Ann\n\
+               # @assert status == 201\n\
+               # @assert status >= 200\n\
+               # @assert header content-type contains json\n\
+               # @assert body $.name == {{who}}\n\
+               # @assert body name == \"Ann\"\n\
+               # @assert body id isNumber\n\
+               # @assert body tags isArray\n\
+               # @assert body on isFalse\n\
+               # @assert body missing exists\n\
+               # @assert body $.id == 8\n\
+               # @assert body matches \"id\":\\s*7\n\
+               # @assert duration < 30 s\n\
+               # @assert header x-none startsWith a\n\
+               # @assert body $.name > 3\n\
+               # @assert status ~ 1\n\
+               GET {{baseUrl}}/u\n";
+    let ex = run(src, Path::new("/tmp"), &server.uri(), 0).await.unwrap();
+    let r: Vec<_> = ex.tests.iter().map(|t| (t.passed, t.detail.as_str())).collect();
+    assert_eq!(r, [
+        (true, ""), (true, ""), (true, ""), (true, ""), (true, ""), (true, ""), (true, ""), (true, ""),
+        (false, "actual: (missing)"),
+        (false, "actual: 7"),
+        (true, ""), (true, ""),
+        (false, "actual: (missing)"),
+        (false, "'>' compares numbers; actual: Ann"),
+        (false, "unknown operator '~'"),
+    ]);
+}
+
+#[tokio::test]
 async fn bodies_auth_graphql_redirect() {
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();

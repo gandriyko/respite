@@ -35,6 +35,7 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 | **Response** | Body, headers, cookies, the request as sent, timeline (redirects, time to first byte, download); multi-MB bodies, images, JSONPath filter, run history ‹ › with diff, pin |
 | **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
 | **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings |
+| **Tests** | `# @assert status == 201`, `# @assert body $.id exists`, `# @assert duration < 500ms`: httpyac's operators, written as comments so the file still runs in VS Code and JetBrains; results in the Tests tab, `respite run` exits 1 on a failure |
 | **History** | Every run is stored per project: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
 | **Workspace** | Collections in `~/.config/respite` plus any project folders, light and dark themes, settings, state restored on launch |
@@ -204,6 +205,7 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 - [x] Autocompletion and inline diagnostics in the editor
 - [ ] Timeline: DNS, TCP and TLS phases
 - [ ] MCP server for AI agents
+- [x] Declarative assertions (`# @assert`)
 - [ ] Pre-request and test scripts, JUnit output
 - [ ] WebSocket, SSE, gRPC; OAuth 2.0 and AWS SigV4 auth
 

@@ -200,6 +200,8 @@ impl Store {
             },
             dependencies: entry.dependencies,
             history_id: Some(entry.id),
+            // ponytail: results are not stored; record them in Entry if History should show them.
+            tests: vec![],
         })
     }
 
@@ -273,6 +275,7 @@ mod tests {
             },
             dependencies: vec![],
             history_id: None,
+            tests: vec![],
         }
     }
 

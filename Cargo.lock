@@ -3141,6 +3141,7 @@ dependencies = [
  "http-env",
  "http-syntax",
  "jiff",
+ "regex",
  "reqwest",
  "reqwest_cookie_store",
  "serde",

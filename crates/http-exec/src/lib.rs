@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use http_env::{ResolveError, Resolver, Variable};
-use http_syntax::{HttpFile, Request};
+use http_syntax::{Assert, HttpFile, Request, Subject};
 use serde_json::{Value, json};
 
 /// What to run against: a parsed `.http` file plus resolved variables.
@@ -75,6 +75,18 @@ pub struct Exchange {
     pub dependencies: Vec<String>,
     /// Set when the exchange was written to history.
     pub history_id: Option<String>,
+    /// `# @assert` results, in file order; empty for history entries.
+    pub tests: Vec<TestResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestResult {
+    pub line: usize,
+    /// The assertion as written.
+    pub text: String,
+    pub passed: bool,
+    /// On failure: the actual value, or why it could not be checked.
+    pub detail: String,
 }
 
 #[derive(Debug)]
@@ -153,6 +165,8 @@ impl Default for Executor {
 struct Prepared {
     sent: SentRequest,
     output: Option<(PathBuf, bool)>,
+    /// `# @assert` lines with `{{vars}}` in the expected value resolved.
+    asserts: Vec<(usize, String, Result<Assert, String>)>,
 }
 
 impl Executor {
@@ -266,8 +280,14 @@ impl Executor {
             if let Some((path, overwrite)) = &prepared.output {
                 write_output(path, *overwrite, &response.body)?;
             }
-            let mut ex =
-                Exchange { request: prepared.sent, response, dependencies: ran[first_dep..].to_vec(), history_id: None };
+            let tests = prepared.asserts.iter().map(|(line, text, a)| check(*line, text, a, &response)).collect();
+            let mut ex = Exchange {
+                request: prepared.sent,
+                response,
+                dependencies: ran[first_dep..].to_vec(),
+                history_id: None,
+                tests,
+            };
             self.persist(cx, req, &mut ex);
             if let Some(name) = &req.name {
                 let key = (cx.path.to_path_buf(), name.clone());
@@ -363,7 +383,15 @@ impl Executor {
             Some(o) => Some((dir.join(r(&o.path)?), o.overwrite)),
             None => None,
         };
-        Ok(Prepared { sent: SentRequest { method, url, headers, body }, output })
+        let mut asserts = vec![];
+        for (line, text, a) in req.asserts() {
+            let a = match a {
+                Ok(a) => Ok(Assert { expected: r(&a.expected)?, ..a }),
+                e => e,
+            };
+            asserts.push((line, text.to_string(), a));
+        }
+        Ok(Prepared { sent: SentRequest { method, url, headers, body }, output, asserts })
     }
 }
 
@@ -431,20 +459,105 @@ fn extract(ex: &Exchange, path: &str) -> Option<String> {
     }
 }
 
+/// `10 s`, `500ms`, `2m`; bare numbers in `default_unit_ms`.
+fn millis(v: &str, default_unit_ms: u64) -> Option<u64> {
+    let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let n: u64 = v[..end].parse().ok()?;
+    Some(match v[end..].trim() {
+        "" => n * default_unit_ms,
+        "ms" => n,
+        "s" => n * 1000,
+        "m" => n * 60_000,
+        _ => return None,
+    })
+}
+
 /// `# @timeout 10 s` — units ms / s / m, seconds by default.
 fn duration(req: &Request, directive: &str) -> Result<Option<Duration>, Error> {
     let Some(d) = req.directive(directive) else { return Ok(None) };
     let v = d.value.as_deref().unwrap_or("");
-    let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
-    let bad = || Error::BadRequest(format!("invalid @{directive} '{v}'"));
-    let n: u64 = v[..end].parse().map_err(|_| bad())?;
-    let ms = match v[end..].trim() {
-        "" | "s" => n * 1000,
-        "ms" => n,
-        "m" => n * 60_000,
-        _ => return Err(bad()),
-    };
+    let ms = millis(v, 1000).ok_or_else(|| Error::BadRequest(format!("invalid @{directive} '{v}'")))?;
     Ok(Some(Duration::from_millis(ms)))
+}
+
+fn check(line: usize, text: &str, a: &Result<Assert, String>, res: &Response) -> TestResult {
+    let outcome = a.clone().and_then(|a| {
+        let v = actual(&a.subject, res)?;
+        let passed = compare(v.as_ref(), &a.op, &a.expected, a.subject == Subject::Duration)?;
+        Ok((passed, v))
+    });
+    let (passed, detail) = match outcome {
+        Ok((true, _)) => (true, String::new()),
+        Ok((false, v)) => (false, format!("actual: {}", v.as_ref().map_or("(missing)".into(), show))),
+        Err(e) => (false, e),
+    };
+    TestResult { line, text: text.into(), passed, detail }
+}
+
+fn actual(subject: &Subject, res: &Response) -> Result<Option<Value>, String> {
+    Ok(match subject {
+        Subject::Status => Some(json!(res.status)),
+        Subject::Duration => Some(json!(res.total.as_millis() as u64)),
+        Subject::Header(n) => header(&res.headers, n).map(|v| json!(v)),
+        Subject::Body(None) => Some(Value::String(String::from_utf8_lossy(&res.body).into_owned())),
+        Subject::Body(Some(p)) => {
+            let full = if p.starts_with('$') { p.clone() } else { format!("$.{p}") };
+            let path = serde_json_path::JsonPath::parse(&full).map_err(|e| format!("invalid JSONPath '{p}': {e}"))?;
+            let json: Value = serde_json::from_slice(&res.body).map_err(|_| "response body is not JSON".to_string())?;
+            path.query(&json).first().cloned()
+        }
+    })
+}
+
+fn show(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
+/// httpyac semantics: `exists` / `isTrue` / `isFalse` on presence and truthiness, numbers compared
+/// as numbers when both sides parse, everything else on the value's text.
+fn compare(v: Option<&Value>, op: &str, expected: &str, is_duration: bool) -> Result<bool, String> {
+    let truthy = |v: &Value| match v {
+        Value::Null | Value::Bool(false) => false,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        _ => true,
+    };
+    match op {
+        "exists" => return Ok(v.is_some_and(|v| !v.is_null())),
+        "isTrue" => return Ok(v.is_some_and(truthy)),
+        "isFalse" => return Ok(!v.is_some_and(truthy)),
+        _ => {}
+    }
+    let Some(v) = v else { return Ok(false) };
+    let text = show(v);
+    let expected = expected.strip_prefix('"').and_then(|e| e.strip_suffix('"')).unwrap_or(expected);
+    let want = if is_duration { millis(expected, 1).map(|n| n as f64) } else { expected.parse::<f64>().ok() };
+    let got = text.parse::<f64>().ok();
+    let ord = || match (got, want) {
+        (Some(g), Some(w)) => Ok(g.partial_cmp(&w)),
+        _ => Err(format!("'{op}' compares numbers; actual: {text}")),
+    };
+    use std::cmp::Ordering::*;
+    Ok(match op {
+        "isNumber" => v.is_number(),
+        "isString" => v.is_string(),
+        "isBoolean" => v.is_boolean(),
+        "isArray" => v.is_array(),
+        "==" | "equals" => got.zip(want).map_or(text == expected, |(g, w)| g == w),
+        "!=" => got.zip(want).map_or(text != expected, |(g, w)| g != w),
+        "<" => ord()? == Some(Less),
+        "<=" => matches!(ord()?, Some(Less | Equal)),
+        ">" => ord()? == Some(Greater),
+        ">=" => matches!(ord()?, Some(Greater | Equal)),
+        "contains" | "includes" => text.contains(expected),
+        "startsWith" => text.starts_with(expected),
+        "endsWith" => text.ends_with(expected),
+        "matches" => regex::Regex::new(expected).map_err(|e| format!("invalid regex: {e}"))?.is_match(&text),
+        o => return Err(format!("unknown operator '{o}'")),
+    })
 }
 
 async fn send(

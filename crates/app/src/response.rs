@@ -210,12 +210,25 @@ pub fn timeline_text(ex: &Exchange) -> String {
     s
 }
 
-/// Tests tab: scripts are recognised but not run yet.
-pub fn tests_text(has_scripts: bool) -> String {
-    match has_scripts {
-        true => "# This request has response handler scripts (> {% … %}).\n# Scripts are not executed yet, so there are no test results.\n".into(),
-        false => "# No tests.\n# Response handler scripts (> {% client.test(…) %}) will report here once scripts run.\n".into(),
+/// Tests tab: `# @assert` results; scripts are recognised but not run yet.
+pub fn tests_text(ex: &Exchange, has_scripts: bool) -> String {
+    let mut s = String::new();
+    if ex.tests.is_empty() {
+        s += "# No tests. Add checks above the request line:\n#   # @assert status == 200\n#   # @assert body $.id exists\n";
+    } else {
+        let failed = ex.tests.iter().filter(|t| !t.passed).count();
+        let _ = writeln!(s, "# {} passed, {failed} failed", ex.tests.len() - failed);
+        for t in &ex.tests {
+            let _ = writeln!(s, "{} {}  (line {})", if t.passed { "✓" } else { "✗" }, t.text, t.line);
+            if !t.passed {
+                let _ = writeln!(s, "    {}", t.detail);
+            }
+        }
     }
+    if has_scripts {
+        s += "# Response handler scripts (> {% … %}) are not executed yet.\n";
+    }
+    s
 }
 
 /// Unified diff of two bodies (pretty JSON when both are JSON), for the diff view.
@@ -461,7 +474,7 @@ impl Respite {
                     format!("{} {}\n{headers}{body}", q.method, q.url)
                 }
                 4 => timeline_text(&ex),
-                _ => tests_text(has_scripts),
+                _ => tests_text(&ex, has_scripts),
             };
             self.resp_meta.update(cx, |s, cx| s.set_value(text, window, cx));
             self.shown_meta = Some((ptr, self.tab));

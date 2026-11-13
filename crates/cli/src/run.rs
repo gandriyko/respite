@@ -10,7 +10,7 @@ use http_exec::{Context, Error, Exchange, SentRequest};
 use http_syntax::Request;
 use serde_json::{Map, Value, json};
 
-use crate::{BOLD, CliError, DIM, EnvArgs, Format, Loaded, YELLOW, environment, find, load, paint, status_color};
+use crate::{BOLD, CliError, DIM, EnvArgs, Format, GREEN, Loaded, RED, YELLOW, environment, find, load, paint, status_color};
 
 const MASK: &str = "••••";
 const SENSITIVE: [&str; 3] = ["authorization", "cookie", "x-api-key"];
@@ -106,6 +106,7 @@ pub(crate) fn run(args: RunArgs) -> Result<u8, CliError> {
         });
         let code = match &outcome {
             Ok(Outcome::Done(ex)) if args.fail_on_status && ex.response.status >= 400 => 1,
+            Ok(Outcome::Done(ex)) if ex.tests.iter().any(|t| !t.passed) => 1,
             Ok(_) => 0,
             Err(e) => e.exit,
         };
@@ -297,6 +298,12 @@ impl Out<'_> {
                 }
                 let status = format!("{} {} · {} ms · {}", r.status, r.reason, r.total.as_millis(), size(r.body.len()));
                 println!("{title}  {}", paint(&status, status_color(r.status), false));
+                for t in &ex.tests {
+                    match t.passed {
+                        true => println!("{} {}", paint("✓", GREEN, false), t.text),
+                        false => println!("{} {}  {}", paint("✗", RED, true), t.text, paint(&t.detail, DIM, false)),
+                    }
+                }
                 if self.has(Part::Headers) {
                     r.headers.iter().for_each(|(n, v)| println!("{}", paint(&format!("{n}: {v}"), DIM, false)));
                 }
@@ -350,7 +357,11 @@ impl Out<'_> {
                 if self.has(Part::Timing) {
                     item["timing_ms"] = json!({ "ttfb": r.ttfb.as_millis() as u64, "total": r.total.as_millis() as u64 });
                 }
-                item["tests"] = json!([]);
+                item["tests"] = ex
+                    .tests
+                    .iter()
+                    .map(|t| json!({ "line": t.line, "assert": t.text, "passed": t.passed, "detail": t.detail }))
+                    .collect();
                 item["dependencies"] = json!(ex.dependencies);
                 item["history_id"] = json!(ex.history_id);
             }

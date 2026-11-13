@@ -96,9 +96,82 @@ pub const DIRECTIVES: &[&str] = &[
     "timeout",
     "connection-timeout",
     "insecure",
+    "assert",
 ];
 
+/// `# @assert <subject> <operator> [expected]`; subjects and operators follow httpyac's `??`.
+/// Kept in a comment so VS Code REST Client and JetBrains still run the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assert {
+    pub subject: Subject,
+    pub op: String,
+    /// Raw, may hold `{{vars}}`; empty for unary operators.
+    pub expected: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Subject {
+    Status,
+    Header(String),
+    /// Whole body as text, or a JSONPath (`$.a[0]`; a bare `a.b` means `$.a.b`).
+    Body(Option<String>),
+    /// Total time in ms; the expected value may carry `ms` / `s` / `m`.
+    Duration,
+}
+
+pub const ASSERT_UNARY: &[&str] = &["exists", "isTrue", "isFalse", "isNumber", "isString", "isBoolean", "isArray"];
+pub const ASSERT_BINARY: &[&str] =
+    &["==", "equals", "!=", "<", "<=", ">", ">=", "contains", "includes", "startsWith", "endsWith", "matches"];
+
+fn word<'a>(s: &mut &'a str) -> &'a str {
+    let (w, rest) = s.split_once(char::is_whitespace).unwrap_or((*s, ""));
+    *s = rest.trim_start();
+    w
+}
+
+pub fn parse_assert(text: &str) -> Result<Assert, String> {
+    let mut s = text.trim();
+    let is_op = |w: &str| ASSERT_UNARY.contains(&w) || ASSERT_BINARY.contains(&w);
+    let subject = match word(&mut s) {
+        "status" => Subject::Status,
+        "duration" => Subject::Duration,
+        "header" => match word(&mut s) {
+            "" => return Err("header name expected: header <name> <operator> …".into()),
+            n => Subject::Header(n.into()),
+        },
+        "body" => {
+            let mut peek = s;
+            match word(&mut peek) {
+                w if w.is_empty() || is_op(w) => Subject::Body(None),
+                w => {
+                    s = peek;
+                    Subject::Body(Some(w.into()))
+                }
+            }
+        }
+        "" => return Err("expected: @assert <subject> <operator> [value]".into()),
+        w => return Err(format!("unknown subject '{w}'; use status, header <name>, body [path] or duration")),
+    };
+    let op = word(&mut s);
+    let expected = s.trim().to_string();
+    match op {
+        "" => Err("operator expected, e.g. ==, contains, exists".into()),
+        o if ASSERT_UNARY.contains(&o) && !expected.is_empty() => Err(format!("'{o}' takes no value")),
+        o if ASSERT_BINARY.contains(&o) && expected.is_empty() => Err(format!("'{o}' needs a value")),
+        o if !is_op(o) => Err(format!("unknown operator '{o}'")),
+        o => Ok(Assert { subject, op: o.into(), expected }),
+    }
+}
+
 impl Request {
+    /// `# @assert` lines in order: (line, text as written, parsed).
+    pub fn asserts(&self) -> impl Iterator<Item = (usize, &str, Result<Assert, String>)> {
+        self.directives.iter().filter(|d| d.name == "assert").map(|d| {
+            let text = d.value.as_deref().unwrap_or("");
+            (d.line, text, parse_assert(text))
+        })
+    }
+
     /// Label for trees and search: `@name`, then `###` title, then `METHOD url`.
     pub fn label(&self) -> String {
         self.name
@@ -254,6 +327,11 @@ fn parse_block(
                 if !DIRECTIVES.contains(&name) {
                     file.diagnostics.push(diag(i + 1, Severity::Warning, "unknown_directive",
                         format!("unknown directive '@{name}'")));
+                }
+                if name == "assert"
+                    && let Err(e) = parse_assert(value.as_deref().unwrap_or(""))
+                {
+                    file.diagnostics.push(diag(i + 1, Severity::Error, "invalid_assert", e));
                 }
                 directives.push(Directive { name: name.into(), value, line: i + 1 });
             }
@@ -447,6 +525,24 @@ mod tests {
             (17, "duplicate_name"),
             (19, "scripts_not_supported"),
         ]);
+    }
+
+    #[test]
+    fn asserts() {
+        let a = |s| parse_assert(s);
+        let ok = |subject, op: &str, expected: &str| Ok(Assert { subject, op: op.into(), expected: expected.into() });
+        assert_eq!(a("status == 201"), ok(Subject::Status, "==", "201"));
+        assert_eq!(a("header content-type contains json"), ok(Subject::Header("content-type".into()), "contains", "json"));
+        assert_eq!(a("body $.items[0].name == Ann Lee"), ok(Subject::Body(Some("$.items[0].name".into())), "==", "Ann Lee"));
+        assert_eq!(a("body id exists"), ok(Subject::Body(Some("id".into())), "exists", ""));
+        assert_eq!(a("body contains ok"), ok(Subject::Body(None), "contains", "ok"));
+        assert_eq!(a("duration < 2 s"), ok(Subject::Duration, "<", "2 s"));
+        for bad in ["", "code == 1", "status", "status ~ 1", "status ==", "body exists 1", "header"] {
+            assert!(a(bad).is_err(), "{bad}");
+        }
+        let f = parse("# @assert status == 200\n# @assert status ~ 1\nGET /a\n");
+        assert_eq!(f.diagnostics.iter().map(|d| (d.line, d.code)).collect::<Vec<_>>(), [(2, "invalid_assert")]);
+        assert_eq!(f.requests[0].asserts().count(), 2);
     }
 
     #[test]

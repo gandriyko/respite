@@ -85,6 +85,22 @@ POST {{baseUrl}}/post
 # @note Deletes for real
 DELETE {{baseUrl}}/delete
 
+### Assertions
+# Results in the Tests tab; `respite run` exits 1 when one fails.
+# Subjects: status, header <name>, body, body <JSONPath>, duration.
+# Operators: == != < <= > >= contains startsWith endsWith matches
+#   exists isTrue isFalse isNumber isString isBoolean isArray
+# Comments to other clients, so the file still runs in VS Code and JetBrains.
+# @assert status == 200
+# @assert header content-type contains json
+# @assert body $.json.name == Ann
+# @assert body json.tags isArray
+# @assert duration < 2 s
+POST {{baseUrl}}/post
+Content-Type: application/json
+
+{"name": "Ann", "tags": ["a"]}
+
 
 ### Body from a file
 # <@ fills {{variables}} in the file, < sends it as is.

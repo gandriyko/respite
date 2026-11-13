@@ -1,5 +1,5 @@
 //! `respite <command>`: the same core as the GUI, for terminals, CI and agents.
-//! Exit codes: 0 ok · 1 failed checks (`--fail-on-status`) · 2 network/timeout ·
+//! Exit codes: 0 ok · 1 failed checks (`# @assert`, `--fail-on-status`) · 2 network/timeout ·
 //! 3 parse error / undefined variable / bad input · 4 refused (confirmation needed).
 
 mod curl;
