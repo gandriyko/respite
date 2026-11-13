@@ -7,7 +7,7 @@ use std::{fmt::Write as _, path::Path, sync::Arc};
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size, WindowExt as _,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonGroup, ButtonVariants as _},
     diff::{Diff, DiffFile, DiffMode, DiffState},
     input::{Editor, Input},
     progress::ProgressCircle,
@@ -587,9 +587,7 @@ impl Respite {
                 let wrap_on = self.settings.settings.response.soft_wrap;
                 let too_big = body_tab && view.read(cx).text().len() > WRAP_MAX;
                 let wrap = Button::new("response-wrap")
-                    .label("Wrap")
-                    .ghost()
-                    .xsmall()
+                    .icon(icon(include_bytes!("../assets/text-wrap.svg")))
                     .selected(wrap_on && !too_big)
                     .disabled(too_big)
                     .tooltip(match (too_big, wrap_on) {
@@ -600,9 +598,7 @@ impl Respite {
                     .on_click(cx.listener(move |this, _, window, cx| this.set("response.soft_wrap", (!wrap_on).into(), window, cx)));
                 let raw = (body_tab && self.body_other.is_none()).then(|| {
                     Button::new("response-raw")
-                        .label("Raw")
-                        .ghost()
-                        .xsmall()
+                        .icon(icon(include_bytes!("../assets/braces.svg")))
                         .selected(self.raw)
                         .tooltip(if self.raw { "As received — click to pretty-print" } else { "Pretty-printed — click to show as received" })
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -613,23 +609,20 @@ impl Respite {
                 let (a, b, c_) = (ex.clone(), ex.clone(), ex.clone());
                 let copy = Button::new("copy-body")
                     .icon(IconName::Copy)
-                    .ghost()
-                    .xsmall()
                     .tooltip("Copy the body")
                     .on_click(cx.listener(move |this, _, window, cx| this.copy_body(&a, window, cx)));
                 let curl = Button::new("copy-curl")
-                    .label("cURL")
-                    .ghost()
-                    .xsmall()
+                    .icon(icon(include_bytes!("../assets/terminal.svg")))
                     .tooltip("Copy the request as a cURL command")
                     .on_click(cx.listener(move |this, _, window, cx| this.copy_curl(&c_, window, cx)));
                 let save = Button::new("save-body")
                     .icon(icon(include_bytes!("../assets/download.svg")))
-                    .ghost()
-                    .xsmall()
                     .tooltip("Save the body to a file")
                     .on_click(cx.listener(move |this, _, window, cx| this.save_body(&b, window, cx)));
-                Some(div().flex().items_center().gap_1().children(raw).child(wrap).child(div().w_2()).child(copy).child(curl).child(save).child(search))
+                // Outlined segments: view toggles, then actions; search stands alone.
+                let view_opts = ButtonGroup::new("response-view").outline().xsmall().children(raw).child(wrap);
+                let actions = ButtonGroup::new("response-actions").outline().xsmall().child(copy).child(curl).child(save);
+                Some(div().flex().items_center().gap_1().child(view_opts).child(div().w_2()).child(actions).child(search))
             }
             _ => None,
         };
