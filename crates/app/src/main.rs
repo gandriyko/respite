@@ -130,6 +130,9 @@ struct Respite {
     settings: respite_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
     show_history: bool,
+    /// History column and whether it is descending.
+    history_sort: (history_page::SortBy, bool),
+    history_scroll: UniformListScrollHandle,
     /// Holds focus when nothing else does (no tabs), so shortcuts still reach the "Respite" context.
     focus: FocusHandle,
     /// Current project's history, newest first; reloaded when the page opens and after runs.
@@ -265,6 +268,8 @@ impl Respite {
             settings,
             settings_window: None,
             show_history: false,
+            history_sort: (history_page::SortBy::Time, true),
+            history_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
             history: vec![],
             history_rows: vec![],
@@ -593,6 +598,8 @@ impl Respite {
             }
         };
         self.current = Some(ix);
+        // Opening a file (sidebar, Cmd+P, F1 …) shows it, so leave the History page.
+        self.show_history = false;
         self.touch_mru();
         self.expanded.insert(path);
         // Now, not only on quit: closing the window or killing the process skips the quit hook.
@@ -642,6 +649,7 @@ impl Respite {
     fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.docs.len() {
             self.current = Some(ix);
+            self.show_history = false;
             self.touch_mru();
             self.remember_position(cx);
             self.docs[ix].editor.update(cx, |s, cx| s.focus(window, cx));

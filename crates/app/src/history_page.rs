@@ -1,17 +1,35 @@
-//! History (Cmd+Y): every execution of the current project, newest first.
+//! History (Cmd+Y): every execution of the current project, newest first; headers sort.
 //! Click shows the recorded response in the response panel; ▶ runs the request again.
 
-use std::{ops::Range, sync::Arc};
+use std::{cmp::Ordering, ops::Range, sync::Arc};
 
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::Input,
 };
-use http_exec::Store;
+use http_exec::{Entry, Store};
 
 use crate::{Respite, sidebar};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SortBy {
+    Time,
+    Status,
+    Method,
+    Request,
+    File,
+    Duration,
+}
+
+/// Column widths: header and rows share them.
+const TIME_W: f32 = 104.;
+const STATUS_W: f32 = 56.;
+const METHOD_W: f32 = 48.;
+const FILE_W: f32 = 120.;
+const DURATION_W: f32 = 64.;
+const REPLAY_W: f32 = 24.;
 
 impl Respite {
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -37,11 +55,13 @@ impl Respite {
         }
     }
 
-    /// Indices of entries matching every word of the filter (method, URL, name, file, status).
+    /// Indices of entries matching every word of the filter (method, URL, name, file, status),
+    /// in the chosen column order.
     fn history_matches(&self, cx: &App) -> Vec<usize> {
         let query = self.history_filter.read(cx).value().to_lowercase();
         let words: Vec<&str> = query.split_whitespace().collect();
-        self.history
+        let mut rows: Vec<usize> = self
+            .history
             .iter()
             .enumerate()
             .filter(|(_, e)| {
@@ -49,7 +69,25 @@ impl Respite {
                 words.iter().all(|w| hay.contains(w))
             })
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+        let (by, desc) = self.history_sort;
+        // Stable: ties keep the newest-first order.
+        rows.sort_by(|&a, &b| {
+            let o = compare(by, &self.history[a], &self.history[b]);
+            if desc { o.reverse() } else { o }
+        });
+        rows
+    }
+
+    /// Same column again flips the order; a new one starts slowest / newest first for
+    /// duration and time, A→Z otherwise.
+    fn sort_history(&mut self, by: SortBy, cx: &mut Context<Self>) {
+        self.history_sort = match self.history_sort {
+            (cur, desc) if cur == by => (by, !desc),
+            _ => (by, matches!(by, SortBy::Time | SortBy::Duration)),
+        };
+        self.history_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
     }
 
     fn pick_history(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -98,6 +136,7 @@ impl Respite {
             .border_color(t.border)
             .child(div().text_lg().font_weight(FontWeight::BOLD).child("History"))
             .child(div().text_xs().text_color(muted).child(count))
+            .child(self.history_summary(cx))
             .child(div().flex_1())
             .child(Input::new(&self.history_filter).small().w(px(280.)))
             .child(
@@ -118,19 +157,92 @@ impl Respite {
         } else {
             let list = uniform_list("history", self.history_rows.len(), cx.processor(|this, range: Range<usize>, _, cx| {
                 range.map(|ix| this.history_row(ix, cx)).collect::<Vec<_>>()
-            }));
-            div().flex_1().min_h_0().py_1().child(list.size_full()).into_any_element()
+            }))
+            .track_scroll(&self.history_scroll);
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .pt_2()
+                .child(self.table_head(cx))
+                .child(div().flex_1().min_h_0().child(list.size_full()))
+                .into_any_element()
         };
         div().size_full().flex().flex_col().child(header).child(body).into_any_element()
+    }
+
+    /// "3 OK · 1 failed · avg 414 ms" as coloured chips, for the shown rows.
+    fn history_summary(&self, cx: &App) -> AnyElement {
+        let t = cx.theme();
+        let rows: Vec<&Entry> = self.history_rows.iter().map(|&i| &self.history[i]).collect();
+        let ok = rows.iter().filter(|e| (200..400).contains(&e.status)).count();
+        let failed = rows.len() - ok;
+        let avg = if rows.is_empty() { 0 } else { rows.iter().map(|e| e.total_ms).sum::<u64>() / rows.len() as u64 };
+        let chip = |text: String, color: Hsla| div().px_2().py_0p5().rounded_full().bg(color.opacity(0.15)).text_color(color).text_xs().font_weight(FontWeight::SEMIBOLD).child(text);
+        div()
+            .flex()
+            .gap_1()
+            .when(ok > 0, |d| d.child(chip(format!("{ok} OK"), t.success)))
+            .when(failed > 0, |d| d.child(chip(format!("{failed} failed"), t.danger)))
+            .when(!rows.is_empty(), |d| d.child(chip(format!("avg {avg} ms"), t.muted_foreground)))
+            .into_any_element()
+    }
+
+    fn table_head(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.theme();
+        let (fg, muted, hover) = (t.foreground, t.muted_foreground, t.list_hover);
+        let (sorted, desc) = self.history_sort;
+        let fs = cx.theme().font_size * 0.75;
+        let cell = |id: &'static str, label: &'static str, by: SortBy, cx: &mut Context<Self>| {
+            let active = sorted == by;
+            let arrow = if desc { IconName::ChevronDown } else { IconName::ChevronUp };
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .whitespace_nowrap()
+                .hover(move |s| s.bg(hover))
+                .text_color(if active { fg } else { muted })
+                .child(label)
+                .when(active, |d| d.child(Icon::new(arrow).size(fs)))
+                .on_click(cx.listener(move |this, _, _, cx| this.sort_history(by, cx)))
+        };
+        div()
+            .flex_none()
+            .mx_2()
+            .px_3()
+            .pb_2()
+            .mb_1()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(t.border)
+            .text_xs()
+            .font_weight(FontWeight::BOLD)
+            .child(div().w(px(TIME_W)).flex_none().child(cell("sort-time", "TIME", SortBy::Time, cx)))
+            .child(div().w(px(STATUS_W)).flex_none().child(cell("sort-status", "STATUS", SortBy::Status, cx)))
+            .child(div().w(px(METHOD_W)).flex_none().child(cell("sort-method", "METHOD", SortBy::Method, cx)))
+            .child(div().flex_1().min_w_0().child(cell("sort-request", "REQUEST", SortBy::Request, cx)))
+            .child(div().w(px(FILE_W)).flex_none().child(cell("sort-file", "FILE", SortBy::File, cx)))
+            .child(div().w(px(DURATION_W)).flex_none().flex().justify_end().child(cell("sort-duration", "MS", SortBy::Duration, cx)))
+            .child(div().w(px(REPLAY_W)).flex_none())
+            .into_any_element()
     }
 
     fn history_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let i = self.history_rows[ix];
         let e = &self.history[i];
         let t = cx.theme();
-        let (muted, hover, active) = (t.muted_foreground, t.list_hover, t.list_active);
+        let (muted, hover, active, zebra) = (t.muted_foreground, t.list_hover, t.list_active, t.secondary.opacity(0.5));
+        let mono = t.mono_font_family.clone();
         let selected = self.history_pick.as_ref().is_some_and(|(p, _)| p.id == e.id);
         let color = self.status_color(e.status, cx);
+        let slow = if e.total_ms >= 1000 { t.warning } else { muted };
         let replay = Button::new(("history-replay", ix))
             .icon(IconName::Play)
             .ghost()
@@ -142,54 +254,43 @@ impl Respite {
             }));
         let row = div()
             .id(("history-row", ix))
-            .h(px(40.))
             .px_3()
-            .rounded_md()
+            .h(px(36.))
             .flex()
             .items_center()
             .gap_3()
-            .text_sm()
+            .rounded_md()
             .cursor_pointer()
-            .hover(move |s| s.bg(hover))
+            .when(ix % 2 == 1, |r| r.bg(zebra))
             .when(selected, |r| r.bg(active))
-            .child(div().w(px(104.)).flex_none().text_xs().font_family(t.mono_font_family.clone()).text_color(muted).child(time_label(&e.time)))
+            .hover(move |s| s.bg(hover))
+            .child(div().w(px(TIME_W)).flex_none().text_xs().font_family(mono.clone()).text_color(muted).child(time_label(&e.time)))
             .child(
                 div()
-                    .w(px(36.))
+                    .w(px(STATUS_W))
                     .flex_none()
                     .flex()
-                    .justify_center()
-                    .rounded_sm()
-                    .bg(color.opacity(0.15))
-                    .text_color(color)
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .child(e.status.to_string()),
+                    .items_center()
+                    .gap_1p5()
+                    .child(div().size(px(8.)).rounded_full().bg(color))
+                    .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(color).child(e.status.to_string())),
             )
-            .child(
-                div()
-                    .w(px(44.))
-                    .flex_none()
-                    .flex()
-                    .justify_end()
-                    .text_size(px(9.5))
-                    .font_weight(FontWeight::BOLD)
-                    .font_family(t.mono_font_family.clone())
-                    .text_color(sidebar::method_color(&e.method, cx))
-                    .child(e.method.clone()),
-            )
+            .child(div().w(px(METHOD_W)).flex_none().text_xs().font_weight(FontWeight::BOLD).font_family(mono).text_color(sidebar::method_color(&e.method, cx)).child(e.method.clone()))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
-                    .flex_col()
-                    .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(e.label.clone()))
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    // The name keeps most of the room; the URL shrinks first.
+                    .child(div().flex_shrink_0().max_w(relative(0.75)).truncate().font_weight(FontWeight::SEMIBOLD).child(short_label(e)))
                     .child(div().truncate().text_xs().text_color(muted).child(e.url.clone())),
             )
-            .child(div().flex_none().text_xs().text_color(muted).child(format!("{}:{}", e.file, e.line)))
-            .child(div().w(px(64.)).flex_none().flex().justify_end().text_xs().text_color(muted).child(format!("{} ms", e.total_ms)))
-            .child(replay)
+            .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(format!("{}:{}", e.file, e.line)))
+            .child(div().w(px(DURATION_W)).flex_none().text_right().text_xs().text_color(slow).child(e.total_ms.to_string()))
+            .child(div().w(px(REPLAY_W)).flex_none().child(replay))
             // Click shows the response; double click opens the request in its file.
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 if ev.click_count() >= 2 {
@@ -199,6 +300,23 @@ impl Respite {
                 }
             }));
         div().w_full().px_2().child(row).into_any_element()
+    }
+}
+
+/// An unnamed request's label is `METHOD url`; the METHOD column already says the method.
+fn short_label(e: &Entry) -> String {
+    e.label.strip_prefix(&e.method).and_then(|rest| rest.strip_prefix(' ')).unwrap_or(&e.label).to_string()
+}
+
+fn compare(by: SortBy, a: &Entry, b: &Entry) -> Ordering {
+    match by {
+        // RFC 3339 UTC: text order is time order.
+        SortBy::Time => a.time.cmp(&b.time),
+        SortBy::Status => a.status.cmp(&b.status),
+        SortBy::Method => a.method.cmp(&b.method),
+        SortBy::Request => a.label.to_lowercase().cmp(&b.label.to_lowercase()),
+        SortBy::File => (&a.file, a.line).cmp(&(&b.file, b.line)),
+        SortBy::Duration => a.total_ms.cmp(&b.total_ms),
     }
 }
 
