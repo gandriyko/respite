@@ -4,6 +4,7 @@
 mod attach;
 mod doc;
 mod fixes;
+mod help_page;
 mod highlight;
 mod history_page;
 mod keymap;
@@ -46,7 +47,7 @@ actions!(
         RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Import, Quit,
         NextEnvironment, ToggleHistory, InsertFile, RunAll, RunSelected, RepeatLast, CancelRequests, GoToFile, GoToRequest,
         CommandPalette, PrevRequest, NextRequest, QuickFix, RenameSymbol, GoToWorkspaceRequest, FocusEditor, FocusResponse,
-        ExpandTemplate, CopyJsonPath, ToggleResponse, ToggleSplit
+        ExpandTemplate, CopyJsonPath, ToggleResponse, ToggleSplit, ShowHelp
     ]
 );
 
@@ -129,6 +130,8 @@ struct Respite {
     settings: respite_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
     show_history: bool,
+    /// Holds focus when nothing else does (no tabs), so shortcuts still reach the "Respite" context.
+    focus: FocusHandle,
     /// Current project's history, newest first; reloaded when the page opens and after runs.
     history: Vec<http_exec::Entry>,
     /// Indices into `history` that match the filter (the list's rows).
@@ -262,6 +265,7 @@ impl Respite {
             settings,
             settings_window: None,
             show_history: false,
+            focus: cx.focus_handle(),
             history: vec![],
             history_rows: vec![],
             history_pick: None,
@@ -561,6 +565,9 @@ impl Respite {
                             cx,
                         );
                     }
+                    if help_page::is_help(&path) {
+                        s.set_readonly(true, cx);
+                    }
                     s
                 });
                 let subs = vec![
@@ -742,8 +749,10 @@ impl Respite {
             0 => None,
             n => Some(ix.min(n - 1)),
         };
-        if let Some(ix) = self.current {
-            self.select(ix, window, cx);
+        match self.current {
+            Some(ix) => self.select(ix, window, cx),
+            // The closed editor may still hold focus; take it, or shortcuts stop working.
+            None => window.focus(&self.focus, cx),
         }
         cx.notify();
     }
@@ -1191,10 +1200,14 @@ impl Respite {
 impl Render for Respite {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_response(window, cx);
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus, cx);
+        }
         let sidebar = self.sidebar(cx);
         let center = self.center(cx);
         div()
             .key_context("Respite")
+            .track_focus(&self.focus)
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -1279,6 +1292,7 @@ impl Render for Respite {
             .on_action(cx.listener(|this, _: &NextEnvironment, window, cx| this.next_env(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowHelp, window, cx| this.show_help(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar = !this.sidebar;
                 cx.notify();
@@ -1367,6 +1381,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Command Palette…", CommandPalette),
         ]),
+        Menu::new("Help").items([MenuItem::action("Syntax Reference", ShowHelp)]),
     ]);
 }
 
@@ -1402,6 +1417,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Add Project…", Box::new(AddProject)),
         ("Import…", Box::new(Import)),
         ("Settings…", Box::new(OpenSettings)),
+        ("Syntax Reference", Box::new(ShowHelp)),
         ("Quit Respite", Box::new(Quit)),
     ]
 }

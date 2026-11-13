@@ -74,6 +74,7 @@ fn defaults() -> Vec<Spec> {
         spec(key(","), OpenSettings, Both),
         spec(key("alt-e"), NextEnvironment, Both),
         spec(key("y"), ToggleHistory, Both),
+        spec("f1", ShowHelp, Both),
         spec(key("p"), GoToFile, Both),
         spec(key("shift-o"), GoToRequest, Both),
         spec(key("t"), GoToWorkspaceRequest, Both),

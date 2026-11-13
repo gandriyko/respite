@@ -1,0 +1,130 @@
+# Cmd+Enter runs an example. Copy any block into your file.
+
+@baseUrl = https://httpbin.org
+
+
+### Simplest request
+GET https://httpbin.org/get
+
+### Headers and a body
+# A blank line separates the body.
+POST {{baseUrl}}/post
+Content-Type: application/json
+
+{"name": "Anya"}
+
+### Long URLs
+GET {{baseUrl}}/get
+    ?page=1
+    &limit=20
+
+### No method means GET
+httpbin.org/get
+
+
+### File variables
+@host = httpbin.org
+GET https://{{host}}/get
+
+### Environments
+# respite.json, respite-dev.json,
+# respite-dev.private.json (secrets):
+#   {"token": "dev-token"}
+GET {{baseUrl}}/bearer
+Authorization: Bearer {{token}}
+
+### Generated values
+# Offsets: y M w d h m s ms.
+# Also: $processEnv HOME, $dotenv KEY, $localDatetime.
+POST {{baseUrl}}/post
+Content-Type: application/json
+
+{
+  "id": "{{$uuid}}",
+  "n": {{$randomInt 1 100}},
+  "unix": {{$timestamp}},
+  "iso": "{{$isoTimestamp}}",
+  "day": "{{$datetime "YYYY-MM-DD"}}",
+  "nextWeek": "{{$datetime iso8601 7 d}}"
+}
+
+
+### Log in
+# @name login
+POST {{baseUrl}}/post
+Content-Type: application/json
+
+{"token": "abc123"}
+
+### Use login's response
+# Runs login first if needed.
+# Also: response.headers.X, response.body.*, request.body.
+GET {{baseUrl}}/bearer
+Authorization: Bearer {{login.response.body.$.json.token}}
+
+
+### Directives
+# @timeout 10 s
+# @connection-timeout 2 s
+# @no-redirect
+# @no-cookie-jar
+# @no-log
+GET {{baseUrl}}/redirect/1
+
+### Self-signed certificate
+# @insecure
+GET https://self-signed.badssl.com/
+
+### Ask for a value
+# @prompt otp One-time code
+POST {{baseUrl}}/post
+
+{"otp": "{{otp}}"}
+
+### Confirm before sending
+# @note Deletes for real
+DELETE {{baseUrl}}/delete
+
+
+### Body from a file
+# <@ fills {{variables}} in the file, < sends it as is.
+POST {{baseUrl}}/post
+Content-Type: application/json
+
+< ./payload.json
+
+### Form
+POST {{baseUrl}}/post
+Content-Type: application/x-www-form-urlencoded
+
+user=anya
+&city=Kyiv
+
+### File upload
+POST {{baseUrl}}/post
+Content-Type: multipart/form-data; boundary=B
+
+--B
+Content-Disposition: form-data; name="file"; filename="report.pdf"
+
+< ./report.pdf
+--B--
+
+### GraphQL
+GRAPHQL https://countries.trevorblades.com/
+
+query Country($code: ID!) {
+  country(code: $code) { name capital }
+}
+
+{"code": "UA"}
+
+### Basic auth
+GET {{baseUrl}}/basic-auth/anya/secret
+Authorization: Basic anya secret
+
+### Save the response
+# >>! overwrites.
+GET {{baseUrl}}/json
+
+>> ./out/sample.json
