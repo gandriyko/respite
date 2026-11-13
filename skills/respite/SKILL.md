@@ -158,13 +158,27 @@ Authorization: Bearer {{$auth.token("api")}}
 ```
 
 - `{{$auth.token("id")}}` is the access token, `{{$auth.idToken("id")}}` the ID token.
-- `Grant Type`: `Client Credentials` or `Password` (`Username`, `Password`).
-  `Authorization Code`, `Device Authorization` and `Implicit` are not supported yet.
+- `Grant Type`:
+  - `Client Credentials`;
+  - `Password` — with `Username` and `Password`;
+  - `Authorization Code` — with `Auth URL`. It opens the system browser and waits up to 5
+    minutes for the redirect. `Redirect URL` must be a loopback address like
+    `http://127.0.0.1:8765/callback`; without it a free port is used.
+    `"PKCE": true` uses S256, or pass an object with `Code Challenge Method` (`SHA-256` /
+    `Plain`) and `Code Verifier`;
+  - `Device Authorization` — with `Device Auth URL`. It shows "Enter code … at …", opens the
+    page and polls. `"Open Complete URI": true` opens the link with the code already filled in.
+    `Start Polling After Browser` is accepted, but polling starts right away.
+  - `Implicit` is not supported.
+- Browser and device sign-ins need a person. Don't start them from an agent unless the user
+  is at the machine. `respite auth token ID` prints the instructions on stderr, and the token
+  stays cached for later runs.
+- A config without `Client Secret` is a public client: `client_id` goes in the body.
 - `Type: "Mock"` with `"Token"` (and `"ID Token"`) hands out a fixed token, with no request.
 - Other fields:
   - `Client Credentials` — how the client authenticates: `basic` (default), `in body`, `none`;
   - `Custom Request Parameters` / `Custom Request Headers` — `"name": "v"`, a list, or
-    `{"Value": …, "Use": "Everywhere" | "In Token Request"}`;
+    `{"Value": …, "Use": "Everywhere" | "In Auth Request" | "In Token Request"}`;
   - `Acquire Automatically: false` — requests fail until `respite auth token ID` gets one.
 - Config values may use `{{variables}}`; keep secrets in `.private` files. A private file can
   hold just the fields it adds (`"Client Secret"`): configs merge field by field.

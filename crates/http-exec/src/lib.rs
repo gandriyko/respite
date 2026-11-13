@@ -7,7 +7,7 @@
 mod oauth;
 mod store;
 
-pub use oauth::Token;
+pub use oauth::{AuthUi, Token, open_in_browser};
 pub use store::{Entry, Store};
 
 use std::cell::RefCell;
@@ -157,6 +157,8 @@ pub struct Executor {
     named: Mutex<HashMap<(PathBuf, String), Arc<Exchange>>>,
     /// OAuth 2.0 tokens by config id, for this executor's environment.
     tokens: Mutex<HashMap<String, Token>>,
+    /// Where browser and device sign-ins talk to the user.
+    auth_ui: std::sync::RwLock<AuthUi>,
     store: Option<Store>,
     env: Option<String>,
     source: &'static str,
@@ -191,6 +193,7 @@ impl Executor {
             cookies: Arc::new(reqwest_cookie_store::CookieStoreMutex::new(jar)),
             named: Mutex::default(),
             tokens: Mutex::new(tokens),
+            auth_ui: Default::default(),
             store,
             env: env.map(Into::into),
             source,
@@ -333,9 +336,10 @@ impl Executor {
         let options = self.options.read().unwrap().clone();
         let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(options.insecure);
         builder = builder.timeout(options.timeout.unwrap_or(Duration::from_secs(30)));
-        let token = oauth::acquire(&builder.build()?, &cfg, previous.as_ref().filter(|_| !force)).await.map_err(|e| match e {
+        let ui = self.auth_ui.read().unwrap().clone();
+        let token = oauth::acquire(&builder.build()?, &cfg, previous.as_ref().filter(|_| !force), &ui).await.map_err(|e| match e {
             oauth::Error::Http(h) => Error::Http(h),
-            oauth::Error::Config(message) | oauth::Error::Server(message) => Error::Auth { id: id.into(), message },
+            oauth::Error::Config(message) | oauth::Error::Server(message) | oauth::Error::Pending(message) => Error::Auth { id: id.into(), message },
         })?;
         let mut tokens = self.tokens.lock().unwrap();
         tokens.insert(id.into(), token.clone());
@@ -345,6 +349,11 @@ impl Executor {
             eprintln!("respite: OAuth tokens not saved: {e}");
         }
         Ok(token)
+    }
+
+    /// How sign-ins that need the user (browser, device code) reach them.
+    pub fn set_auth_ui(&self, ui: AuthUi) {
+        *self.auth_ui.write().unwrap() = ui;
     }
 
     /// Forget every token of this environment, on disk too.

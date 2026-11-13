@@ -661,6 +661,8 @@ impl Respite {
                     .gap_3()
                     .child(ProgressCircle::new("waiting").loading(true).color(t.primary).with_size(Size::Size(t.font_size * 4.)))
                     .child(div().text_sm().text_color(muted).child("Waiting for the response…"))
+                    // A browser or device sign-in the request waits for (OAuth 2.0).
+                    .children(self.auth_notice.clone().map(|m| div().px_4().max_w_full().text_center().text_sm().text_color(t.foreground).child(m)))
                     .child(div().text_xs().text_color(muted).child("Esc to stop"));
                 return panel.child(waiting).into_any_element();
             }

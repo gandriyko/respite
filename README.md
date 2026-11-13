@@ -153,13 +153,22 @@ The config lives in an env file under `Security` → `Auth`, with JetBrains' fie
 { "clientSecret": "…" }
 ```
 
-- **Grants.** `Client Credentials` and `Password` work now. `"Type": "Mock"` with a `"Token"` gives a fixed token for tests. Browser flows (Authorization Code with PKCE, Device Authorization) come next.
+- **Grants.**
+  - `Client Credentials` and `Password`.
+  - `Authorization Code`: Respite opens the system browser and catches the redirect on a loopback address. Set `Redirect URL` to something like `http://127.0.0.1:8765/callback`, or leave it out and a free port is picked. Add `"PKCE": true` to use PKCE.
+  - `Device Authorization`: Respite shows "Enter code … at …" while the request waits, opens the page and polls until you sign in.
+  - `"Type": "Mock"` with a `"Token"` gives a fixed token for tests.
+  - Implicit is not supported.
 - **Other fields.** `Client Credentials` (`basic`, `in body` or `none`), `Custom Request Parameters`, `Custom Request Headers` and `Acquire Automatically`. `{{$auth.idToken("api")}}` gives the ID token.
 - **When a token is fetched.** Only when a request first needs it. It is reused until shortly before it expires, renewed with the refresh token when there is one, and fetched again when the config changes.
 - **Cache.** Tokens are kept per environment in `~/.respite/history/<project>/oauth.<env>.json`, a file only you can read. The app and the CLI share it, and history masks the tokens.
 - **Commands.** `respite auth token api --env dev` prints a token, `respite auth clear --env dev` forgets them. In the app, use **Clear OAuth 2.0 Tokens** in the command palette.
 
-To try it, the public Duende demo server accepts client `m2m` with secret `secret` and scope `api` at `https://demo.duendesoftware.com/connect/token`. Its API is `https://demo.duendesoftware.com/api/test`.
+To try it, use the public Duende demo server. Its token endpoint is `https://demo.duendesoftware.com/connect/token` and its API is `https://demo.duendesoftware.com/api/test`. Test clients:
+
+- `m2m` with secret `secret` and scope `api`, for Client Credentials;
+- `interactive.public` with `"PKCE": true`, for the browser. Set `Auth URL` to `https://demo.duendesoftware.com/connect/authorize` and sign in as bob / bob;
+- `device`, for the device flow. Set `Device Auth URL` to `https://demo.duendesoftware.com/connect/deviceauthorization`.
 
 ## Tests
 
@@ -280,8 +289,7 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 - [ ] MCP server for AI agents
 - [x] Declarative assertions (`# @assert`)
 - [ ] Pre-request and test scripts, JUnit output
-- [x] OAuth 2.0: Client Credentials, Password, refresh tokens (`$auth.token`)
-- [ ] OAuth 2.0 browser flows: Authorization Code + PKCE, Device Authorization
+- [x] OAuth 2.0: Client Credentials, Password, Authorization Code + PKCE, Device Authorization, refresh tokens (`$auth.token`)
 - [ ] WebSocket, SSE, gRPC; AWS SigV4 auth
 
 ## License

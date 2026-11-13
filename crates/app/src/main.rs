@@ -95,6 +95,9 @@ struct Respite {
     env_name: Option<String>,
     /// One per workspace root (history and cookies are per project).
     executors: HashMap<PathBuf, Arc<Executor>>,
+    /// The latest browser / device sign-in instruction, shown while a request waits for it.
+    auth_notice: Option<String>,
+    auth_tx: tokio::sync::mpsc::UnboundedSender<String>,
     docs: Vec<Doc>,
     current: Option<usize>,
     projects: Vec<Project>,
@@ -263,6 +266,7 @@ impl Respite {
                 }
             }),
         ];
+        let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut this = Self {
             settings,
             settings_window: None,
@@ -308,7 +312,18 @@ impl Respite {
             shown: None,
             shown_meta: None,
             body_json: false,
+            auth_notice: None,
+            auth_tx,
         };
+        // Sign-in instructions from the executors (on the request runtime) reach the UI here.
+        cx.spawn(async move |this, cx| {
+            while let Some(m) = auth_rx.recv().await {
+                if this.update(cx, |this, cx| (this.auth_notice, _) = (Some(m), cx.notify())).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // An explicit file wins; else the file (and cursor) last used in this project — or in any
         // project, on a plain launch (no folder given); else the first one.
         let base = Store::default_base();
@@ -437,7 +452,7 @@ impl Respite {
     }
 
     fn executor(&mut self, root: &Path) -> Arc<Executor> {
-        let (env, s) = (self.env_name.clone(), self.settings.settings.clone());
+        let (env, s, tx) = (self.env_name.clone(), self.settings.settings.clone(), self.auth_tx.clone());
         self.executors
             .entry(root.to_path_buf())
             .or_insert_with(|| {
@@ -449,6 +464,12 @@ impl Respite {
                 });
                 let exec = Executor::new(store, env.as_deref(), "gui");
                 exec.set_options(respite_cli::exec_options(&s));
+                exec.set_auth_ui(http_exec::AuthUi {
+                    notice: Arc::new(move |m| {
+                        let _ = tx.send(m);
+                    }),
+                    ..Default::default()
+                });
                 Arc::new(exec)
             })
             .clone()
@@ -806,6 +827,7 @@ impl Respite {
                 Err(e) => Status::Failed(e.to_string()),
             };
             this.update(cx, |this, cx| {
+                this.auth_notice = None;
                 // The block's line now: edits above may have moved it since the run started.
                 if let Some(d) = this.docs.iter_mut().find(|d| d.path == key)
                     && let Some(line) = d.tasks.iter().find(|(_, (t, _))| *t == id).map(|(l, _)| *l)

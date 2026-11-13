@@ -190,7 +190,8 @@ async fn oauth2() {
     Mock::given(path("/token")).and(body_string_contains("grant_type=refresh_token")).and(body_string_contains("refresh_token=R1"))
         .respond_with(token(serde_json::json!({"access_token": "A2", "expires_in": "3600"})))
         .expect(1).mount(&server).await;
-    Mock::given(path("/token")).and(header("authorization", "Basic YmFkOg=="))
+    // No secret: a public client, identified in the body.
+    Mock::given(path("/token")).and(body_string_contains("client_id=bad"))
         .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({"error": "invalid_client"})))
         .mount(&server).await;
     Mock::given(path("/me")).and(header("authorization", "Bearer A1")).and(header("x-id", "I1"))
@@ -237,6 +238,93 @@ async fn oauth2() {
     assert!(matches!(exec.run(&cx, 3).await, Err(Error::Auth { message, .. }) if message.contains("Acquire Automatically")));
     assert_eq!(exec.auth_token(&cx, "manual", false).await.unwrap().access_token, "M");
     assert!(matches!(exec.run(&cx, 4).await, Err(Error::Auth { id, .. }) if id == "mock"));
+}
+
+/// Authorization Code + PKCE and Device Authorization, with the "browser" played by `open_url`.
+#[tokio::test]
+async fn oauth2_browser_and_device() {
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    let base = server.uri();
+    let json = |v: serde_json::Value| ResponseTemplate::new(200).set_body_json(v);
+    Mock::given(path("/token"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .and(body_string_contains("code=C1"))
+        .and(body_string_contains("code_verifier="))
+        .and(body_string_contains("client_id=web"))
+        .respond_with(json(serde_json::json!({"access_token": "A3", "expires_in": 3600})))
+        .expect(1).mount(&server).await;
+    Mock::given(path("/device")).and(body_string_contains("client_id=tv"))
+        .respond_with(json(serde_json::json!({
+            "device_code": "D", "user_code": "U-1", "verification_uri": "https://v", "verification_uri_complete": "https://v?c=U-1",
+            "interval": 0, "expires_in": 60,
+        })))
+        .expect(1).mount(&server).await;
+    Mock::given(path("/token")).and(body_string_contains("device_code=D"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "authorization_pending"})))
+        .up_to_n_times(1).with_priority(1).expect(1).mount(&server).await;
+    Mock::given(path("/token")).and(body_string_contains("device_code=D"))
+        .respond_with(json(serde_json::json!({"access_token": "A4"}))).with_priority(2).expect(1).mount(&server).await;
+    Mock::given(path("/me")).and(header("authorization", "Bearer A3")).respond_with(ResponseTemplate::new(203)).mount(&server).await;
+    Mock::given(path("/me")).and(header("authorization", "Bearer A4")).respond_with(ResponseTemplate::new(204)).mount(&server).await;
+
+    let auth = |id: &str, cfg: serde_json::Value| (format!("$auth.{id}"), Variable { value: cfg.to_string(), source: "env".into(), secret: false });
+    let mut env = env(&base);
+    env.extend([
+        auth("web", serde_json::json!({
+            "Grant Type": "Authorization Code", "Auth URL": format!("{base}/authorize"), "Token URL": format!("{base}/token"),
+            "Client ID": "web", "PKCE": true, "Scope": "openid",
+            "Custom Request Parameters": {"prompt": {"Value": "login", "Use": "In Auth Request"}},
+        })),
+        auth("tv", serde_json::json!({
+            "Grant Type": "Device Authorization", "Device Auth URL": format!("{base}/device"), "Token URL": format!("{base}/token"),
+            "Client ID": "tv", "Open Complete URI": true,
+        })),
+        auth("remote", serde_json::json!({
+            "Grant Type": "Authorization Code", "Auth URL": format!("{base}/authorize"), "Token URL": format!("{base}/token"),
+            "Client ID": "web", "Redirect URL": "https://example.com/cb",
+        })),
+    ]);
+    let file = http_syntax::parse(
+        "GET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.token(\"web\")}}\n\
+         ###\nGET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.token(\"tv\")}}\n\
+         ###\nGET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.token(\"remote\")}}\n",
+    );
+    let (path, overrides) = (Path::new("/tmp/api.http"), HashMap::new());
+    let cx = Context { path, file: &file, env: &env, overrides: &overrides };
+
+    let (notices, opened) = (Arc::new(Mutex::new(vec![])), Arc::new(Mutex::new(vec![])));
+    let exec = Executor::default();
+    let (n, o) = (notices.clone(), opened.clone());
+    exec.set_auth_ui(http_exec::AuthUi {
+        notice: Arc::new(move |m| n.lock().unwrap().push(m)),
+        open_url: Arc::new(move |url| {
+            o.lock().unwrap().push(url.to_string());
+            let url = reqwest::Url::parse(url).unwrap();
+            let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
+            let Some(redirect) = q.get("redirect_uri").cloned() else { return };
+            let back = format!("{redirect}?code=C1&state={}", q["state"]);
+            // The browser: a stray request first, then the redirect with the code.
+            tokio::spawn(async move {
+                let _ = reqwest::get(format!("{redirect}/../favicon.ico")).await;
+                assert!(reqwest::get(back).await.unwrap().text().await.unwrap().contains("Signed in"));
+            });
+        }),
+    });
+
+    assert_eq!(exec.run(&cx, 0).await.unwrap().response.status, 203);
+    let authorize = opened.lock().unwrap()[0].clone();
+    for part in ["response_type=code", "client_id=web", "code_challenge_method=S256", "prompt=login", "redirect_uri=http%3A%2F%2F127.0.0.1%3A"] {
+        assert!(authorize.contains(part), "{part} in {authorize}");
+    }
+
+    assert_eq!(exec.run(&cx, 1).await.unwrap().response.status, 204);
+    assert_eq!(opened.lock().unwrap()[1], "https://v?c=U-1");
+    assert!(notices.lock().unwrap().iter().any(|m| m == "Enter code U-1 at https://v"));
+
+    let remote = exec.run(&cx, 2).await;
+    assert!(matches!(remote, Err(Error::Auth { message, .. }) if message.contains("loopback")));
 }
 
 #[tokio::test]

@@ -407,6 +407,11 @@ pub(crate) fn executor(root: &Path, env: Option<&str>) -> http_exec::Executor {
     let s = settings(root);
     let exec = http_exec::Executor::new(open_store(root, &s), env, "cli");
     exec.set_options(exec_options(&s));
+    // Browser and device sign-ins: stdout stays the result, the instructions go to stderr.
+    exec.set_auth_ui(http_exec::AuthUi {
+        notice: std::sync::Arc::new(|m| eprintln!("{} {m}", paint("auth:", YELLOW, true))),
+        ..Default::default()
+    });
     exec
 }
 

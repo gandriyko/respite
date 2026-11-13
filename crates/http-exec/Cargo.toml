@@ -11,6 +11,10 @@ reqwest = { version = "0.13", features = ["cookies", "gzip", "brotli", "deflate"
 serde_json = "1"
 serde_json_path = "0.7"
 regex = "1"
+# OAuth 2.0 browser and device sign-ins: PKCE, the redirect listener, polling.
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["net", "time", "io-util"] }
 base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 jiff = "0.2"

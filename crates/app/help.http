@@ -40,7 +40,10 @@ Authorization: Bearer {{token}}
 #     "Token URL": "https://demo.duendesoftware.com/connect/token",
 #     "Client ID": "m2m", "Client Secret": "{{clientSecret}}",
 #     "Scope": "api"}}}}
-# Grants: Client Credentials, Password; "Type": "Mock" for tests.
+# Grants: Client Credentials, Password,
+#   Authorization Code ("Auth URL", "PKCE": true; opens the browser),
+#   Device Authorization ("Device Auth URL"; shows the code to enter);
+#   "Type": "Mock" for tests.
 # The token is fetched once, cached, refreshed near expiry.
 # $auth.idToken("api") for the ID token.
 GET https://demo.duendesoftware.com/api/test
