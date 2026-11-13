@@ -534,6 +534,31 @@ fn history(last: usize, format: Format) -> Result<u8, CliError> {
 mod tests {
     use super::*;
 
+    /// The agent skill documents every command, long flag and directive; extend it when this fails.
+    #[test]
+    fn skill_covers_cli() {
+        use clap::CommandFactory as _;
+        let skill = include_str!("../../../skills/respite/SKILL.md");
+        fn walk(cmd: &clap::Command, path: &str, skill: &str, missing: &mut Vec<String>) {
+            for sub in cmd.get_subcommands().filter(|s| s.get_name() != "help") {
+                let path = format!("{path} {}", sub.get_name());
+                if !skill.contains(&path) {
+                    missing.push(path.clone());
+                }
+                let flags = sub.get_arguments().filter_map(|a| a.get_long()).filter(|l| *l != "help");
+                missing.extend(flags.filter(|l| !skill.contains(&format!("--{l}"))).map(|l| format!("{path} --{l}")));
+                walk(sub, &path, skill, missing);
+            }
+        }
+        let mut missing = vec![];
+        walk(&Cli::command(), "respite", skill, &mut missing);
+        missing.extend(http_syntax::DIRECTIVES.iter().filter(|d| !skill.contains(&format!("@{d}"))).map(|d| format!("@{d}")));
+        missing.extend(
+            http_syntax::ASSERT_BINARY.iter().chain(http_syntax::ASSERT_UNARY).filter(|o| !skill.contains(&format!("`{o}`"))).map(|o| format!("@assert {o}")),
+        );
+        assert!(missing.is_empty(), "skills/respite/SKILL.md misses: {missing:?}");
+    }
+
     #[test]
     fn request_addresses() {
         let dir = tempfile::tempdir().unwrap();

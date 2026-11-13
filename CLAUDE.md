@@ -1,5 +1,13 @@
 # Respite
 
+## Agent skill
+
+`skills/respite/SKILL.md` is the user-facing guide for AI agents. Whenever a change touches the
+CLI (command, flag, output, exit code), `.http` syntax (directive, body form, variable,
+`@assert` subject or operator) or environments, update the skill in the same change, then the
+README. `cargo test -p respite-cli skill_covers_cli` fails when a command, long flag, directive
+or assert operator is missing from it; semantics it can't check are on you.
+
 ## Dependencies
 
 Never modify third-party crates: no `[patch]` overrides, vendored copies or forks of

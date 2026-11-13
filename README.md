@@ -124,6 +124,42 @@ respite run api.http --fail-on-status --fail-fast    # use it as a smoke test in
 respite run api.http --jsonpath '$.items[*].id'      # print only the matching values
 ```
 
+## Tests
+
+Write checks above the request line. They are plain comments to VS Code REST Client and JetBrains, so the file still runs there; Respite runs them after every response.
+
+```http
+### Create a user
+# @name createUser
+# @assert status == 200
+# @assert header content-type contains json
+# @assert body $.json.name == {{name}}
+# @assert body json.id exists
+# @assert duration < 2 s
+POST https://httpbin.org/post
+Content-Type: application/json
+
+{"name": "{{name}}", "id": "{{$uuid}}"}
+```
+
+`# @assert <subject> <operator> [value]`, with httpyac's vocabulary:
+
+| | |
+|---|---|
+| **Subjects** | `status` · `header <name>` · `body` (the whole body as text) · `body <JSONPath>` (`$.a[0].b`; a bare `a.b` means `$.a.b`) · `duration` (total ms; the value may use `ms` / `s` / `m`) |
+| **Compare** | `==` `!=` `<` `<=` `>` `>=` (numbers as numbers, otherwise text) · `contains` `startsWith` `endsWith` · `matches` (regex) |
+| **No value** | `exists` · `isTrue` · `isFalse` · `isNumber` · `isString` · `isBoolean` · `isArray` |
+
+The value may hold `{{variables}}`. In the app, results show in the **Tests** tab, and a red dot marks the tab when one fails. `respite run` prints ✓ / ✗ for each check, lists them under `tests` in JSON output, and exits with `1` when any fails, which makes a `.http` file a CI smoke test:
+
+```sh
+respite run api.http --env staging --fail-fast
+```
+
+## AI agents
+
+[`skills/respite/SKILL.md`](skills/respite/SKILL.md) teaches a coding agent (Claude Code, Codex and others that read Agent Skills) to send requests and test an API through the CLI. Copy the folder into the agent's skills directory, for example `~/.claude/skills/respite`.
+
 ## Environments
 
 One flat file per environment, found in every folder from the workspace root down to the `.http` file (deeper folders win). `respite.json` holds values shared by all environments. Keep secrets in `.private` files and git-ignore them:
