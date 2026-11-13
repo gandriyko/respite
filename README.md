@@ -31,11 +31,11 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 
 | | |
 |---|---|
-| **Editor** | `.http` syntax highlighting (JSON, XML, GraphQL and JS bodies), completion, diagnostics with quick fixes, rename, live templates, folding |
+| **Editor** | `.http` syntax highlighting (JSON, XML, GraphQL and JS bodies), completion, diagnostics with quick fixes, rename, live templates, folding; a syntax reference with runnable examples (<kbd>F1</kbd>) |
 | **Response** | Body, headers, cookies, the request as sent, timeline (redirects, time to first byte, download); multi-MB bodies, images, JSONPath filter, run history ‹ › with diff, pin |
 | **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
-| **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, …) |
-| **History** | Every run is stored per project and can be browsed, filtered and reopened |
+| **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings |
+| **History** | Every run is stored per project: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
 | **Workspace** | Collections in `~/.config/respite` plus any project folders, light and dark themes, settings, state restored on launch |
 
@@ -95,6 +95,7 @@ Run `respite` with no arguments to open your collections in `~/.config/respite`.
 | <kbd>⌘</kbd> <kbd>Y</kbd> | History |
 | <kbd>⌘</kbd> <kbd>B</kbd> | Toggle sidebar |
 | <kbd>⌘</kbd> <kbd>,</kbd> | Settings |
+| <kbd>F1</kbd> | Syntax reference |
 | <kbd>⌘</kbd> <kbd>S</kbd> / <kbd>⌘</kbd> <kbd>W</kbd> | Save / close tab |
 
 ## CLI
