@@ -100,6 +100,11 @@ pub struct Request {
     pub max_redirects: usize,
     /// Skip TLS certificate checks for all requests (self-signed, expired, wrong host).
     pub insecure: bool,
+    /// `http://[user:pass@]host:port` for every request; empty = the system proxy
+    /// (macOS settings, `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`).
+    pub proxy: String,
+    /// Hosts that skip `proxy`: `localhost`, `.internal` (and subdomains), `10.0.0.0/8`.
+    pub no_proxy: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,7 +177,7 @@ impl Default for Editor {
 
 impl Default for Request {
     fn default() -> Self {
-        Self { timeout_ms: 0, follow_redirects: true, max_redirects: 10, insecure: false }
+        Self { timeout_ms: 0, follow_redirects: true, max_redirects: 10, insecure: false, proxy: String::new(), no_proxy: vec![] }
     }
 }
 

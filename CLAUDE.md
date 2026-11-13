@@ -1,5 +1,12 @@
 # Respite
 
+## JSON key naming
+
+- `settings.json` (Respite's own format, modelled on Zed): snake_case — `timeout_ms`, `no_proxy`.
+- Env files: keys from another client's format keep that client's spelling for compatibility —
+  JetBrains `Security.Auth` (`"Grant Type"`), `SSLConfiguration` (`clientCertificate`). Our own
+  additions inside such an object follow its neighbours' style (`caCertificate`).
+
 ## Agent skill
 
 `skills/respite/SKILL.md` is the user-facing guide for AI agents. Whenever a change touches the

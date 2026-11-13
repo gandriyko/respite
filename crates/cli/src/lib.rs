@@ -399,6 +399,8 @@ pub fn exec_options(s: &Settings) -> http_exec::Options {
         follow_redirects: s.request.follow_redirects,
         max_redirects: s.request.max_redirects,
         insecure: s.request.insecure,
+        proxy: Some(s.request.proxy.trim().to_string()).filter(|p| !p.is_empty()),
+        no_proxy: s.request.no_proxy.clone(),
     }
 }
 

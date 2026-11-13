@@ -188,6 +188,34 @@ Authorization: Bearer {{$auth.token("api")}}
   history.
 - `check` reports `unknown_auth` for an id that no env file defines.
 
+### Client certificates, CAs, proxy
+
+Client certificates (mTLS) use JetBrains' `SSLConfiguration` in an env file, usually the
+private one. It applies to every request of that environment, token requests included:
+
+```jsonc
+// respite-dev.private.json
+{ "SSLConfiguration": {
+  "clientCertificate": "certs/client.pem",       // or {"path": "certs/client.der", "format": "DER"}
+  "clientCertificateKey": "certs/client.key",
+  "caCertificate": "certs/dev-ca.pem",           // Respite's addition: extra trusted CA(s), a path or a list
+  "verifyHostCertificate": false                 // skip certificate checks, like @insecure
+}}
+```
+
+- Paths are relative to the env file that names them.
+- Formats: PEM, or DER (`.der` / `.cer`, or `"format"`). The certificate file may also hold the key.
+- P12/PFX, encrypted keys and `hasCertificatePassphrase` are not supported. The error gives the
+  `openssl` command that converts or decrypts them.
+- Fields merge across env files the same way as `Security.Auth`.
+- The system trust store is always used; `caCertificate` adds to it.
+- macOS rejects server certificates valid for more than 398 days, even when the CA is trusted.
+  For a long-lived dev certificate, use `verifyHostCertificate: false`.
+- Proxy: the system one by default (macOS settings, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`). To
+  override it, set `request.proxy` (`http://user:pass@host:port`) and `request.no_proxy`
+  (`["localhost", ".internal"]`) in settings.json (Settings → Requests). It applies to every
+  request.
+
 ### Bodies and output
 
 - JSON / XML / text: written as is after the blank line.

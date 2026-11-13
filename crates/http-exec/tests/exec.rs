@@ -327,6 +327,27 @@ async fn oauth2_browser_and_device() {
     assert!(matches!(remote, Err(Error::Auth { message, .. }) if message.contains("loopback")));
 }
 
+/// `Options::proxy`: a plain-HTTP request to an unresolvable host goes through it; `no_proxy`
+/// sends it direct (and it fails).
+#[tokio::test]
+async fn proxy_and_no_proxy() {
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/via")).and(header("host", "respite.invalid"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("proxied")).expect(1).mount(&proxy).await;
+    let file = http_syntax::parse("GET http://respite.invalid/via\n");
+    let (env, overrides) = (HashMap::new(), HashMap::new());
+    let cx = Context { path: Path::new("/tmp/api.http"), file: &file, env: &env, overrides: &overrides };
+    let exec = Executor::default();
+    exec.set_options(http_exec::Options { proxy: Some(proxy.uri()), ..Default::default() });
+    let ex = exec.run(&cx, 0).await.unwrap();
+    assert_eq!(ex.response.body, b"proxied");
+
+    exec.set_options(http_exec::Options { proxy: Some(proxy.uri()), no_proxy: vec!["respite.invalid".into()], ..Default::default() });
+    assert!(matches!(exec.run(&cx, 0).await, Err(Error::Http(_))));
+    exec.set_options(http_exec::Options { proxy: Some("not a url".into()), ..Default::default() });
+    assert!(matches!(exec.run(&cx, 0).await, Err(Error::BadRequest(m)) if m.contains("invalid proxy")));
+}
+
 #[tokio::test]
 async fn errors() {
     let cycle = "# @name a\nGET http://x/{{b.response.body.*}}\n###\n# @name b\nGET http://x/{{a.response.body.*}}\n";

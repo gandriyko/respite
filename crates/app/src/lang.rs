@@ -362,6 +362,8 @@ impl Lang {
                     Some(id) => cands.extend(["token", "idToken"].map(|f| {
                         (format!("$auth.{f}(\"{id}\")"), format!("OAuth 2.0, {}", file_name(&v.source)), CompletionItemKind::FUNCTION)
                     })),
+                    // `$ssl` and the like: config carried as variables, not usable as `{{…}}`.
+                    None if k.starts_with('$') => {}
                     None => cands.push((k.clone(), file_name(&v.source), CompletionItemKind::VARIABLE)),
                 }
             }

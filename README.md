@@ -34,7 +34,7 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 | **Editor** | `.http` syntax highlighting (JSON, XML, GraphQL and JS bodies), completion, diagnostics with quick fixes, rename, live templates, folding; a syntax reference with runnable examples (<kbd>F1</kbd>) |
 | **Response** | Body, headers, cookies, the request as sent, timeline (redirects, time to first byte, download); multi-MB bodies, images, JSONPath filter, run history ‹ › with diff, pin |
 | **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
-| **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings |
+| **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings; client certificates, extra CAs and a proxy |
 | **Tests** | `# @assert status == 201`, `# @assert body $.id exists`, `# @assert duration < 500ms`: httpyac's operators, written as comments so the file still runs in VS Code and JetBrains; results in the Tests tab, `respite run` exits 1 on a failure |
 | **History** | Every run is stored per project: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
@@ -169,6 +169,27 @@ To try it, use the public Duende demo server. Its token endpoint is `https://dem
 - `m2m` with secret `secret` and scope `api`, for Client Credentials;
 - `interactive.public` with `"PKCE": true`, for the browser. Set `Auth URL` to `https://demo.duendesoftware.com/connect/authorize` and sign in as bob / bob;
 - `device`, for the device flow. Set `Device Auth URL` to `https://demo.duendesoftware.com/connect/deviceauthorization`.
+
+## Certificates and proxy
+
+Client certificates (mTLS) are set up the JetBrains way, in an env file. The private one is the right place, since it is git-ignored:
+
+```jsonc
+// respite-dev.private.json
+{
+  "SSLConfiguration": {
+    "clientCertificate": "certs/client.pem",
+    "clientCertificateKey": "certs/client.key",
+    "caCertificate": "certs/dev-ca.pem",
+    "verifyHostCertificate": true
+  }
+}
+```
+
+- **Files.** Paths are relative to the env file. The certificate and key can be PEM or DER. Write `{"path": …, "format": "DER"}` when the extension doesn't tell. P12/PFX files and keys with a passphrase are not supported yet; the error shows the `openssl` command that converts them to PEM.
+- **CAs.** `caCertificate` is Respite's addition: one CA file or a list, trusted on top of the system store. `"verifyHostCertificate": false` turns certificate checks off for the whole environment.
+- **Scope.** The setup applies to every request in the environment, OAuth 2.0 token requests included.
+- **Proxy.** By default the system proxy is used: macOS settings, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`. To override it, use **Settings → Requests**, or `request.proxy` (`http://user:pass@proxy:3128`) and `request.no_proxy` (`["localhost", ".internal"]`) in settings.json.
 
 ## Tests
 

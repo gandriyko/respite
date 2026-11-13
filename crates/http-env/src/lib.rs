@@ -127,10 +127,13 @@ impl Environments {
     /// `Security.Auth.<id>` (JetBrains HTTP Client's OAuth 2.0 config) is merged field by field
     /// across files, so a private file can add just `"Client Secret"`. Each config comes back as
     /// `$auth.<id>` holding its JSON — a name no `{{variable}}` can reach (`{{$…}}` is dynamic).
-    // ponytail: SSLConfiguration deep merge comes with mTLS.
+    ///
+    /// `SSLConfiguration` (JetBrains' client certificate block, plus our `caCertificate`) is merged
+    /// the same way into `$ssl`, its file paths made absolute against the env file that names them.
     pub fn variables(&self, env: Option<&str>) -> HashMap<String, Variable> {
         let mut out = HashMap::new();
         let mut auth: BTreeMap<String, (Map<String, Value>, Variable)> = BTreeMap::new();
+        let mut ssl: Option<(Map<String, Value>, Variable)> = None;
         for key in std::iter::once("$shared").chain(env) {
             for f in &self.files {
                 let Some(Value::Object(block)) = f.json.get(key) else { continue };
@@ -147,6 +150,19 @@ impl Environments {
                             }
                             continue;
                         }
+                        Value::Object(o) if k == "SSLConfiguration" => {
+                            let dir = f.path.parent().unwrap_or(Path::new("."));
+                            let e = ssl.get_or_insert_with(|| (Map::new(), Variable { value: String::new(), source: f.path.clone(), secret: false }));
+                            for (field, v) in o {
+                                let v = match field.as_str() {
+                                    "clientCertificate" | "clientCertificateKey" | "caCertificate" => absolute_paths(v, dir),
+                                    _ => v.clone(),
+                                };
+                                e.0.insert(field.clone(), v);
+                            }
+                            e.1.source = f.path.clone();
+                            continue;
+                        }
                         Value::Object(_) | Value::Array(_) => continue,
                         other => other.to_string(),
                     };
@@ -156,6 +172,9 @@ impl Environments {
         }
         for (id, (cfg, var)) in auth {
             out.insert(format!("$auth.{id}"), Variable { value: Value::Object(cfg).to_string(), ..var });
+        }
+        if let Some((cfg, var)) = ssl {
+            out.insert("$ssl".into(), Variable { value: Value::Object(cfg).to_string(), ..var });
         }
         out
     }
@@ -348,6 +367,22 @@ impl Resolver<'_> {
     }
 }
 
+/// A path (`"a.pem"`), `{"path": …, "format": …}`, or a list of either, made absolute against `dir`.
+fn absolute_paths(v: &Value, dir: &Path) -> Value {
+    match v {
+        Value::String(p) => Value::String(dir.join(p).to_string_lossy().into_owned()),
+        Value::Object(o) => {
+            let mut o = o.clone();
+            if let Some(p) = o.get("path").cloned() {
+                o.insert("path".into(), absolute_paths(&p, dir));
+            }
+            Value::Object(o)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|x| absolute_paths(x, dir)).collect()),
+        other => other.clone(),
+    }
+}
+
 /// `token("api")` → `("token", "api")`; also `idToken`, single quotes.
 pub fn auth_call(call: &str) -> Option<(&'static str, &str)> {
     let (kind, rest) = call.split_once('(')?;
@@ -374,6 +409,20 @@ mod tests {
         let cfg: Value = serde_json::from_str(&v["$auth.api"].value).unwrap();
         assert_eq!((cfg["Client ID"].as_str(), cfg["Client Secret"].as_str(), v["$auth.api"].secret), (Some("c"), Some("s3"), true));
         assert!(!v.contains_key("Security"));
+
+        // SSLConfiguration: merged field by field, paths absolute against their own file.
+        fs::create_dir_all(r.join("api")).unwrap();
+        fs::write(r.join("respite.json"), r#"{"SSLConfiguration": {"caCertificate": "certs/ca.pem", "verifyHostCertificate": true}}"#).unwrap();
+        fs::write(
+            r.join("api/respite-dev.private.json"),
+            r#"{"SSLConfiguration": {"clientCertificate": {"path": "c.der", "format": "DER"}, "clientCertificateKey": "/abs/k.pem"}}"#,
+        )
+        .unwrap();
+        let v = Environments::load(&r.join("api/a.http"), r, &[]).variables(Some("dev"));
+        let ssl: Value = serde_json::from_str(&v["$ssl"].value).unwrap();
+        assert_eq!(ssl["caCertificate"], Value::String(r.join("certs/ca.pem").to_string_lossy().into()));
+        assert_eq!(ssl["clientCertificate"]["path"], Value::String(r.join("api/c.der").to_string_lossy().into()));
+        assert_eq!((ssl["clientCertificateKey"].as_str(), ssl["verifyHostCertificate"].as_bool()), (Some("/abs/k.pem"), Some(true)));
 
         assert_eq!(auth_call(r#"token("api")"#), Some(("token", "api")));
         assert_eq!(auth_call("idToken('a b')"), Some(("idToken", "a b")));

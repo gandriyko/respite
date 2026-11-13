@@ -6,6 +6,7 @@
 
 mod oauth;
 mod store;
+mod tls;
 
 pub use oauth::{AuthUi, Token, open_in_browser};
 pub use store::{Entry, Store};
@@ -107,7 +108,16 @@ impl fmt::Display for Error {
         match self {
             Self::Resolve(e) => e.fmt(f),
             Self::File(p, e) => write!(f, "{}: {e}", p.display()),
-            Self::Http(e) => write!(f, "{e}"),
+            // reqwest's top line hides the cause ("error sending request"): add the chain.
+            Self::Http(e) => {
+                write!(f, "{e}")?;
+                let mut src = std::error::Error::source(e);
+                while let Some(c) = src {
+                    write!(f, ": {c}")?;
+                    src = c.source();
+                }
+                Ok(())
+            }
             Self::BadRequest(m) => f.write_str(m),
             Self::DependencyCycle(n) => write!(f, "request dependency cycle through '{n}'"),
             Self::Auth { id, message } => write!(f, "auth '{id}': {message}"),
@@ -141,12 +151,34 @@ pub struct Options {
     pub max_redirects: usize,
     /// Skip TLS certificate checks for every request, as if each had `# @insecure`.
     pub insecure: bool,
+    /// Proxy URL for every request; `None`: the system proxy (macOS settings, `HTTPS_PROXY`…).
+    pub proxy: Option<String>,
+    /// Hosts that bypass `proxy` (`NO_PROXY` syntax: `localhost`, `.internal`, `10.0.0.0/8`).
+    pub no_proxy: Vec<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { timeout: None, follow_redirects: true, max_redirects: 10, insecure: false }
+        Self { timeout: None, follow_redirects: true, max_redirects: 10, insecure: false, proxy: None, no_proxy: vec![] }
     }
+}
+
+/// What every client of a run shares — the request's and the token endpoint's: proxy, client
+/// certificate, extra CAs, certificate checks.
+fn client_builder(options: &Options, tls: &tls::Tls, insecure: bool) -> Result<reqwest::ClientBuilder, Error> {
+    let mut b = reqwest::Client::builder().danger_accept_invalid_certs(insecure || options.insecure || !tls.verify);
+    if let Some(id) = &tls.identity {
+        b = b.identity(id.clone());
+    }
+    for ca in &tls.roots {
+        b = b.add_root_certificate(ca.clone());
+    }
+    // An explicit proxy replaces the system one (reqwest drops it once one is added).
+    if let Some(url) = &options.proxy {
+        let proxy = reqwest::Proxy::all(url).map_err(|e| Error::BadRequest(format!("invalid proxy '{url}': {e}")))?;
+        b = b.proxy(proxy.no_proxy(reqwest::NoProxy::from_string(&options.no_proxy.join(","))));
+    }
+    Ok(b)
 }
 
 /// Long-lived: owns the cookie jar and the named-response cache. Share via `Arc`.
@@ -176,6 +208,7 @@ struct Prepared {
     output: Option<(PathBuf, bool)>,
     /// `# @assert` lines with `{{vars}}` in the expected value resolved.
     asserts: Vec<(usize, String, Result<Assert, String>)>,
+    tls: tls::Tls,
 }
 
 impl Executor {
@@ -304,7 +337,7 @@ impl Executor {
             stack.pop();
 
             let options = self.options.read().unwrap().clone();
-            let response = send(req, &prepared.sent, self.cookies.clone(), &options).await?;
+            let response = send(req, &prepared.sent, self.cookies.clone(), &options, &prepared.tls).await?;
             if let Some((path, overwrite)) = &prepared.output {
                 write_output(path, *overwrite, &response.body)?;
             }
@@ -334,8 +367,7 @@ impl Executor {
             return Ok(t.clone());
         }
         let options = self.options.read().unwrap().clone();
-        let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(options.insecure);
-        builder = builder.timeout(options.timeout.unwrap_or(Duration::from_secs(30)));
+        let builder = client_builder(&options, &tls::load(cx.env)?, false)?.timeout(options.timeout.unwrap_or(Duration::from_secs(30)));
         let ui = self.auth_ui.read().unwrap().clone();
         let token = oauth::acquire(&builder.build()?, &cfg, previous.as_ref().filter(|_| !force), &ui).await.map_err(|e| match e {
             oauth::Error::Http(h) => Error::Http(h),
@@ -502,7 +534,7 @@ impl Executor {
             };
             asserts.push((line, text.to_string(), a));
         }
-        Ok(Prepared { sent: SentRequest { method, url, headers, body }, output, asserts })
+        Ok(Prepared { sent: SentRequest { method, url, headers, body }, output, asserts, tls: tls::load(cx.env)? })
     }
 }
 
@@ -676,6 +708,7 @@ async fn send(
     sent: &SentRequest,
     cookies: Arc<reqwest_cookie_store::CookieStoreMutex>,
     options: &Options,
+    tls: &tls::Tls,
 ) -> Result<Response, Error> {
     let has = |d: &str| req.directive(d).is_some();
     // Each followed hop is recorded for the Timeline.
@@ -699,9 +732,7 @@ async fn send(
     };
     // ponytail: a client per run (redirect/TLS/connect-timeout are client-level in reqwest),
     // so no connection reuse between runs; cache clients by settings if latency matters.
-    let mut builder = reqwest::Client::builder()
-        .redirect(redirect)
-        .danger_accept_invalid_certs(options.insecure || has("insecure"));
+    let mut builder = client_builder(options, tls, has("insecure"))?.redirect(redirect);
     if !has("no-cookie-jar") {
         builder = builder.cookie_provider(cookies);
     }

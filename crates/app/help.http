@@ -91,6 +91,17 @@ GET {{baseUrl}}/redirect/1
 # @insecure
 GET https://self-signed.badssl.com/
 
+### Client certificate (mTLS)
+# In respite-<env>.private.json, for every request of that env:
+#   {"SSLConfiguration": {
+#     "clientCertificate": "certs/client.pem",
+#     "clientCertificateKey": "certs/client.key",
+#     "caCertificate": "certs/dev-ca.pem",
+#     "verifyHostCertificate": true}}
+# PEM or DER; paths relative to the env file.
+# Proxy: the system one, or Settings → Requests.
+GET https://client.badssl.com/
+
 ### Ask for a value
 # @prompt otp One-time code
 POST {{baseUrl}}/post

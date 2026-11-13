@@ -57,6 +57,9 @@ pub(crate) struct SettingsWindow {
     focus: FocusHandle,
     font_input: Entity<InputState>,
     timeout_input: Entity<InputState>,
+    proxy_input: Entity<InputState>,
+    /// `request.no_proxy`, comma-separated.
+    no_proxy_input: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
@@ -65,6 +68,8 @@ impl SettingsWindow {
         let s = app.upgrade().map(|a| a.read(cx).settings.settings.clone()).unwrap_or_default();
         let font_input = cx.new(|cx| InputState::new(window, cx).placeholder("Default monospace font").default_value(s.font_family.clone()));
         let timeout_input = cx.new(|cx| InputState::new(window, cx).placeholder("0 = no limit").default_value(s.request.timeout_ms.to_string()));
+        let proxy_input = cx.new(|cx| InputState::new(window, cx).placeholder("System proxy").default_value(s.request.proxy.clone()));
+        let no_proxy_input = cx.new(|cx| InputState::new(window, cx).placeholder("localhost, .internal").default_value(s.request.no_proxy.join(", ")));
         // Only real edits are written: syncing an input from the file must not write it back
         // (a project override would land in the global file).
         let mut _subs = vec![
@@ -82,12 +87,30 @@ impl SettingsWindow {
                     this.set("request.timeout_ms", ms.into(), cx);
                 }
             }),
+            cx.subscribe(&proxy_input, |this, input, ev: &InputEvent, cx| {
+                let v = input.read(cx).value().trim().to_string();
+                if matches!(ev, InputEvent::Change) && Some(&v) != this.current(cx).map(|s| s.request.proxy).as_ref() {
+                    this.set("request.proxy", v.into(), cx);
+                }
+            }),
+            cx.subscribe(&no_proxy_input, |this, input, ev: &InputEvent, cx| {
+                let v = hosts(&input.read(cx).value());
+                if matches!(ev, InputEvent::Change) && Some(&v) != this.current(cx).map(|s| s.request.no_proxy).as_ref() {
+                    this.set("request.no_proxy", v.into(), cx);
+                }
+            }),
         ];
         // Settings changed elsewhere (the file on disk): refresh the text inputs not being edited.
         if let Some(entity) = app.upgrade() {
             _subs.push(cx.observe_in(&entity, window, |this, app, window, cx| {
                 let s = app.read(cx).settings.settings.clone();
-                for (input, value) in [(&this.font_input, s.font_family), (&this.timeout_input, s.request.timeout_ms.to_string())] {
+                let inputs = [
+                    (&this.font_input, s.font_family),
+                    (&this.timeout_input, s.request.timeout_ms.to_string()),
+                    (&this.proxy_input, s.request.proxy),
+                    (&this.no_proxy_input, s.request.no_proxy.join(", ")),
+                ];
+                for (input, value) in inputs {
                     if !input.focus_handle(cx).is_focused(window) && input.read(cx).value() != value {
                         input.update(cx, |i, cx| i.set_value(value, window, cx));
                     }
@@ -97,7 +120,7 @@ impl SettingsWindow {
         }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        Self { app, main, focus, font_input, timeout_input, _subs }
+        Self { app, main, focus, font_input, timeout_input, proxy_input, no_proxy_input, _subs }
     }
 
     fn current(&self, cx: &App) -> Option<respite_settings::Settings> {
@@ -224,6 +247,11 @@ impl Render for SettingsWindow {
             .child(Self::row(&l, "Follow redirects", "request.follow_redirects", switch("request.follow_redirects", s.request.follow_redirects, cx), cx))
             .child(Self::row(&l, "Max redirects", "request.max_redirects", Self::stepper("request.max_redirects", s.request.max_redirects as f64, 1., 0., 50., cx), cx))
             .child(Self::row(&l, "Skip TLS certificate verification", "request.insecure", switch("request.insecure", s.request.insecure, cx), cx))
+            .child(Self::row(&l, "Proxy", "request.proxy", Input::new(&self.proxy_input).w(px(260.)).into_any_element(), cx))
+            .child(Self::row(&l, "No proxy for", "request.no_proxy", Input::new(&self.no_proxy_input).w(px(260.)).into_any_element(), cx))
+            .child(div().text_xs().text_color(muted).child(
+                "Empty proxy: the system one (macOS settings, HTTPS_PROXY). Client certificates: SSLConfiguration in an env file.",
+            ))
             .child(section("History"))
             .child(Self::row(&l, "Entries per request", "history.per_request", Self::stepper("history.per_request", s.history.per_request as f64, 10., 0., 1000., cx), cx))
             .child(Self::row(&l, "Entries in total", "history.total", Self::stepper("history.total", s.history.total as f64, 100., 0., 10000., cx), cx))
@@ -252,4 +280,9 @@ impl Render for SettingsWindow {
             .child(body)
             .into_any_element()
     }
+}
+
+/// `"localhost, .internal,,"` → `["localhost", ".internal"]`.
+fn hosts(s: &str) -> Vec<String> {
+    s.split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect()
 }
