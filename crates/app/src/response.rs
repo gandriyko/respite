@@ -674,7 +674,14 @@ impl Respite {
                 this.tab = *ix;
                 cx.notify();
             })),
-            |bar, t| bar.child(Tab::new().label(*t)),
+            |bar, name| {
+                let tab = Tab::new().label(*name);
+                // Failed `# @assert`: a dot sized from the UI font, ringed so the hover fill doesn't swallow it.
+                bar.child(match *name == "Tests" && ex.tests.iter().any(|r| !r.passed) {
+                    true => tab.suffix(div().size(t.font_size * 0.75).rounded_full().bg(t.danger).border_2().border_color(t.background).mr(t.font_size * 0.4)),
+                    false => tab,
+                })
+            },
         );
 
         let content = match (&self.body_other, body_tab) {

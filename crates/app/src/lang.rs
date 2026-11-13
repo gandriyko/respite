@@ -351,6 +351,29 @@ impl Lang {
         let trimmed = before.trim_start();
         // `# @…` / `// @…`: directives.
         if let Some(word) = trimmed.strip_prefix('#').or_else(|| trimmed.strip_prefix("//")).and_then(|r| r.trim_start().strip_prefix('@')) {
+            // `@assert <subject> <operator> …`: subjects, then operators.
+            if let Some(args) = word.strip_prefix("assert").filter(|a| a.starts_with(char::is_whitespace)) {
+                let words: Vec<&str> = args.split_whitespace().collect();
+                let (done, cur) = match args.ends_with(char::is_whitespace) {
+                    true => (&words[..], ""),
+                    false => (&words[..words.len() - 1], words[words.len() - 1]),
+                };
+                let is_op = |w: &str| http_syntax::ASSERT_BINARY.contains(&w) || http_syntax::ASSERT_UNARY.contains(&w);
+                let ops = || http_syntax::ASSERT_BINARY.iter().chain(http_syntax::ASSERT_UNARY).copied().collect();
+                let cands: Vec<&str> = match done {
+                    d if d.iter().any(|w| is_op(w)) => vec![],
+                    [] => vec!["status", "header", "body", "duration"],
+                    ["header"] => vec!["content-type", "content-length", "location", "cache-control"],
+                    ["body"] => [vec!["$."], ops()].concat(),
+                    ["status" | "duration"] | ["header" | "body", _] => ops(),
+                    _ => vec![],
+                };
+                return cands
+                    .into_iter()
+                    .filter(|c| matches(c, cur))
+                    .map(|c| edit(cur, c, c.to_string(), CompletionItemKind::KEYWORD, None))
+                    .collect();
+            }
             return http_syntax::DIRECTIVES
                 .iter()
                 .filter(|d| matches(d, word))
@@ -479,6 +502,17 @@ mod tests {
     fn labels(l: &Lang, src: &str) -> Vec<String> {
         let text = Rope::from(src);
         l.completions_at(&text, src.len()).into_iter().map(|i| i.label).collect()
+    }
+
+    #[test]
+    fn assert_completion() {
+        let l = lang();
+        assert_eq!(labels(&l, "# @assert "), ["status", "header", "body", "duration"]);
+        assert_eq!(labels(&l, "# @assert st"), ["status"]);
+        assert_eq!(labels(&l, "# @assert header content-type con"), ["contains"]);
+        assert_eq!(labels(&l, "# @assert body i")[..3], ["includes", "isTrue", "isFalse"]);
+        assert!(labels(&l, "# @assert status == ").is_empty());
+        assert!(labels(&l, "# @ass").contains(&"assert".to_string()));
     }
 
     #[test]
