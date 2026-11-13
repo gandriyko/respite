@@ -21,6 +21,8 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features =
 # tree-sitter: JSON highlighting in the response panel; -html also covers XML-ish bodies
 gpui-component = { version = "=0.9.1", features = ["tree-sitter", "tree-sitter-html"] }
 gpui-kit-assets = "=0.9.1"
+# gpui-component's own base; named only for `ResizeHandleContext` (invisible panel dividers).
+gpui-base = "=0.9.1"
 # Same version and features as gpui-component's, so the editor's provider types match.
 lsp-types = { version = "0.97", features = ["proposed"] }
 anyhow = "1"

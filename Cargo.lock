@@ -5850,6 +5850,7 @@ name = "respite"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

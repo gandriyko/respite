@@ -35,7 +35,6 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     menu::{DropdownMenu as _, PopupMenuItem},
     resizable_panel,
-    tab::{Tab, TabBar},
 };
 use http_env::Environments;
 use http_exec::{Exchange, Executor, Store};
@@ -1094,44 +1093,72 @@ impl Respite {
             .into_any_element()
     }
 
-    fn tabs(&self, cx: &mut Context<Self>) -> TabBar {
-        let (muted, fg, hover_bg) = (cx.theme().muted_foreground, cx.theme().foreground, cx.theme().list_active);
-        // Sized from the interface font, so the close button keeps up with the tab label.
-        let fs = cx.theme().font_size;
-        self.docs.iter().enumerate().fold(
-            TabBar::new("docs")
-                .selected_index(self.current.unwrap_or(0))
-                .on_click(cx.listener(|this, ix: &usize, window, cx| this.select(*ix, window, cx)))
-                .suffix(div().px_2().flex().items_center().h_full().child(self.env_picker(cx))),
-            |bar, (i, d)| {
-                // An icon, not a `×` glyph: the glyph sits small and low next to the label.
-                let close = div()
-                    .id(("close", i))
-                    .size(fs * 1.5)
-                    // Cancels the tab label's own 12 px right padding; the tab's 4 px gap stays.
-                    .ml(px(-12.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .text_color(muted)
-                    .hover(move |s| s.text_color(fg).bg(hover_bg))
-                    .map(|el| match d.dirty {
-                        true => el.child(div().size(fs * 0.5).rounded_full().bg(muted)),
-                        false => el.child(Icon::new(IconName::Close).size(fs)),
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.close(i, window, cx);
-                    }));
-                bar.child(Tab::new().label(d.name()).suffix(close))
-            },
-        )
+    /// Open files as rounded buttons on the window background; the current one is raised with a
+    /// fill and a hairline border. The close button shows on the current or hovered tab, the
+    /// unsaved dot always.
+    fn tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.theme();
+        let (muted, fg, hover_bg, raised, border) = (t.muted_foreground, t.foreground, t.list_hover, t.secondary, t.border);
+        // Sized from the interface font, so the tabs keep up with the label.
+        let fs = t.font_size;
+        let tabs = self.docs.iter().enumerate().map(|(i, d)| {
+            let current = self.current == Some(i);
+            let group: SharedString = format!("doc-tab-{i}").into();
+            // An icon, not a `×` glyph: the glyph sits small and low next to the label.
+            let close = div()
+                .id(("close", i))
+                .size(fs * 1.4)
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .text_color(muted)
+                .hover(move |s| s.text_color(fg).bg(hover_bg))
+                .map(|el| match d.dirty {
+                    true => el.child(div().size(fs * 0.5).rounded_full().bg(muted)),
+                    false => el.child(Icon::new(IconName::Close).size(fs)),
+                })
+                .when(!current && !d.dirty, |el| el.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.close(i, window, cx);
+                }));
+            div()
+                .id(("doc-tab", i))
+                .group(group)
+                .flex_none()
+                .h(fs * 2.3)
+                .pl_3()
+                .pr_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .rounded_lg()
+                .border_1()
+                .map(|el| match current {
+                    true => el.bg(raised).border_color(border).text_color(fg),
+                    false => el.border_color(gpui::transparent_black()).text_color(muted).hover(move |s| s.bg(hover_bg).text_color(fg)),
+                })
+                .on_click(cx.listener(move |this, _, window, cx| this.select(i, window, cx)))
+                .child(d.name())
+                .child(close)
+        });
+        // ponytail: no scroll-into-view for the current tab; add when many open files hide it.
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .pb_1()
+            .child(div().id("docs").flex_1().min_w_0().flex().gap_1().overflow_x_scroll().children(tabs))
+            .child(self.env_picker(cx))
+            .into_any_element()
     }
 
-    fn center(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn center(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         if self.show_history {
-            return self.history_page(cx);
+            return card(false, cx).child(self.history_page(cx)).into_any_element();
         }
         let body = match self.doc() {
             Some(d) => div().flex_1().min_h_0().relative().child(Editor::new(&d.editor).size_full()).child(d.block_tint()),
@@ -1145,9 +1172,33 @@ impl Respite {
         };
         let tabs = (!self.docs.is_empty()).then(|| self.tabs(cx));
         let crumbs = self.breadcrumbs(cx);
-        div().size_full().flex().flex_col().children(tabs).children(crumbs).child(body).into_any_element()
+        let card = card(focused, cx).children(crumbs).child(body);
+        div().size_full().flex().flex_col().children(tabs).child(card).into_any_element()
     }
 
+}
+
+/// A panel on the window background: rounded, hairline border, ring colour while it has focus.
+fn card(focused: bool, cx: &App) -> Div {
+    let t = cx.theme();
+    div()
+        .flex_1()
+        .min_h_0()
+        .size_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .rounded_lg()
+        .border_1()
+        .border_color(if focused { t.ring } else { t.border })
+        .bg(t.background)
+}
+
+/// Panel groups without a painted divider: the gap between cards is the drag area.
+fn invisible_dividers(group: gpui_component::resizable::ResizablePanelGroup) -> gpui_component::resizable::ResizablePanelGroup {
+    group.with_handle_appearance(std::rc::Rc::new(|_: &gpui_base::ResizeHandleContext, _: &mut Window, _: &mut App| {
+        Some(div().into_any_element())
+    }))
 }
 
 /// Scroll so 0-based `line` sits mid-viewport, unless it's already well inside it (the editor
@@ -1188,8 +1239,11 @@ impl Respite {
         // orientation gives a switch fresh sizes.
         let vp = window.viewport_size();
         let total = if vertical { vp.height - px(40.) } else { vp.width - if self.sidebar { px(260.) } else { px(0.) } };
-        let group = if vertical { v_resizable("split-v") } else { h_resizable("split-h") };
+        let group = invisible_dividers(if vertical { v_resizable("split-v") } else { h_resizable("split-h") });
         let (view, open) = (cx.entity().downgrade(), self.response_open);
+        let resp_focused = [&self.resp_body, &self.resp_meta].iter().any(|e| e.focus_handle(cx).contains_focused(window, cx));
+        // Half the gap on each side of a divider; the outer edge gets the root's padding.
+        let response = div().size_full().p_1().child(card(resp_focused, cx).child(self.response_panel(cx)));
         group
             .on_resize(move |state, window, cx| {
                 let sizes = state.read(cx).sizes().clone();
@@ -1199,8 +1253,8 @@ impl Respite {
                 let r = ((sizes[0] / (sizes[0] + sizes[1])) * 100.).round() / 100.;
                 view.update(cx, |this, cx| this.set("split_ratio", serde_json::json!(r), window, cx)).ok();
             })
-            .child(resizable_panel().size(total * ratio).child(center))
-            .child(resizable_panel().size(total * (1. - ratio)).visible(self.response_open).child(self.response_panel(cx)))
+            .child(resizable_panel().size(total * ratio).child(div().size_full().p_1().child(center)))
+            .child(resizable_panel().size(total * (1. - ratio)).visible(self.response_open).child(response))
             .into_any_element()
     }
 }
@@ -1211,13 +1265,16 @@ impl Render for Respite {
         if window.focused(cx).is_none() {
             window.focus(&self.focus, cx);
         }
-        let sidebar = self.sidebar(cx);
-        let center = self.center(cx);
+        let sidebar = div().size_full().p_1().child(card(false, cx).child(self.sidebar(cx)));
+        let editor_focused = self.doc().is_some_and(|d| d.editor.focus_handle(cx).contains_focused(window, cx));
+        let center = self.center(editor_focused, cx);
         div()
             .key_context("Respite")
             .track_focus(&self.focus)
             .size_full()
-            .bg(cx.theme().background)
+            .p_1()
+            // The sidebar, the editor and the response float on it as cards.
+            .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &RunRequest, window, cx| {
                 if let (Some(ix), Some(line)) = (this.current, this.doc().and_then(|d| d.cursor_request(cx)).map(|r| r.request_line)) {
@@ -1317,7 +1374,7 @@ impl Render for Respite {
                 this.set("split", serde_json::json!(next), window, cx);
             }))
             .child(
-                h_resizable("main")
+                invisible_dividers(h_resizable("main"))
                     .child(resizable_panel().size(px(260.)).size_range(px(160.)..px(520.)).visible(self.sidebar).child(sidebar))
                     .child(resizable_panel().child(self.editor_and_response(center, window, cx))),
             )

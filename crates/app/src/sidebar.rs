@@ -542,7 +542,7 @@ impl Respite {
             .size_full()
             .flex()
             .flex_col()
-            .bg(t.sidebar)
+            // Background and border come from the card it sits in (main.rs `card`).
             .text_color(t.sidebar_foreground)
             .child(header)
             .child(search)
