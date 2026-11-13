@@ -175,6 +175,71 @@ async fn history_cache_and_cookies_survive_restart() {
 }
 
 #[tokio::test]
+async fn oauth2() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    let token = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+    Mock::given(path("/token"))
+        .and(body_string_contains("grant_type=password"))
+        .and(body_string_contains("username=ann"))
+        .and(body_string_contains("password=pw"))
+        .and(body_string_contains("client_id=c"))
+        .and(body_string_contains("audience=x"))
+        .respond_with(token(serde_json::json!({"access_token": "A1", "expires_in": 1, "refresh_token": "R1", "id_token": "I1"})))
+        .expect(1).mount(&server).await;
+    Mock::given(path("/token")).and(body_string_contains("grant_type=refresh_token")).and(body_string_contains("refresh_token=R1"))
+        .respond_with(token(serde_json::json!({"access_token": "A2", "expires_in": "3600"})))
+        .expect(1).mount(&server).await;
+    Mock::given(path("/token")).and(header("authorization", "Basic YmFkOg=="))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({"error": "invalid_client"})))
+        .mount(&server).await;
+    Mock::given(path("/me")).and(header("authorization", "Bearer A1")).and(header("x-id", "I1"))
+        .respond_with(ResponseTemplate::new(200)).expect(2).mount(&server).await;
+    Mock::given(path("/me")).and(header("authorization", "Bearer A2")).respond_with(ResponseTemplate::new(201)).mount(&server).await;
+    Mock::given(path("/me")).and(header("authorization", "Bearer M")).respond_with(ResponseTemplate::new(202)).mount(&server).await;
+
+    let base = server.uri();
+    let auth = |id: &str, cfg: serde_json::Value| (format!("$auth.{id}"), Variable { value: cfg.to_string(), source: "env".into(), secret: true });
+    let mut env = env(&base);
+    env.extend([
+        auth("pw", serde_json::json!({
+            "Grant Type": "Password", "Token URL": format!("{base}/token"), "Client ID": "c", "Client Credentials": "in body",
+            "Username": "ann", "Password": "{{pass}}",
+            "Custom Request Parameters": {"audience": {"Value": "x", "Use": "In Token Request"}, "prompt": {"Value": "login", "Use": "In Auth Request"}},
+        })),
+        auth("mock", serde_json::json!({"Type": "Mock", "Token": "M"})),
+        auth("bad", serde_json::json!({"Grant Type": "Client Credentials", "Token URL": format!("{base}/token"), "Client ID": "bad"})),
+        auth("manual", serde_json::json!({"Type": "Mock", "Token": "M", "Acquire Automatically": false})),
+        ("pass".into(), Variable { value: "pw".into(), source: "env".into(), secret: true }),
+    ]);
+    let file = http_syntax::parse(
+        "GET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.token(\"pw\")}}\nX-Id: {{$auth.idToken(\"pw\")}}\n\
+         ###\nGET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.token('mock')}}\n\
+         ###\nGET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.token(\"bad\")}}\n\
+         ###\nGET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.token(\"manual\")}}\n\
+         ###\nGET {{baseUrl}}/me\nAuthorization: Bearer {{$auth.idToken(\"mock\")}}\n",
+    );
+    let (path, overrides) = (Path::new("/tmp/api.http"), HashMap::new());
+    let cx = Context { path, file: &file, env: &env, overrides: &overrides };
+    let exec = Executor::default();
+
+    // Acquired once, reused while fresh, then refreshed with the kept refresh token.
+    assert_eq!(exec.run(&cx, 0).await.unwrap().response.status, 200);
+    assert_eq!(exec.run(&cx, 0).await.unwrap().response.status, 200);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let ex = exec.run(&cx, 0);
+    // The refreshed token has no id_token, so `idToken` asks again and finds none.
+    assert!(matches!(ex.await, Err(Error::Auth { id, message }) if id == "pw" && message.contains("id_token")));
+    assert_eq!(exec.cached_token("pw").unwrap().refresh_token.as_deref(), Some("R1"));
+
+    assert_eq!(exec.run(&cx, 1).await.unwrap().response.status, 202);
+    assert!(matches!(exec.run(&cx, 2).await, Err(Error::Auth { message, .. }) if message.contains("401") && message.contains("invalid_client")));
+    assert!(matches!(exec.run(&cx, 3).await, Err(Error::Auth { message, .. }) if message.contains("Acquire Automatically")));
+    assert_eq!(exec.auth_token(&cx, "manual", false).await.unwrap().access_token, "M");
+    assert!(matches!(exec.run(&cx, 4).await, Err(Error::Auth { id, .. }) if id == "mock"));
+}
+
+#[tokio::test]
 async fn errors() {
     let cycle = "# @name a\nGET http://x/{{b.response.body.*}}\n###\n# @name b\nGET http://x/{{a.response.body.*}}\n";
     assert!(matches!(run(cycle, Path::new("/tmp"), "", 0).await, Err(Error::DependencyCycle(n)) if n == "a"));

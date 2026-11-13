@@ -4,8 +4,10 @@
 //! Async but runtime-agnostic in API; reqwest needs a tokio runtime to drive it.
 //! Cancel by dropping the future.
 
+mod oauth;
 mod store;
 
+pub use oauth::Token;
 pub use store::{Entry, Store};
 
 use std::cell::RefCell;
@@ -96,6 +98,8 @@ pub enum Error {
     Http(reqwest::Error),
     BadRequest(String),
     DependencyCycle(String),
+    /// OAuth 2.0 config `id` is missing or incomplete, or its token request failed.
+    Auth { id: String, message: String },
 }
 
 impl fmt::Display for Error {
@@ -106,6 +110,7 @@ impl fmt::Display for Error {
             Self::Http(e) => write!(f, "{e}"),
             Self::BadRequest(m) => f.write_str(m),
             Self::DependencyCycle(n) => write!(f, "request dependency cycle through '{n}'"),
+            Self::Auth { id, message } => write!(f, "auth '{id}': {message}"),
         }
     }
 }
@@ -150,6 +155,8 @@ pub struct Executor {
     cookies: Arc<reqwest_cookie_store::CookieStoreMutex>,
     /// In-memory layer over `store.latest()`.
     named: Mutex<HashMap<(PathBuf, String), Arc<Exchange>>>,
+    /// OAuth 2.0 tokens by config id, for this executor's environment.
+    tokens: Mutex<HashMap<String, Token>>,
     store: Option<Store>,
     env: Option<String>,
     source: &'static str,
@@ -178,10 +185,12 @@ impl Executor {
             .and_then(|s| std::fs::File::open(s.cookies_path(env)).ok())
             .and_then(|f| cookie_store::serde::json::load(std::io::BufReader::new(f)).ok())
             .unwrap_or_default();
+        let tokens = store.as_ref().map(|s| oauth::load(&s.oauth_path(env))).unwrap_or_default();
         Self {
             options: Default::default(),
             cookies: Arc::new(reqwest_cookie_store::CookieStoreMutex::new(jar)),
             named: Mutex::default(),
+            tokens: Mutex::new(tokens),
             store,
             env: env.map(Into::into),
             source,
@@ -219,8 +228,14 @@ impl Executor {
         let Some(store) = &self.store else { return };
         if req.directive("no-log").is_none() {
             // Short values would mask unrelated text.
-            let secrets: Vec<&str> =
-                cx.env.values().filter(|v| v.secret && v.value.len() >= 4).map(|v| v.value.as_str()).collect();
+            let tokens = self.tokens.lock().unwrap();
+            let secrets: Vec<&str> = cx
+                .env
+                .values()
+                .filter(|v| v.secret && v.value.len() >= 4)
+                .map(|v| v.value.as_str())
+                .chain(tokens.values().flat_map(Token::secrets))
+                .collect();
             match store.record(self.source, cx.path, req, ex, &secrets) {
                 Ok(id) => ex.history_id = Some(id),
                 Err(e) => eprintln!("respite: history not saved: {e}"),
@@ -251,12 +266,22 @@ impl Executor {
             let req = &cx.file.requests[index];
             let first_dep = ran.len();
             stack.push(index);
+            let mut fetched: Vec<String> = vec![];
             let prepared = loop {
                 let misses = RefCell::new(vec![]);
                 match self.prepare_inner(cx, req, &misses) {
                     Ok(p) => break p,
                     Err(Error::Resolve(ResolveError::Reference(_))) if !misses.borrow().is_empty() => {
                         for name in misses.take() {
+                            if let Some(id) = name.strip_prefix("$auth.") {
+                                if fetched.iter().any(|f| f == id) {
+                                    let message = "the token response has no id_token".into();
+                                    return Err(Error::Auth { id: id.into(), message });
+                                }
+                                self.auto_token(cx, id).await?;
+                                fetched.push(id.into());
+                                continue;
+                            }
                             let dep = cx
                                 .file
                                 .requests
@@ -297,15 +322,92 @@ impl Executor {
         })
     }
 
-    /// `misses` collects named requests referenced but not cached yet.
+    /// Token of OAuth 2.0 config `id`: the cached one while fresh, else refreshed or acquired
+    /// (`force`: always the full grant). Saved to the token cache.
+    pub async fn auth_token(&self, cx: &Context<'_>, id: &str, force: bool) -> Result<Token, Error> {
+        let cfg = self.auth_config(cx, id)?;
+        let previous = self.tokens.lock().unwrap().get(id).cloned();
+        if !force && let Some(t) = previous.as_ref().filter(|t| t.config == cfg.hash && t.fresh(oauth::now())) {
+            return Ok(t.clone());
+        }
+        let options = self.options.read().unwrap().clone();
+        let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(options.insecure);
+        builder = builder.timeout(options.timeout.unwrap_or(Duration::from_secs(30)));
+        let token = oauth::acquire(&builder.build()?, &cfg, previous.as_ref().filter(|_| !force)).await.map_err(|e| match e {
+            oauth::Error::Http(h) => Error::Http(h),
+            oauth::Error::Config(message) | oauth::Error::Server(message) => Error::Auth { id: id.into(), message },
+        })?;
+        let mut tokens = self.tokens.lock().unwrap();
+        tokens.insert(id.into(), token.clone());
+        if let Some(store) = &self.store
+            && let Err(e) = oauth::save(&store.oauth_path(self.env.as_deref()), &tokens)
+        {
+            eprintln!("respite: OAuth tokens not saved: {e}");
+        }
+        Ok(token)
+    }
+
+    /// Forget every token of this environment, on disk too.
+    pub fn clear_tokens(&self) {
+        self.tokens.lock().unwrap().clear();
+        if let Some(store) = &self.store {
+            let _ = std::fs::remove_file(store.oauth_path(self.env.as_deref()));
+        }
+    }
+
+    /// Cached token of `id`, fresh or not (hover, `respite auth`).
+    pub fn cached_token(&self, id: &str) -> Option<Token> {
+        self.tokens.lock().unwrap().get(id).cloned()
+    }
+
+    /// A token for a request: like [`Self::auth_token`], unless the config says
+    /// `"Acquire Automatically": false`.
+    async fn auto_token(&self, cx: &Context<'_>, id: &str) -> Result<Token, Error> {
+        if !self.auth_config(cx, id)?.automatic() {
+            let message = format!("\"Acquire Automatically\" is false; get a token with `respite auth token {id}`");
+            return Err(Error::Auth { id: id.into(), message });
+        }
+        self.auth_token(cx, id, false).await
+    }
+
+    /// `Security.Auth.<id>` from the env files with `{{variables}}` resolved.
+    fn auth_config(&self, cx: &Context<'_>, id: &str) -> Result<oauth::Config, Error> {
+        let missing = || Error::Auth { id: id.into(), message: "no such config in Security.Auth of the env files".into() };
+        let raw: Value = serde_json::from_str(&cx.env.get(&format!("$auth.{id}")).ok_or_else(missing)?.value).map_err(|_| missing())?;
+        let dir = cx.path.parent().unwrap_or(Path::new("."));
+        let resolver = Resolver { overrides: cx.overrides, file_vars: &cx.file.variables, env: cx.env, dir };
+        match oauth::resolve_strings(&raw, &|s: &str| resolver.resolve(s, &|_, _| None))? {
+            Value::Object(map) => Ok(oauth::Config::new(map)),
+            _ => Err(missing()),
+        }
+    }
+
+    /// `misses` collects named requests (and `$auth.<id>` configs) referenced but not cached yet.
     fn prepare_inner(&self, cx: &Context<'_>, req: &Request, misses: &RefCell<Vec<String>>) -> Result<Prepared, Error> {
         let dir = cx.path.parent().unwrap_or(Path::new("."));
         let resolver = Resolver { overrides: cx.overrides, file_vars: &cx.file.variables, env: cx.env, dir };
+        let miss = |name: &str| {
+            let mut m = misses.borrow_mut();
+            if !m.iter().any(|n| n == name) {
+                m.push(name.to_string());
+            }
+        };
         let refs = |name: &str, path: &str| {
+            if let Some(id) = name.strip_prefix("$auth.") {
+                let value = self.auth_config(cx, id).ok().and_then(|cfg| {
+                    let tokens = self.tokens.lock().unwrap();
+                    let t = tokens.get(id).filter(|t| t.config == cfg.hash && t.fresh(oauth::now()))?;
+                    t.get(path).map(String::from)
+                });
+                if value.is_none() {
+                    miss(name);
+                }
+                return value;
+            }
             match self.cached(cx.path, name) {
                 Some(ex) => extract(&ex, path),
                 None => {
-                    misses.borrow_mut().push(name.to_string());
+                    miss(name);
                     None
                 }
             }

@@ -196,8 +196,20 @@ fn ask(
 }
 
 pub(crate) fn exec_error(e: Error, loaded: &Loaded, req: &Request) -> CliError {
-    let at = |e: CliError| e.at(&loaded.path, Some(req.request_line));
+    exec_error_at(e, &loaded.path, Some(req.request_line))
+}
+
+/// An executor error not tied to a request line (`respite auth`).
+pub(crate) fn exec_error_plain(e: Error, path: &std::path::Path) -> CliError {
+    exec_error_at(e, path, None)
+}
+
+fn exec_error_at(e: Error, path: &std::path::Path, line: Option<usize>) -> CliError {
+    let at = |e: CliError| e.at(path, line);
     match e {
+        Error::Auth { id, message } => {
+            at(CliError::new("auth_failed", format!("auth '{id}': {message}"), 3).hint("see Security.Auth in the env files; `respite env show <env>`"))
+        }
         Error::Resolve(r) => {
             let (code, hint) = match &r {
                 ResolveError::Undefined(v) => ("undefined_variable", format!("define @{v} = … in the file, add it to an env file, or pass --var {v}=…")),

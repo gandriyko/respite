@@ -46,7 +46,7 @@ actions!(
         RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Import, Quit,
         NextEnvironment, ToggleHistory, InsertFile, RunAll, RunSelected, RepeatLast, CancelRequests, GoToFile, GoToRequest,
         CommandPalette, PrevRequest, NextRequest, QuickFix, RenameSymbol, GoToWorkspaceRequest, FocusEditor, FocusResponse,
-        ExpandTemplate, CopyJsonPath, ToggleResponse, ToggleSplit, ShowHelp
+        ExpandTemplate, CopyJsonPath, ToggleResponse, ToggleSplit, ShowHelp, ClearAuthTokens
     ]
 );
 
@@ -1358,6 +1358,10 @@ impl Render for Respite {
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &ShowHelp, window, cx| this.show_help(window, cx)))
+            .on_action(cx.listener(|this, _: &ClearAuthTokens, window, cx| {
+                this.executors.values().for_each(|e| e.clear_tokens());
+                window.push_notification("OAuth 2.0 tokens of this environment cleared", cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar = !this.sidebar;
                 cx.notify();
@@ -1483,6 +1487,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Import…", Box::new(Import)),
         ("Settings…", Box::new(OpenSettings)),
         ("Syntax Reference", Box::new(ShowHelp)),
+        ("Clear OAuth 2.0 Tokens", Box::new(ClearAuthTokens)),
         ("Quit Respite", Box::new(Quit)),
     ]
 }

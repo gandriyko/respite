@@ -262,6 +262,25 @@ impl Lang {
         if let Some((_, about)) = DYNAMIC.iter().find(|(n, _)| expr.split_whitespace().next() == Some(n)) {
             return format!("Dynamic variable: {about}. New value on every send.");
         }
+        if let Some(call) = expr.strip_prefix("$auth.") {
+            let Some((kind, id)) = http_env::auth_call(call) else { return "Expected `$auth.token(\"id\")` or `$auth.idToken(\"id\")`".into() };
+            let ctx = self.0.borrow();
+            let Some(v) = ctx.env.get(&format!("$auth.{id}")) else {
+                return format!("No OAuth 2.0 config {} in `Security.Auth` of the selected environment's files", code(id));
+            };
+            let cfg: serde_json::Value = serde_json::from_str(&v.value).unwrap_or_default();
+            let field = |f: &str| cfg[f].as_str().map(|s| format!("\n\n{f}: {}", code(s))).unwrap_or_default();
+            let what = if kind == "idToken" { "ID token" } else { "Access token" };
+            return format!(
+                "{what} of OAuth 2.0 config {}, acquired before sending and cached{}{}{}{}\n\nFrom {}",
+                code(id),
+                field("Type"),
+                field("Grant Type"),
+                field("Token URL"),
+                field("Client ID"),
+                code(&file_name(&v.source)),
+            );
+        }
         if let Some((name, path)) = expr.split_once('.') {
             return match file.requests.iter().any(|r| r.name.as_deref() == Some(name)) {
                 true => format!("{} of the last response of request {}", code(path), code(name)),
@@ -292,7 +311,10 @@ impl Lang {
         let file = crate::highlight::parse(&text.to_string());
         let ctx = self.0.borrow();
         let here = |line: usize| (ctx.path.to_path_buf(), line.saturating_sub(1));
-        let (path, row) = if let Some((name, _)) = expr.split_once('.') {
+        let (path, row) = if let Some((_, id)) = expr.strip_prefix("$auth.").and_then(http_env::auth_call) {
+            let v = ctx.env.get(&format!("$auth.{id}")).or_else(|| ctx.all.get(&format!("$auth.{id}")))?;
+            (v.source.clone(), key_line(&v.source, id))
+        } else if let Some((name, _)) = expr.split_once('.') {
             here(file.requests.iter().find(|r| r.name.as_deref() == Some(name))?.request_line)
         } else if let Some(v) = file.variables.iter().find(|v| v.name == expr) {
             here(v.line)
@@ -335,7 +357,14 @@ impl Lang {
             cands.extend(file.variables.iter().map(|v| (v.name.clone(), format!("file variable = {}", v.value), CompletionItemKind::VARIABLE)));
             let mut env: Vec<_> = ctx.all.iter().collect();
             env.sort_by(|a, b| a.0.cmp(b.0));
-            cands.extend(env.into_iter().map(|(k, v)| (k.clone(), file_name(&v.source), CompletionItemKind::VARIABLE)));
+            for (k, v) in env {
+                match k.strip_prefix("$auth.") {
+                    Some(id) => cands.extend(["token", "idToken"].map(|f| {
+                        (format!("$auth.{f}(\"{id}\")"), format!("OAuth 2.0, {}", file_name(&v.source)), CompletionItemKind::FUNCTION)
+                    })),
+                    None => cands.push((k.clone(), file_name(&v.source), CompletionItemKind::VARIABLE)),
+                }
+            }
             cands.extend(DYNAMIC.iter().map(|(n, about)| (n.to_string(), about.to_string(), CompletionItemKind::FUNCTION)));
             cands.extend(
                 file.requests.iter().filter_map(|r| r.name.as_ref()).map(|n| (format!("{n}.response.body"), "last response body".into(), CompletionItemKind::REFERENCE)),
@@ -494,7 +523,11 @@ mod tests {
 
     fn lang() -> Lang {
         let var = |v: &str, secret| Variable { value: v.into(), source: PathBuf::from("/p/respite-dev.json"), secret };
-        let env = HashMap::from([("host".to_string(), var("http://x", false)), ("token".to_string(), var("s3cret", true))]);
+        let env = HashMap::from([
+            ("host".to_string(), var("http://x", false)),
+            ("token".to_string(), var("s3cret", true)),
+            ("$auth.api".to_string(), var(r#"{"Grant Type": "Client Credentials", "Client ID": "c"}"#, true)),
+        ]);
         let all = Arc::new(env.clone());
         Lang(Rc::new(RefCell::new(Ctx { path: Arc::new(PathBuf::from("/p/a.http")), env: Arc::new(env), all, env_name: None })))
     }
@@ -502,6 +535,16 @@ mod tests {
     fn labels(l: &Lang, src: &str) -> Vec<String> {
         let text = Rope::from(src);
         l.completions_at(&text, src.len()).into_iter().map(|i| i.label).collect()
+    }
+
+    #[test]
+    fn auth_completion_and_hover() {
+        let l = lang();
+        assert_eq!(labels(&l, "GET /\nAuthorization: Bearer {{$au"), [r#"$auth.token("api")"#, r#"$auth.idToken("api")"#]);
+        let file = http_syntax::parse("GET /\n");
+        let hover = l.describe(r#"$auth.token("api")"#, &file);
+        assert!(hover.contains("Access token") && hover.contains("Client Credentials"), "{hover}");
+        assert!(l.describe(r#"$auth.token("nope")"#, &file).contains("No OAuth 2.0 config"));
     }
 
     #[test]

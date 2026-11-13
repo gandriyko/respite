@@ -31,11 +31,13 @@ Requests are addressed by `@name`, `###` title, `:LINE` (any line of the block) 
 | `respite export-curl FILE REQUEST [--raw]` | Request → cURL; `--raw` keeps `{{variables}}` |
 | `respite env list [--dir DIR]` | Environment names visible from a directory |
 | `respite env show NAME [--dir DIR]` | Merged variables of one environment, secrets masked |
+| `respite auth token ID [--force] [--dir DIR]` | OAuth 2.0 token of a config: cached while fresh, else refreshed or acquired; `--force` runs the full grant |
+| `respite auth clear [--env NAME] [--dir DIR]` | Forget the cached OAuth 2.0 tokens of one environment |
 | `respite history [--last N]` | Past executions of this workspace (default 20) |
 
 `list`, `check`, `import`, `env`, `history` and `run` take `--output human|json|jsonl`.
 
-Variables (`run`, `show`, `export-curl`):
+Variables (`run`, `show`, `export-curl`, `auth token`):
 
 - `--env NAME` — environment (`dev` reads `respite-dev.json`).
 - `--var KEY=VALUE` — override any variable, highest priority, repeatable.
@@ -65,7 +67,7 @@ Exit codes:
 | `0` | OK |
 | `1` | An `@assert` failed, or a 4xx/5xx with `--fail-on-status` |
 | `2` | Network error or timeout |
-| `3` | Parse error, undefined variable or bad input; also `check` finding errors |
+| `3` | Parse error, undefined variable or bad input, an OAuth 2.0 config or token request failing (`auth_failed`); also `check` finding errors |
 | `4` | Refused: a `@note` needs confirmation |
 
 `run --output json` gives one object per request (an array when there are several):
@@ -132,6 +134,45 @@ Authorization: Bearer {{login.response.body.$.token}}
   `{{login.response.body.*}}` (whole body), `{{login.response.headers.X-Token}}`,
   `{{login.request.body.*}}`. The named request runs first when its response isn't cached;
   dependency cycles are errors.
+
+### OAuth 2.0
+
+Same syntax and config as JetBrains HTTP Client, so the file runs there too:
+
+```http
+GET {{host}}/me
+Authorization: Bearer {{$auth.token("api")}}
+```
+
+```jsonc
+// respite-dev.json (committed)
+{ "Security": { "Auth": { "api": {
+  "Type": "OAuth2",
+  "Grant Type": "Client Credentials",
+  "Token URL": "https://auth.example.com/oauth/token",
+  "Client ID": "respite",
+  "Client Secret": "{{clientSecret}}",
+  "Scope": "read write"
+}}}}
+// respite-dev.private.json (git-ignored): { "clientSecret": "…" }
+```
+
+- `{{$auth.token("id")}}` is the access token, `{{$auth.idToken("id")}}` the ID token.
+- `Grant Type`: `Client Credentials` or `Password` (`Username`, `Password`).
+  `Authorization Code`, `Device Authorization` and `Implicit` are not supported yet.
+- `Type: "Mock"` with `"Token"` (and `"ID Token"`) hands out a fixed token, with no request.
+- Other fields:
+  - `Client Credentials` — how the client authenticates: `basic` (default), `in body`, `none`;
+  - `Custom Request Parameters` / `Custom Request Headers` — `"name": "v"`, a list, or
+    `{"Value": …, "Use": "Everywhere" | "In Token Request"}`;
+  - `Acquire Automatically: false` — requests fail until `respite auth token ID` gets one.
+- Config values may use `{{variables}}`; keep secrets in `.private` files. A private file can
+  hold just the fields it adds (`"Client Secret"`): configs merge field by field.
+- The token is acquired before the first request that needs it, then reused. Near expiry it is
+  renewed with the refresh token, falling back to the full grant. Changing the config drops it.
+- Cache: `~/.respite/history/<project>/oauth.<env>.json`, owner-only. Tokens are masked in
+  history.
+- `check` reports `unknown_auth` for an id that no env file defines.
 
 ### Bodies and output
 

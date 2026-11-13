@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 http-syntax = { path = "../http-syntax" }
 http-env = { path = "../http-env" }
-reqwest = { version = "0.13", features = ["cookies", "gzip", "brotli", "deflate"] }
+reqwest = { version = "0.13", features = ["cookies", "gzip", "brotli", "deflate", "form"] }
 serde_json = "1"
 serde_json_path = "0.7"
 regex = "1"

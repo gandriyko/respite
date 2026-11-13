@@ -112,6 +112,7 @@ respite import       Postman / Insomnia / OpenAPI / Swagger / Bruno / HAR → .h
 respite import-curl  cURL from stdin or the clipboard → request block(s)
 respite export-curl  Request → cURL command
 respite env          Environments from respite-<env>(.private).json
+respite auth         OAuth 2.0 tokens: print one (token ID), forget them (clear)
 respite history      Past executions of this workspace
 ```
 
@@ -123,6 +124,42 @@ respite run api.http createUser --dry-run            # show the resolved request
 respite run api.http --fail-on-status --fail-fast    # use it as a smoke test in CI
 respite run api.http --jsonpath '$.items[*].id'      # print only the matching values
 ```
+
+## OAuth 2.0
+
+Write the token into a request as in JetBrains HTTP Client, and the file runs there too:
+
+```http
+GET https://api.example.com/me
+Authorization: Bearer {{$auth.token("api")}}
+```
+
+The config lives in an env file under `Security` → `Auth`, with JetBrains' field names. Commit the config, and keep the secret in the git-ignored private file:
+
+```jsonc
+// respite-dev.json
+{
+  "Security": { "Auth": { "api": {
+    "Type": "OAuth2",
+    "Grant Type": "Client Credentials",
+    "Token URL": "https://auth.example.com/oauth/token",
+    "Client ID": "respite",
+    "Client Secret": "{{clientSecret}}",
+    "Scope": "read write"
+  }}}
+}
+
+// respite-dev.private.json
+{ "clientSecret": "…" }
+```
+
+- **Grants.** `Client Credentials` and `Password` work now. `"Type": "Mock"` with a `"Token"` gives a fixed token for tests. Browser flows (Authorization Code with PKCE, Device Authorization) come next.
+- **Other fields.** `Client Credentials` (`basic`, `in body` or `none`), `Custom Request Parameters`, `Custom Request Headers` and `Acquire Automatically`. `{{$auth.idToken("api")}}` gives the ID token.
+- **When a token is fetched.** Only when a request first needs it. It is reused until shortly before it expires, renewed with the refresh token when there is one, and fetched again when the config changes.
+- **Cache.** Tokens are kept per environment in `~/.respite/history/<project>/oauth.<env>.json`, a file only you can read. The app and the CLI share it, and history masks the tokens.
+- **Commands.** `respite auth token api --env dev` prints a token, `respite auth clear --env dev` forgets them. In the app, use **Clear OAuth 2.0 Tokens** in the command palette.
+
+To try it, the public Duende demo server accepts client `m2m` with secret `secret` and scope `api` at `https://demo.duendesoftware.com/connect/token`. Its API is `https://demo.duendesoftware.com/api/test`.
 
 ## Tests
 
@@ -243,7 +280,9 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 - [ ] MCP server for AI agents
 - [x] Declarative assertions (`# @assert`)
 - [ ] Pre-request and test scripts, JUnit output
-- [ ] WebSocket, SSE, gRPC; OAuth 2.0 and AWS SigV4 auth
+- [x] OAuth 2.0: Client Credentials, Password, refresh tokens (`$auth.token`)
+- [ ] OAuth 2.0 browser flows: Authorization Code + PKCE, Device Authorization
+- [ ] WebSocket, SSE, gRPC; AWS SigV4 auth
 
 ## License
 

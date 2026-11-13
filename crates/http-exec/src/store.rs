@@ -80,6 +80,11 @@ impl Store {
         self.dir.join(format!("cookies.{}.json", env.unwrap_or("_")))
     }
 
+    /// OAuth 2.0 token cache of one environment (owner-only file).
+    pub fn oauth_path(&self, env: Option<&str>) -> PathBuf {
+        self.dir.join(format!("oauth.{}.json", env.unwrap_or("_")))
+    }
+
     /// Save an execution; returns its id. Sensitive request headers and every `secrets` value
     /// in the request (URL, headers, body) are masked. The response body is kept as is:
     /// it is the `{{name.response…}}` cache.

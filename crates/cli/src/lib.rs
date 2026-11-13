@@ -71,6 +71,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: EnvCmd,
     },
+    /// OAuth 2.0 tokens of `Security.Auth` configs in the env files
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
     /// Past executions of this workspace
     History {
         #[arg(long, default_value_t = 20)]
@@ -96,6 +101,32 @@ enum EnvCmd {
         dir: PathBuf,
         #[arg(long, value_enum)]
         output: Option<Format>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCmd {
+    /// Print a token: cached while fresh, else refreshed or acquired
+    Token {
+        /// Config id: `api` for `{{$auth.token("api")}}`
+        id: String,
+        /// Skip the cache and the refresh token: run the full grant
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        #[command(flatten)]
+        env: EnvArgs,
+        #[arg(long, value_enum)]
+        output: Option<Format>,
+    },
+    /// Forget the cached tokens of one environment
+    Clear {
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Environment name; none = the tokens used without one
+        #[arg(long)]
+        env: Option<String>,
     },
 }
 
@@ -129,7 +160,8 @@ impl Format {
 /// The GUI binary calls this first; `None` means "not a CLI command, open the GUI".
 pub fn main_if_cli() -> Option<ExitCode> {
     const COMMANDS: &[&str] = &[
-        "list", "show", "run", "import", "import-curl", "export-curl", "check", "env", "history", "help", "--help", "-h", "--version", "-V",
+        "list", "show", "run", "import", "import-curl", "export-curl", "check", "env", "auth", "history", "help", "--help", "-h", "--version",
+        "-V",
     ];
     let first = std::env::args().nth(1)?;
     if !COMMANDS.contains(&first.as_str()) {
@@ -141,8 +173,9 @@ pub fn main_if_cli() -> Option<ExitCode> {
             Format::resolve(*output)
         }
         Cmd::Env { cmd: EnvCmd::List { output, .. } | EnvCmd::Show { output, .. } } => Format::resolve(*output),
+        Cmd::Auth { cmd: AuthCmd::Token { output, .. } } => Format::resolve(*output),
         Cmd::Run(a) => Format::resolve(a.output),
-        Cmd::Show { .. } | Cmd::ImportCurl(_) | Cmd::ExportCurl(_) => Format::Human,
+        Cmd::Show { .. } | Cmd::ImportCurl(_) | Cmd::ExportCurl(_) | Cmd::Auth { cmd: AuthCmd::Clear { .. } } => Format::Human,
     } == Format::Human;
     Some(match dispatch(cli) {
         Ok(code) => ExitCode::from(code),
@@ -164,8 +197,42 @@ fn dispatch(cli: Cli) -> Result<u8, CliError> {
         Cmd::Check { paths, output } => check(&paths, Format::resolve(output)),
         Cmd::Env { cmd: EnvCmd::List { dir, output } } => env_list(&dir, Format::resolve(output)),
         Cmd::Env { cmd: EnvCmd::Show { name, dir, output } } => env_show(&name, &dir, Format::resolve(output)),
+        Cmd::Auth { cmd: AuthCmd::Token { id, force, dir, env, output } } => auth_token(&id, force, &dir, &env, Format::resolve(output)),
+        Cmd::Auth { cmd: AuthCmd::Clear { dir, env } } => {
+            let probe = std::path::absolute(&dir).unwrap_or(dir).join("_.http");
+            executor(&http_env::workspace_root(&probe), env.as_deref()).clear_tokens();
+            Ok(0)
+        }
         Cmd::History { last, output } => history(last, Format::resolve(output)),
     }
+}
+
+/// `respite auth token`: the token is printed in full, the user asked for it.
+fn auth_token(id: &str, force: bool, dir: &Path, args: &EnvArgs, format: Format) -> Result<u8, CliError> {
+    let path = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()).join("_.http");
+    let root = http_env::workspace_root(&path);
+    let loaded = Loaded { path, root, file: Default::default(), src: String::new() };
+    let (env, overrides) = environment(&loaded, args)?;
+    let exec = executor(&loaded.root, args.env.as_deref());
+    let cx = http_exec::Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    let t = rt.block_on(exec.auth_token(&cx, id, force)).map_err(|e| run::exec_error_plain(e, &loaded.path))?;
+    let expires = t.expires_at.and_then(|s| jiff::Timestamp::from_second(s).ok()).map(|ts| ts.to_string());
+    match format {
+        Format::Human => {
+            println!("{}", t.access_token);
+            let meta = [expires.map(|e| format!("expires {e}")), t.scope.clone().map(|s| format!("scope {s}"))];
+            let meta: Vec<String> = meta.into_iter().flatten().collect();
+            if !meta.is_empty() {
+                eprintln!("{}", paint(&meta.join(" · "), DIM, false));
+            }
+        }
+        _ => println!(
+            "{}",
+            json!({"id": id, "access_token": t.access_token, "id_token": t.id_token, "expires_at": expires, "scope": t.scope, "has_refresh_token": t.refresh_token.is_some()})
+        ),
+    }
+    Ok(0)
 }
 
 fn import(path: &Path, to: &Path, format: Format) -> Result<u8, CliError> {

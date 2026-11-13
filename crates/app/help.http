@@ -33,6 +33,19 @@ GET https://{{host}}/get
 GET {{baseUrl}}/bearer
 Authorization: Bearer {{token}}
 
+### OAuth 2.0
+# Configured in an env file the same way as in JetBrains:
+#   {"Security": {"Auth": {"api": {"Type": "OAuth2",
+#     "Grant Type": "Client Credentials",
+#     "Token URL": "https://demo.duendesoftware.com/connect/token",
+#     "Client ID": "m2m", "Client Secret": "{{clientSecret}}",
+#     "Scope": "api"}}}}
+# Grants: Client Credentials, Password; "Type": "Mock" for tests.
+# The token is fetched once, cached, refreshed near expiry.
+# $auth.idToken("api") for the ID token.
+GET https://demo.duendesoftware.com/api/test
+Authorization: Bearer {{$auth.token("api")}}
+
 ### Generated values
 # Offsets: y M w d h m s ms.
 # Also: $processEnv HOME, $dotenv KEY, $localDatetime.

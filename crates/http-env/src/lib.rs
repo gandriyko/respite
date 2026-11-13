@@ -7,7 +7,7 @@
 
 mod dynamic;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -123,21 +123,39 @@ impl Environments {
 
     /// Merged variables: `$shared` from every file, then the `env` block from every file.
     /// Shallow merge by key; objects (e.g. `SSLConfiguration`) are not variables.
+    ///
+    /// `Security.Auth.<id>` (JetBrains HTTP Client's OAuth 2.0 config) is merged field by field
+    /// across files, so a private file can add just `"Client Secret"`. Each config comes back as
+    /// `$auth.<id>` holding its JSON — a name no `{{variable}}` can reach (`{{$…}}` is dynamic).
     // ponytail: SSLConfiguration deep merge comes with mTLS.
     pub fn variables(&self, env: Option<&str>) -> HashMap<String, Variable> {
         let mut out = HashMap::new();
+        let mut auth: BTreeMap<String, (Map<String, Value>, Variable)> = BTreeMap::new();
         for key in std::iter::once("$shared").chain(env) {
             for f in &self.files {
                 let Some(Value::Object(block)) = f.json.get(key) else { continue };
                 for (k, v) in block {
                     let value = match v {
                         Value::String(s) => s.clone(),
+                        Value::Object(o) if k == "Security" => {
+                            let Some(Value::Object(configs)) = o.get("Auth") else { continue };
+                            for (id, cfg) in configs {
+                                let Value::Object(cfg) = cfg else { continue };
+                                let e = auth.entry(id.clone()).or_insert_with(|| (Map::new(), Variable { value: String::new(), source: f.path.clone(), secret: false }));
+                                e.0.extend(cfg.clone());
+                                e.1.secret |= f.private;
+                            }
+                            continue;
+                        }
                         Value::Object(_) | Value::Array(_) => continue,
                         other => other.to_string(),
                     };
                     out.insert(k.clone(), Variable { value, source: f.path.clone(), secret: f.private });
                 }
             }
+        }
+        for (id, (cfg, var)) in auth {
+            out.insert(format!("$auth.{id}"), Variable { value: Value::Object(cfg).to_string(), ..var });
         }
         out
     }
@@ -185,7 +203,7 @@ pub fn check(file: &HttpFile, envs: &Environments, dir: &Path) -> Vec<Diagnostic
 /// [`check`] against already merged variables ([`Environments::all_variables`]).
 pub fn check_vars(file: &HttpFile, env: &HashMap<String, Variable>, dir: &Path) -> Vec<Diagnostic> {
     let names: HashSet<&str> = file.requests.iter().filter_map(|r| r.name.as_deref()).collect();
-    let refs = |name: &str, _: &str| names.contains(name).then(String::new);
+    let refs = |name: &str, _: &str| (names.contains(name) || (name.starts_with("$auth.") && env.contains_key(name))).then(String::new);
     let mut out: Vec<Diagnostic> = vec![];
     for r in &file.requests {
         // `@prompt` variables get their value at send time.
@@ -210,6 +228,7 @@ pub fn check_vars(file: &HttpFile, env: &HashMap<String, Variable>, dir: &Path) 
                         // Depends on the machine running it, not on the file.
                         ResolveError::Undefined(v) if v.starts_with('$') => (Severity::Warning, "undefined_variable"),
                         ResolveError::Undefined(_) => (Severity::Error, "undefined_variable"),
+                        ResolveError::Reference(v) if v.starts_with("$auth.") => (Severity::Error, "unknown_auth"),
                         ResolveError::Reference(_) => (Severity::Error, "unknown_request"),
                         ResolveError::Cycle(_) => (Severity::Error, "cyclic_variable"),
                         ResolveError::Dynamic(_) => (Severity::Error, "invalid_dynamic_variable"),
@@ -255,6 +274,9 @@ impl fmt::Display for ResolveError {
         match self {
             Self::Undefined(v) => write!(f, "undefined variable '{v}'"),
             Self::Cycle(v) => write!(f, "cyclic variable reference through '{v}'"),
+            Self::Reference(v) if v.starts_with("$auth.") => {
+                write!(f, "cannot resolve '{v}': no such config in Security.Auth of the env files, or no token")
+            }
             Self::Reference(v) => write!(f, "cannot resolve '{v}'"),
             Self::Dynamic(v) => write!(f, "invalid dynamic variable '{v}'"),
         }
@@ -294,6 +316,11 @@ impl Resolver<'_> {
     }
 
     fn value(&self, expr: &str, refs: References, stack: &mut Vec<String>) -> Result<String, ResolveError> {
+        // `$auth.token("id")` / `$auth.idToken("id")` → refs("$auth.id", "token" | "idToken").
+        if let Some(call) = expr.strip_prefix("$auth.") {
+            let (kind, id) = auth_call(call).ok_or_else(|| ResolveError::Dynamic(expr.into()))?;
+            return refs(&format!("$auth.{id}"), kind).ok_or_else(|| ResolveError::Reference(expr.into()));
+        }
         if let Some(d) = expr.strip_prefix('$') {
             return dynamic::eval(d, self.dir, &mut |name| self.value(name, refs, stack));
         }
@@ -321,10 +348,43 @@ impl Resolver<'_> {
     }
 }
 
+/// `token("api")` → `("token", "api")`; also `idToken`, single quotes.
+pub fn auth_call(call: &str) -> Option<(&'static str, &str)> {
+    let (kind, rest) = call.split_once('(')?;
+    let kind = ["token", "idToken"].into_iter().find(|k| *k == kind.trim())?;
+    let arg = rest.strip_suffix(')')?.trim();
+    let id = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')).or_else(|| arg.strip_prefix('\'').and_then(|a| a.strip_suffix('\'')))?;
+    (!id.is_empty()).then_some((kind, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn auth_configs() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        let auth = |cfg: &str| format!(r#"{{"Security": {{"Auth": {{"api": {cfg}}}}}}}"#);
+        fs::write(r.join("respite-dev.json"), auth(r#"{"Type": "OAuth2", "Client ID": "c", "Client Secret": "{{secret}}"}"#)).unwrap();
+        fs::write(r.join("respite-dev.private.json"), auth(r#"{"Client Secret": "s3"}"#)).unwrap();
+        let envs = Environments::load(&r.join("a.http"), r, &[]);
+        let v = envs.variables(Some("dev"));
+        let cfg: Value = serde_json::from_str(&v["$auth.api"].value).unwrap();
+        assert_eq!((cfg["Client ID"].as_str(), cfg["Client Secret"].as_str(), v["$auth.api"].secret), (Some("c"), Some("s3"), true));
+        assert!(!v.contains_key("Security"));
+
+        assert_eq!(auth_call(r#"token("api")"#), Some(("token", "api")));
+        assert_eq!(auth_call("idToken('a b')"), Some(("idToken", "a b")));
+        assert_eq!([auth_call("token(api)"), auth_call(r#"secret("a")"#), auth_call(r#"token("")"#)], [None; 3]);
+        let (o, files) = (HashMap::new(), vec![]);
+        let res = Resolver { overrides: &o, file_vars: &files, env: &v, dir: r };
+        let refs = |name: &str, kind: &str| (name == "$auth.api").then(|| format!("{kind}-T"));
+        assert_eq!(res.resolve(r#"Bearer {{$auth.token("api")}} {{$auth.idToken("api")}}"#, &refs).unwrap(), "Bearer token-T idToken-T");
+        assert!(matches!(res.resolve(r#"{{$auth.token("nope")}}"#, &refs), Err(ResolveError::Reference(_))));
+        assert!(matches!(res.resolve("{{$auth.token}}", &refs), Err(ResolveError::Dynamic(_))));
+    }
 
     #[test]
     fn root_resolution() {
