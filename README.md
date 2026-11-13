@@ -32,7 +32,7 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 | | |
 |---|---|
 | **Editor** | `.http` syntax highlighting (JSON, XML, GraphQL and JS bodies), completion, diagnostics with quick fixes, rename, live templates, folding |
-| **Response** | Body, headers, cookies, the request as sent, timeline with redirects; images, JSONPath filter, run history ‹ › with diff, pin |
+| **Response** | Body, headers, cookies, the request as sent, timeline (redirects, time to first byte, download); multi-MB bodies, images, JSONPath filter, run history ‹ › with diff, pin |
 | **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
 | **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, …) |
 | **History** | Every run is stored per project and can be browsed, filtered and reopened |
@@ -199,8 +199,9 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 - [x] `.http` parser, variables, environments, executor, history
 - [x] CLI with JSON output, cURL import and export
 - [x] Import from Postman, Insomnia, OpenAPI / Swagger, Bruno and HAR
-- [ ] Navigation: <kbd>⌘</kbd> <kbd>P</kbd>, go to request, breadcrumbs
-- [ ] Autocompletion and inline diagnostics in the editor
+- [x] Navigation: <kbd>⌘</kbd> <kbd>P</kbd>, go to request, command palette, breadcrumbs
+- [x] Autocompletion and inline diagnostics in the editor
+- [ ] Timeline: DNS, TCP and TLS phases
 - [ ] MCP server for AI agents
 - [ ] Pre-request and test scripts, JUnit output
 - [ ] WebSocket, SSE, gRPC; OAuth 2.0 and AWS SigV4 auth
