@@ -229,7 +229,9 @@ respite run api.http --env staging --fail-fast
 
 ## Environments
 
-One flat file per environment, found in every folder from the workspace root down to the `.http` file (deeper folders win). `respite.json` holds values shared by all environments. Keep secrets in `.private` files and git-ignore them:
+One flat file per environment, found in every folder from the workspace root down to the `.http` file (deeper folders win). `respite.json` holds values shared by all environments.
+
+A single file per environment is enough: `respite-dev.json`, or just `respite-dev.private.json`. Split it in two only when the folder is in git. The public file holds what the team shares (hosts, OAuth configs). The `.private` file is git-ignored and holds secrets; its values are masked in history and CLI output:
 
 ```jsonc
 // respite-dev.json

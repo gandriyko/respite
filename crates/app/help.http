@@ -30,6 +30,8 @@ GET https://{{host}}/get
 # respite.json, respite-dev.json,
 # respite-dev.private.json (secrets):
 #   {"token": "dev-token"}
+# One file per env is enough; .private is for
+# secrets kept out of git.
 GET {{baseUrl}}/bearer
 Authorization: Bearer {{token}}
 

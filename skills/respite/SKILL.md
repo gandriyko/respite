@@ -124,7 +124,9 @@ Authorization: Bearer {{login.response.body.$.token}}
 - Environments: `respite-<env>.json` — a flat `{"key": "value"}` object. Shared values go in
   `respite.json`. Secrets go in git-ignored `respite-<env>.private.json` / `respite.private.json`;
   their values are masked in output and history. Files are found in every folder from the
-  workspace root down to the `.http` file, and deeper folders win.
+  workspace root down to the `.http` file, and deeper folders win. One file per environment
+  is enough, public or private alone. Split into two only when the folder is in git: the public
+  file for what the team shares, the private one for secrets.
 - Dynamic:
   - `{{$uuid}}`, `{{$randomInt 1 100}}`
   - `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$localDatetime}}`
