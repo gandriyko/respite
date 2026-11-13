@@ -331,6 +331,7 @@ pub fn exec_options(s: &Settings) -> http_exec::Options {
         timeout: (s.request.timeout_ms > 0).then(|| std::time::Duration::from_millis(s.request.timeout_ms)),
         follow_redirects: s.request.follow_redirects,
         max_redirects: s.request.max_redirects,
+        insecure: s.request.insecure,
     }
 }
 

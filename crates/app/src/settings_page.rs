@@ -223,6 +223,7 @@ impl Render for SettingsWindow {
             .child(Self::row(&l, "Default timeout, ms", "request.timeout_ms", Input::new(&self.timeout_input).w(px(160.)).into_any_element(), cx))
             .child(Self::row(&l, "Follow redirects", "request.follow_redirects", switch("request.follow_redirects", s.request.follow_redirects, cx), cx))
             .child(Self::row(&l, "Max redirects", "request.max_redirects", Self::stepper("request.max_redirects", s.request.max_redirects as f64, 1., 0., 50., cx), cx))
+            .child(Self::row(&l, "Skip TLS certificate verification", "request.insecure", switch("request.insecure", s.request.insecure, cx), cx))
             .child(section("History"))
             .child(Self::row(&l, "Entries per request", "history.per_request", Self::stepper("history.per_request", s.history.per_request as f64, 10., 0., 1000., cx), cx))
             .child(Self::row(&l, "Entries in total", "history.total", Self::stepper("history.total", s.history.total as f64, 100., 0., 10000., cx), cx))

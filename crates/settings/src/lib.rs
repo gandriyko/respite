@@ -98,6 +98,8 @@ pub struct Request {
     pub timeout_ms: u64,
     pub follow_redirects: bool,
     pub max_redirects: usize,
+    /// Skip TLS certificate checks for all requests (self-signed, expired, wrong host).
+    pub insecure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,7 +172,7 @@ impl Default for Editor {
 
 impl Default for Request {
     fn default() -> Self {
-        Self { timeout_ms: 0, follow_redirects: true, max_redirects: 10 }
+        Self { timeout_ms: 0, follow_redirects: true, max_redirects: 10, insecure: false }
     }
 }
 

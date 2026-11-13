@@ -122,11 +122,13 @@ pub struct Options {
     /// `# @no-redirect` still wins.
     pub follow_redirects: bool,
     pub max_redirects: usize,
+    /// Skip TLS certificate checks for every request, as if each had `# @insecure`.
+    pub insecure: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { timeout: None, follow_redirects: true, max_redirects: 10 }
+        Self { timeout: None, follow_redirects: true, max_redirects: 10, insecure: false }
     }
 }
 
@@ -475,7 +477,7 @@ async fn send(
     // so no connection reuse between runs; cache clients by settings if latency matters.
     let mut builder = reqwest::Client::builder()
         .redirect(redirect)
-        .danger_accept_invalid_certs(has("insecure"));
+        .danger_accept_invalid_certs(options.insecure || has("insecure"));
     if !has("no-cookie-jar") {
         builder = builder.cookie_provider(cookies);
     }
