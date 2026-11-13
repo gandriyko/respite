@@ -26,6 +26,7 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 - ⚡ **Native and GPU-rendered.** Built in Rust on [GPUI](https://www.gpui.rs), the UI framework behind Zed.
 - 🧰 **GUI and CLI.** The same files run from the desktop app, a terminal or CI, and the CLI can print JSON for scripts and AI agents.
 - 📥 **Bring your collections.** Import from Postman, Insomnia, OpenAPI / Swagger, Bruno, HAR and cURL.
+- 🔐 **Works behind real auth.** OAuth 2.0 (including the browser and device flows), client certificates and corporate proxies, configured in the same env files.
 
 ## Features
 
@@ -34,7 +35,8 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 | **Editor** | `.http` syntax highlighting (JSON, XML, GraphQL and JS bodies), completion, diagnostics with quick fixes, rename, live templates, folding; a syntax reference with runnable examples (<kbd>F1</kbd>) |
 | **Response** | Body, headers, cookies, the request as sent, timeline (redirects, time to first byte, download); multi-MB bodies, images, JSONPath filter, run history ‹ › with diff, pin |
 | **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
-| **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings; client certificates, extra CAs and a proxy |
+| **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings |
+| **Auth & network** | OAuth 2.0 via `{{$auth.token("id")}}` (Client Credentials, Password, Authorization Code + PKCE in the system browser, Device Authorization) with cached, refreshed tokens; client certificates (mTLS) and extra CAs per environment; system or custom proxy. Configured the JetBrains way, so files stay portable |
 | **Tests** | `# @assert status == 201`, `# @assert body $.id exists`, `# @assert duration < 500ms`: httpyac's operators, written as comments so the file still runs in VS Code and JetBrains; results in the Tests tab, `respite run` exits 1 on a failure |
 | **History** | Every run is stored per project: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
@@ -313,6 +315,8 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 - [x] Declarative assertions (`# @assert`)
 - [ ] Pre-request and test scripts, JUnit output
 - [x] OAuth 2.0: Client Credentials, Password, Authorization Code + PKCE, Device Authorization, refresh tokens (`$auth.token`)
+- [x] Client certificates (mTLS), extra trusted CAs, proxy settings
+- [ ] P12/PFX certificates and passphrase-protected keys
 - [ ] WebSocket, SSE, gRPC; AWS SigV4 auth
 
 ## License

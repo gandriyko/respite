@@ -1,6 +1,6 @@
 ---
 name: respite
-description: Send HTTP requests and test an API with the Respite CLI and plain `.http` files (VS Code REST Client / JetBrains syntax), including declarative `# @assert` checks, environments, request chaining, imports from Postman / Insomnia / OpenAPI / Bruno / HAR and cURL conversion. Use when the user asks to call, try, smoke-test or regression-test an HTTP endpoint, write or fix `.http` / `.rest` files, import an API collection, or check an API in CI, and `respite` is installed or the project has `.http` files.
+description: Send HTTP requests and test an API with the Respite CLI and plain `.http` files (VS Code REST Client / JetBrains syntax), including declarative `# @assert` checks, environments, request chaining, OAuth 2.0 tokens (`$auth.token`), client certificates (mTLS), custom CAs and proxies, imports from Postman / Insomnia / OpenAPI / Bruno / HAR and cURL conversion. Use when the user asks to call, try, smoke-test or regression-test an HTTP endpoint (also one behind OAuth, mTLS or a corporate proxy), write or fix `.http` / `.rest` files or their env files, import an API collection, or check an API in CI, and `respite` is installed or the project has `.http` files.
 ---
 
 # Respite: HTTP requests and API tests from `.http` files
@@ -13,8 +13,12 @@ From an agent, use the CLI only; never launch the GUI.
 - Pass `--non-interactive` to `run`: otherwise a `@prompt` or `@note` waits for input.
 - Pass `--output json` (or `jsonl`) when you read the result; without a TTY JSON is the default.
 - Before sending anything with side effects, check it with `--dry-run` or `show --resolved`.
-- Never write secrets into `.http` files; use environment files (below).
+- Never write secrets into `.http` files; use environment files (below). Client secrets,
+  passwords and `SSLConfiguration` belong in `respite-<env>.private.json`.
 - After editing a `.http` file, run `respite check` on it.
+- A network error carries its cause, for example "connection refused" or "certificate
+  required". Read it before changing the request: a TLS or proxy problem is fixed in the env
+  file or the settings, not in the `.http` file.
 
 ## Commands
 
