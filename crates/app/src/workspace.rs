@@ -123,9 +123,17 @@ pub use http_env::is_env_file;
 /// `.gitignore`. Private env files are usually git-ignored, so they are added back.
 pub fn scan(root: &Path) -> Vec<PathBuf> {
     // ponytail: depth cap guards against a root like $HOME; raise if real projects nest deeper.
+    // Editor folders are hidden and usually git-ignored, yet people keep personal requests
+    // there — walk them without filters.
+    // ponytail: only at the root; nested `.vscode` in monorepo subprojects stays skipped.
+    let editor_dirs = [".vscode", ".idea"].map(|d| root.join(d));
+    let editor = editor_dirs.iter().filter(|d| d.is_dir()).flat_map(|d| {
+        ignore::WalkBuilder::new(d).standard_filters(false).max_depth(Some(8)).build()
+    });
     let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .max_depth(Some(8))
         .build()
+        .chain(editor)
         .flatten()
         .map(|e| e.into_path())
         .filter(|p| p.is_file() && (p.extension().is_some_and(|e| e == "http" || e == "rest") || is_env_file(p)))
@@ -195,15 +203,17 @@ mod tests {
         let r = cur.path();
         std::fs::create_dir_all(r.join("api/v2")).unwrap();
         std::fs::create_dir_all(r.join("ignored")).unwrap();
+        std::fs::create_dir_all(r.join(".vscode")).unwrap();
+        std::fs::create_dir_all(r.join(".hidden")).unwrap();
         for f in [
-            "a.http", "api/v2/b.rest", "api/notes.txt", "ignored/c.http", "package.json",
+            "a.http", "api/v2/b.rest", "api/notes.txt", "ignored/c.http", "package.json", ".vscode/d.http", ".hidden/e.http",
             "http-client.env.json", "http-client.private.env.json", "respite-dev.json", "respite-dev.private.json",
         ] {
             std::fs::write(r.join(f), "").unwrap();
         }
-        std::fs::write(r.join(".gitignore"), "ignored/\n*.private.*\n").unwrap();
+        std::fs::write(r.join(".gitignore"), "ignored/\n*.private.*\n.vscode/\n").unwrap();
         std::fs::create_dir(r.join(".git")).unwrap(); // .gitignore applies inside a git repo
         let rel: Vec<_> = scan(r).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect();
-        assert_eq!(rel, ["a.http", "api/v2/b.rest", "respite-dev.json", "respite-dev.private.json"]);
+        assert_eq!(rel, [".vscode/d.http", "a.http", "api/v2/b.rest", "respite-dev.json", "respite-dev.private.json"]);
     }
 }
