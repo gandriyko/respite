@@ -6,10 +6,11 @@ use std::{fmt::Write as _, path::Path, sync::Arc};
 
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size, WindowExt as _,
     button::{Button, ButtonVariants as _},
     diff::{Diff, DiffFile, DiffMode, DiffState},
     input::{Editor, Input},
+    progress::ProgressCircle,
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -72,11 +73,16 @@ pub fn body_view(r: &Response, raw: bool, filter: &str, limits: &Limits) -> Body
     BodyView::Text(lang, cap(pretty.unwrap_or_else(|| text.to_string())))
 }
 
-/// The editor's layout can't take megabytes of text without freezing; the rest is in Save.
-// ponytail: plain cap; a virtualized viewer (`uniform_list`) when big bodies need reading.
+/// Soft wrap measures every line on the UI thread when the text is set (measured: ~3 s for
+/// 23 MB of pretty JSON, ~0.15 s unwrapped); bigger bodies don't wrap.
+pub const WRAP_MAX: usize = 1024 * 1024;
+
+/// The editor lays out only the visible lines, but each of them whole: a megabytes-long line
+/// (minified JSON shown raw) freezes it. Any number of short lines is fine; a body with a
+/// too-long line is cut, and Save has all of it.
 fn cap(text: String) -> String {
     const CAP: usize = 256 * 1024;
-    if text.len() <= CAP {
+    if text.len() <= CAP || text.lines().all(|l| l.len() <= CAP) {
         return text;
     }
     let end = (0..=CAP).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
@@ -417,12 +423,21 @@ impl Respite {
             let mb = |m: f64| (m * 1024. * 1024.) as usize;
             let limits = Limits { format: mb(s.format_limit_mb), preview: mb(s.preview_limit_mb) };
             (self.body_json, self.body_other) = (false, None);
+            let wrap = s.soft_wrap;
             match body_view(&ex.response, self.raw, &filter, &limits) {
                 BodyView::Text(lang, text) => {
                     self.body_json = lang == "json";
+                    let wrap = wrap && text.len() <= WRAP_MAX;
                     self.resp_body.update(cx, |s, cx| {
                         s.set_highlighter(SharedString::from(lang), cx);
+                        // Wrapping is the slow part: off before a big text, on only after a small one.
+                        if !wrap {
+                            s.set_soft_wrap(false, window, cx);
+                        }
                         s.set_value(text, window, cx);
+                        if wrap {
+                            s.set_soft_wrap(true, window, cx);
+                        }
                     });
                 }
                 BodyView::Image(f) => self.body_other = Some(BodyOther::Image(Arc::new(gpui::Image::from_bytes(f, ex.response.body.clone())))),
@@ -570,12 +585,18 @@ impl Respite {
                     })
                 });
                 let wrap_on = self.settings.settings.response.soft_wrap;
+                let too_big = body_tab && view.read(cx).text().len() > WRAP_MAX;
                 let wrap = Button::new("response-wrap")
                     .label("Wrap")
                     .ghost()
                     .xsmall()
-                    .selected(wrap_on)
-                    .tooltip(if wrap_on { "Long lines wrap — click to scroll them instead" } else { "Long lines scroll — click to wrap them" })
+                    .selected(wrap_on && !too_big)
+                    .disabled(too_big)
+                    .tooltip(match (too_big, wrap_on) {
+                        (true, _) => "Bodies over 1 MB don't wrap: wrapping them freezes the app",
+                        (_, true) => "Long lines wrap — click to scroll them instead",
+                        _ => "Long lines scroll — click to wrap them",
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| this.set("response.soft_wrap", (!wrap_on).into(), window, cx)));
                 let raw = (body_tab && self.body_other.is_none()).then(|| {
                     Button::new("response-raw")
@@ -624,6 +645,19 @@ impl Respite {
         let ex = match status {
             Some(Status::Done(ex)) => ex,
             Some(Status::Failed(e)) => return panel.child(div().text_sm().text_color(t.danger).child(e)).into_any_element(),
+            // ponytail: covers the wait for the server; showing the body (≤ ~0.2 s, measured) runs on
+            // the UI thread, where nothing animates.
+            Some(Status::Running) => {
+                let waiting = v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .child(ProgressCircle::new("waiting").loading(true).color(t.primary).with_size(Size::Size(t.font_size * 4.)))
+                    .child(div().text_sm().text_color(muted).child("Waiting for the response…"))
+                    .child(div().text_xs().text_color(muted).child("Esc to stop"));
+                return panel.child(waiting).into_any_element();
+            }
             _ => return panel.into_any_element(),
         };
 
@@ -682,7 +716,7 @@ impl Respite {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
-    use super::{BodyView, Limits, body_view, cookies_text, diff, path_at};
+    use super::{BodyView, Limits, body_view, cap, cookies_text, diff, path_at};
     use gpui::ImageFormat;
     use http_exec::Response;
 
@@ -718,6 +752,15 @@ mod tests {
         let small = Limits { format: 2, preview: 4 };
         assert!(matches!(body_view(&resp("text/plain", b"hello"), false, "", &small), BodyView::TooBig));
         assert_eq!(text(body_view(&resp("application/json", b"{\"a\":1}"), false, "", &Limits { format: 2, preview: 100 })).1, "{\"a\":1}");
+    }
+
+    #[test]
+    fn caps_only_long_lines() {
+        let short_lines = "{\"id\": 1},\n".repeat(100_000); // ~1 MB of short lines: kept whole
+        assert_eq!(cap(short_lines.clone()), short_lines);
+        let one_line = "x".repeat(1 << 20); // 1 MB on one line: cut
+        let cut = cap(one_line);
+        assert!(cut.len() < 300 * 1024 && cut.ends_with("Save shows all of it)"));
     }
 
     #[test]

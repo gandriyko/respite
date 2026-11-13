@@ -480,7 +480,10 @@ impl Respite {
             exec.set_options(respite_cli::exec_options(&s));
         }
         for view in [&self.resp_body, &self.resp_meta] {
-            view.update(cx, |e, cx| e.set_soft_wrap(s.response.soft_wrap, window, cx));
+            view.update(cx, |e, cx| {
+                let wrap = s.response.soft_wrap && e.text().len() <= response::WRAP_MAX;
+                e.set_soft_wrap(wrap, window, cx)
+            });
         }
         for e in keymap::apply(s.keymap, keymap_path(&self.settings).as_deref(), cx) {
             notify_later(window, cx, e);
