@@ -126,6 +126,8 @@ struct Respite {
     close_armed: Option<PathBuf>,
     /// What Cmd+Alt+L sends again: the file and its request lines.
     last_run: Option<(PathBuf, Vec<usize>)>,
+    /// Files being dragged in from Finder; taken on mouse up (see `file_drop`).
+    dragged: Option<Vec<PathBuf>>,
     /// The running "run all / selected" sequence; dropping it stops the rest.
     batch: Option<Task<()>>,
     /// Re-renders the open search dialog (Cmd+P …) as its query changes.
@@ -314,6 +316,7 @@ impl Respite {
             sidebar: true,
             close_armed: None,
             last_run: None,
+            dragged: None,
             batch: None,
             picker_sub: None,
             resp_body: readonly(false, window, cx),
@@ -1297,6 +1300,8 @@ impl Render for Respite {
             // The sidebar, the editor and the response float on it as cards.
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ExternalPaths>, _, cx| this.dragged = Some(e.drag(cx).paths().to_vec())))
+            .child(self.file_drop(cx))
             .on_action(cx.listener(|this, _: &RunRequest, window, cx| {
                 if let (Some(ix), Some(line)) = (this.current, this.doc().and_then(|d| d.cursor_request(cx)).map(|r| r.request_line)) {
                     this.send(ix, vec![line], window, cx);
@@ -1403,6 +1408,43 @@ impl Render for Respite {
                     .child(resizable_panel().size(px(260.)).size_range(px(160.)..px(520.)).visible(self.sidebar).child(sidebar))
                     .child(resizable_panel().child(self.editor_and_response(center, window, cx))),
             )
+    }
+}
+
+impl Respite {
+    /// `.http` / `.rest` dragged in from Finder: listed and opened, like the Files `+`.
+    ///
+    /// Not `on_drop`: gpui drops it when the last input was a key (a Finder drag doesn't switch
+    /// the window to mouse input, so nothing counts as hovered). `on_drag_move` has no hover
+    /// check and keeps the paths; a window-wide mouse-up listener takes them.
+    fn file_drop(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let this = this.clone();
+                // A real mouse down starts some other gesture: a drag that left the window is over.
+                window.on_mouse_event({
+                    let this = this.clone();
+                    move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            this.update(cx, |this, _| this.dragged = None).ok();
+                        }
+                    }
+                });
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture || !cx.has_active_drag() {
+                        return;
+                    }
+                    let Some(this) = this.upgrade() else { return };
+                    let Some(paths) = this.update(cx, |this, _| this.dragged.take()) else { return };
+                    cx.stop_active_drag(window);
+                    this.update(cx, |this, cx| this.add_paths(paths, window, cx));
+                });
+            },
+        )
+        .absolute()
+        .size_0()
     }
 }
 

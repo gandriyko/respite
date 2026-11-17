@@ -95,24 +95,27 @@ impl Respite {
         let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Add".into()) });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
-            this.update_in(cx, |this, window, cx| {
-                // ponytail: the system dialog has no extension filter here; other files are skipped after.
-                let (ok, skipped): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| workspace::is_request_file(p));
-                if !skipped.is_empty() {
-                    window.push_notification(format!("Skipped {} file(s): only .http and .rest", skipped.len()), cx);
-                }
-                let first = ok.first().cloned();
-                for p in ok {
-                    this.add_file(p);
-                }
-                if let Some(p) = first {
-                    this.open(p, None, window, cx);
-                }
-                cx.notify();
-            })
-            .ok();
+            this.update_in(cx, |this, window, cx| this.add_paths(paths, window, cx)).ok();
         })
         .detach();
+    }
+
+    /// Lists and opens the `.http` / `.rest` files among `paths` (the `+` dialog, or files dropped
+    /// on the window); the rest are skipped with a notice.
+    pub(crate) fn add_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        // ponytail: the system dialog has no extension filter here; other files are skipped after.
+        let (ok, skipped): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| workspace::is_request_file(p));
+        if !skipped.is_empty() {
+            window.push_notification(format!("Skipped {} file(s): only .http and .rest", skipped.len()), cx);
+        }
+        let first = ok.first().cloned();
+        for p in ok {
+            self.add_file(p);
+        }
+        if let Some(p) = first {
+            self.open(p, None, window, cx);
+        }
+        cx.notify();
     }
 
     /// List `path` in the Files section, unless it's there already or under the central folder.
