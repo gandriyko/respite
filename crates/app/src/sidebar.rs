@@ -417,7 +417,7 @@ impl Respite {
         let size = cx.theme().font_size * 0.95;
         let (d1, d2, d3) = (dir.to_path_buf(), dir.to_path_buf(), dir.to_path_buf());
         [
-            row_action(("import", ix), Icon::default().data(include_bytes!("../assets/import.svg")).size(size), "Import Files…", always, cx).on_click(
+            row_action(("import", ix), Icon::default().data(include_bytes!("../assets/file-down.svg")).size(size), "Import Files…", always, cx).on_click(
                 cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.import_into(d3.clone(), window, cx);
