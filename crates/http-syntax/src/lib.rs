@@ -319,7 +319,9 @@ fn parse_block(
         let t = lines[i].trim();
         if t.is_empty() {
         } else if let Some(c) = comment(t) {
-            if let Some(d) = c.strip_prefix('@').filter(|d| !d.is_empty()) {
+            // `# @var=value` is a commented-out file variable, not a directive.
+            let commented_var = file_variable(c).is_some_and(|(n, _)| !DIRECTIVES.contains(&n));
+            if let Some(d) = c.strip_prefix('@').filter(|d| !d.is_empty() && !commented_var) {
                 let (name, value) = match d.split_once(char::is_whitespace) {
                     Some((n, v)) => (n, Some(v.trim().to_string()).filter(|v| !v.is_empty())),
                     None => (d, None),
@@ -525,6 +527,14 @@ mod tests {
             (17, "duplicate_name"),
             (19, "scripts_not_supported"),
         ]);
+    }
+
+    #[test]
+    fn commented_out_variable_is_a_comment() {
+        let f = parse("# @user_id=test_delete\n@token=abc\nGET /a\n");
+        assert!(f.diagnostics.is_empty());
+        assert!(f.requests[0].directives.is_empty());
+        assert_eq!(f.variables.len(), 1);
     }
 
     #[test]
