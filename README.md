@@ -263,7 +263,31 @@ Authorization: Bearer {{token}}
 
 Env files next to `.http` files are not read. In CI, where there is no `~/.config/respite`, pass them with `--env-file`. 
 
-Two folders, kept apart on purpose: `~/.config/respite` holds what you write (settings, keymap, `collections/`, environments in `env/`), `~/.respite` what the app writes (history, cookies and OAuth tokens per environment in `history/`, the added files list, the last open file). The second one holds tokens and response bodies, so keep it out of a dotfiles repo.
+## Where files live
+
+Two folders, kept apart on purpose: one for what you write, one for what the app writes.
+
+```text
+~/.config/respite/          what you write; fine for a dotfiles repo, unless env/ holds real secrets
+  settings.json             settings (the Settings page edits it)
+  keymap.json               your key bindings over the defaults (optional)
+  collections/              the sidebar's Collections: .http / .rest files, any subfolders
+  env/                      environments, one flat JSON file each, for every .http file anywhere
+    respite.json            values shared by all environments
+    respite-dev.json        …
+
+~/.respite/                 what the app writes; holds tokens and response bodies, keep it private
+  files.json                the sidebar's Files: paths of .http files added from elsewhere
+  state.json                the last open file and cursor, reopened on launch
+  history/                  every run: <time>-<request>.json (request, response, timings)
+                            and <time>-<request>.body (raw response body)
+    cookies.<env>.json      cookie jar per environment (cookies._.json without one)
+    oauth.<env>.json        OAuth tokens per environment
+```
+
+- **Collections** are plain files and folders, so Finder, an editor or git work on them too. The trash button moves them to the Trash.
+- **Files** stay where they are, for example in a repository; Respite keeps only their paths. **×** drops one from the list, the file is untouched.
+- **History** names a file relative to `collections/` when it lives there, by full path otherwise, so moving the whole `collections/` folder keeps it.
 
 ## Project layout
 
