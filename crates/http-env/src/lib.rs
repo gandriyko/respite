@@ -188,15 +188,15 @@ impl Environments {
     }
 }
 
-/// `~/.config/respite`: the central folder. Next to `settings.json` it holds the collections
-/// (`.http` files, in subfolders as the user likes) and [`env_dir`].
+/// `~/.config/respite/collections`: the central folder of `.http` files, in subfolders as the
+/// user likes. Its siblings: `settings.json`, the keymap and [`env_dir`].
 pub fn collections_dir() -> Option<PathBuf> {
-    Some(std::env::home_dir()?.join(".config/respite"))
+    Some(std::env::home_dir()?.join(".config/respite/collections"))
 }
 
 /// `~/.config/respite/env`: every environment, for every `.http` file wherever it lives.
 pub fn env_dir() -> Option<PathBuf> {
-    Some(collections_dir()?.join("env"))
+    Some(std::env::home_dir()?.join(".config/respite/env"))
 }
 
 /// Undefined `{{variables}}`, unknown `{{name.response…}}` requests, cycles and bad `{{$…}}`,

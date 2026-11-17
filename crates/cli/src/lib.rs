@@ -55,7 +55,7 @@ enum Cmd {
     Import {
         /// Export file, spec, or Bruno collection folder
         path: PathBuf,
-        /// Where the new folder goes (default: ~/.config/respite)
+        /// Where the new folder goes (default: ~/.config/respite/collections)
         #[arg(long)]
         to: Option<PathBuf>,
         #[arg(long, value_enum)]

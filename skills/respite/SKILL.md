@@ -31,7 +31,7 @@ Requests are addressed by `@name`, `###` title, `:LINE` (any line of the block) 
 | `respite show FILE REQUEST [--resolved]` | The request block; `--resolved` substitutes variables |
 | `respite run FILE [REQUESTS]...` | Send requests (none named = all, in file order) |
 | `respite check [PATHS]...` | Diagnostics only, sends nothing (pre-commit / CI) |
-| `respite import PATH [--to DIR]` | Postman / Insomnia / OpenAPI / Swagger / Bruno folder / HAR → `.http` files in a new folder (default under `~/.config/respite`), its environments into the env folder |
+| `respite import PATH [--to DIR]` | Postman / Insomnia / OpenAPI / Swagger / Bruno folder / HAR → `.http` files in a new folder (default under `~/.config/respite/collections`), its environments into the env folder |
 | `respite import-curl` | cURL command(s) from stdin → request block(s) |
 | `respite export-curl FILE REQUEST [--raw]` | Request → cURL; `--raw` keeps `{{variables}}` |
 | `respite env list` | Environment names |

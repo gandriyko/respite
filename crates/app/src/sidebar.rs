@@ -32,7 +32,7 @@ const CHEVRON: f32 = 14.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Section {
-    /// `~/.config/respite`
+    /// `~/.config/respite/collections`
     Collections,
     /// Added from elsewhere.
     Files,

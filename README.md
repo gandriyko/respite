@@ -40,7 +40,7 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 | **Tests** | `# @assert status == 201`, `# @assert body $.id exists`, `# @assert duration < 500ms`: httpyac's operators, written as comments so the file still runs in VS Code and JetBrains; results in the Tests tab, `respite run` exits 1 on a failure |
 | **History** | Every run is stored: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
-| **Workspace** | Collections in `~/.config/respite` (with subfolders) plus `.http` files added from anywhere, light and dark themes, settings, state restored on launch |
+| **Workspace** | Collections in `~/.config/respite/collections` (with subfolders) plus `.http` files added from anywhere, light and dark themes, settings, state restored on launch |
 
 ## Quick start
 
@@ -89,7 +89,7 @@ You need a recent stable Rust toolchain (edition 2024); see [Development setup](
 
 The sidebar has two parts:
 
-- **Collections**: the central folder, `~/.config/respite`. Create files and folders there from the sidebar (hover a folder for its buttons); the trash button moves a file or folder to the Trash (a folder asks first). A folder's import button (or File > Import…) takes several picks at once: `.http` / `.rest` files are copied in, and Postman, Insomnia, OpenAPI, Bruno and HAR exports each become a folder, keeping their subfolders.
+- **Collections**: the central folder, `~/.config/respite/collections`. Create files and folders there from the sidebar (hover a folder for its buttons); the trash button moves a file or folder to the Trash (a folder asks first). A folder's import button (or File > Import…) takes several picks at once: `.http` / `.rest` files are copied in, and Postman, Insomnia, OpenAPI, Bruno and HAR exports each become a folder, keeping their subfolders.
 - **Files**: `.http` / `.rest` files that live elsewhere, for example in a repository. **+** adds them (several at once), or drag them from Finder onto the window; **×** drops one from the list without touching the file.
 
 Run `respite file.http` to open a file; it joins the Files list. Each file picks its environment with `# @env dev` on its first line, and the environment menu above the editor writes that line for you.
@@ -263,7 +263,7 @@ Authorization: Bearer {{token}}
 
 Env files next to `.http` files are not read. In CI, where there is no `~/.config/respite`, pass them with `--env-file`. 
 
-Two folders, kept apart on purpose: `~/.config/respite` holds what you write (settings, keymap, collections, environments), `~/.respite` what the app writes (history, cookies and OAuth tokens per environment in `history/`, the added files list, the last open file). The second one holds tokens and response bodies, so keep it out of a dotfiles repo.
+Two folders, kept apart on purpose: `~/.config/respite` holds what you write (settings, keymap, `collections/`, environments in `env/`), `~/.respite` what the app writes (history, cookies and OAuth tokens per environment in `history/`, the added files list, the last open file). The second one holds tokens and response bodies, so keep it out of a dotfiles repo.
 
 ## Project layout
 
@@ -292,7 +292,7 @@ brew install rust cmake librsvg
 
 git clone git@github.com:gandriyko/respite.git
 cd respite
-cargo run -p respite                      # the app, opening ~/.config/respite
+cargo run -p respite                      # the app, opening ~/.config/respite/collections
 cargo run -p respite -- path/to/api.http  # the app on a file or folder
 cargo run -p respite -- run api.http      # the CLI
 ```

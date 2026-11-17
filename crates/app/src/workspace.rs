@@ -1,4 +1,4 @@
-//! What the sidebar shows: the central folder (`~/.config/respite`, with subfolders) and the
+//! What the sidebar shows: the central folder (`~/.config/respite/collections`, with subfolders) and the
 //! `.http` / `.rest` files added from elsewhere.
 //!
 //! The added files are listed in `~/.respite/files.json` (a JSON array of paths). Removing one
@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// `~/.config/respite`: collections live here, environments in its `env/` subfolder.
+/// `~/.config/respite/collections`; environments are next to it, in `~/.config/respite/env`.
 pub fn collections_dir() -> PathBuf {
     http_env::collections_dir().unwrap_or_default()
 }
@@ -59,15 +59,12 @@ pub fn save_last_file(base: Option<&Path>, path: &Path, line: u32, column: u32) 
 
 pub use http_env::is_env_file;
 
-/// Folders and `.http` / `.rest` files under the central folder `root`, sorted; the `env`
-/// folder (environments, edited from the environment menu) is left out. Folders are listed
-/// so that an empty new one shows up.
+/// Folders and `.http` / `.rest` files under the central folder `root`, sorted. Folders are
+/// listed so that an empty new one shows up.
 pub fn scan(root: &Path) -> Vec<PathBuf> {
-    let env = root.join("env");
     // ponytail: depth cap guards against a runaway tree; raise if real collections nest deeper.
     let mut found: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .max_depth(Some(8))
-        .filter_entry(move |e| e.path() != env)
         .build()
         .flatten()
         .map(|e| e.into_path())
@@ -97,10 +94,10 @@ mod tests {
         assert_eq!(last_opened(Some(base.path())), None); // deleted file is not reopened
 
         let r = other.path();
-        for d in ["api/v2", "empty", "env", ".hidden"] {
+        for d in ["api/v2", "empty", ".hidden"] {
             std::fs::create_dir_all(r.join(d)).unwrap();
         }
-        for f in ["b.http", "api/v2/c.rest", "api/notes.txt", "env/respite-dev.json", ".hidden/d.http", "settings.json"] {
+        for f in ["b.http", "api/v2/c.rest", "api/notes.txt", ".hidden/d.http"] {
             std::fs::write(r.join(f), "").unwrap();
         }
         let rel: Vec<_> = scan(r).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect();
