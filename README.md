@@ -229,6 +229,12 @@ respite run api.http --env staging --fail-fast
 
 [`skills/respite/SKILL.md`](skills/respite/SKILL.md) teaches a coding agent (Claude Code, Codex and others that read Agent Skills) to send requests and test an API through the CLI. Copy the folder into the agent's skills directory, for example `~/.claude/skills/respite`.
 
+For clients that talk MCP instead of running commands, `respite mcp` is a stdio MCP server with the same commands as tools (`list`, `run`, `check`, `show`, `env_show`, …). Each tool runs the CLI command with JSON output, so the results, masking and exit codes are the same. Nothing opens on screen.
+
+```sh
+claude mcp add respite -- respite mcp
+```
+
 ## Environments
 
 One flat file per environment, found in every folder from the workspace root down to the `.http` file (deeper folders win). `respite.json` holds values shared by all environments.
@@ -311,7 +317,7 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 - [x] Navigation: <kbd>⌘</kbd> <kbd>P</kbd>, go to request, command palette, breadcrumbs
 - [x] Autocompletion and inline diagnostics in the editor
 - [ ] Timeline: DNS, TCP and TLS phases
-- [ ] MCP server for AI agents
+- [x] MCP server for AI agents (`respite mcp`)
 - [x] Declarative assertions (`# @assert`)
 - [ ] Pre-request and test scripts, JUnit output
 - [x] OAuth 2.0: Client Credentials, Password, Authorization Code + PKCE, Device Authorization, refresh tokens (`$auth.token`)

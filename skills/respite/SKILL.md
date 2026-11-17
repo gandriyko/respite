@@ -38,6 +38,7 @@ Requests are addressed by `@name`, `###` title, `:LINE` (any line of the block) 
 | `respite auth token ID [--force] [--dir DIR]` | OAuth 2.0 token of a config: cached while fresh, else refreshed or acquired; `--force` runs the full grant |
 | `respite auth clear [--env NAME] [--dir DIR]` | Forget the cached OAuth 2.0 tokens of one environment |
 | `respite history [--last N]` | Past executions of this workspace (default 20) |
+| `respite mcp` | MCP server on stdio (see below) |
 
 `list`, `check`, `import`, `env`, `history` and `run` take `--output human|json|jsonl`.
 
@@ -78,6 +79,17 @@ Exit codes:
 `request` (method, url, headers), `response` (status, reason, http_version, headers, body,
 size_bytes), `timing_ms`, `tests`, `dependencies`, `history_id`, `warnings`, or `error`.
 Values of secret variables are masked.
+
+### MCP server
+
+`respite mcp` serves the same commands as MCP tools over stdio, for clients without a shell:
+`list`, `check`, `show`, `run`, `export_curl`, `import`, `import_curl`, `env_list`,
+`env_show`, `history`. Arguments mirror the flags (`dry_run`, `fail_on_status`, …); `vars` is
+an object instead of repeated `--var`. Each tool returns the command's JSON output; a non-zero
+exit code sets `isError` and is appended to the text. `run` is always non-interactive.
+Relative paths resolve against the directory the client starts the server in. History marks
+these runs `mcp`. Register it, for example in Claude Code:
+`claude mcp add respite -- respite mcp`.
 
 ## File syntax
 

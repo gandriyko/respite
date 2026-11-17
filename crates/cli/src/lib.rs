@@ -3,6 +3,7 @@
 //! 3 parse error / undefined variable / bad input · 4 refused (confirmation needed).
 
 mod curl;
+mod mcp;
 mod run;
 
 use std::collections::HashMap;
@@ -83,6 +84,8 @@ enum Cmd {
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
+    /// MCP server on stdio for AI agents (tools: list, run, check, …)
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -160,7 +163,7 @@ impl Format {
 /// The GUI binary calls this first; `None` means "not a CLI command, open the GUI".
 pub fn main_if_cli() -> Option<ExitCode> {
     const COMMANDS: &[&str] = &[
-        "list", "show", "run", "import", "import-curl", "export-curl", "check", "env", "auth", "history", "help", "--help", "-h", "--version",
+        "list", "show", "run", "import", "import-curl", "export-curl", "check", "env", "auth", "history", "mcp", "help", "--help", "-h", "--version",
         "-V",
     ];
     let first = std::env::args().nth(1)?;
@@ -175,7 +178,7 @@ pub fn main_if_cli() -> Option<ExitCode> {
         Cmd::Env { cmd: EnvCmd::List { output, .. } | EnvCmd::Show { output, .. } } => Format::resolve(*output),
         Cmd::Auth { cmd: AuthCmd::Token { output, .. } } => Format::resolve(*output),
         Cmd::Run(a) => Format::resolve(a.output),
-        Cmd::Show { .. } | Cmd::ImportCurl(_) | Cmd::ExportCurl(_) | Cmd::Auth { cmd: AuthCmd::Clear { .. } } => Format::Human,
+        Cmd::Show { .. } | Cmd::Mcp | Cmd::ImportCurl(_) | Cmd::ExportCurl(_) | Cmd::Auth { cmd: AuthCmd::Clear { .. } } => Format::Human,
     } == Format::Human;
     Some(match dispatch(cli) {
         Ok(code) => ExitCode::from(code),
@@ -204,6 +207,7 @@ fn dispatch(cli: Cli) -> Result<u8, CliError> {
             Ok(0)
         }
         Cmd::History { last, output } => history(last, Format::resolve(output)),
+        Cmd::Mcp => Ok(mcp::serve()),
     }
 }
 
@@ -407,7 +411,8 @@ pub fn exec_options(s: &Settings) -> http_exec::Options {
 /// Executor with history (limits from settings) and request defaults.
 pub(crate) fn executor(root: &Path, env: Option<&str>) -> http_exec::Executor {
     let s = settings(root);
-    let exec = http_exec::Executor::new(open_store(root, &s), env, "cli");
+    let source = if std::env::var(mcp::SOURCE_ENV).as_deref() == Ok("mcp") { "mcp" } else { "cli" };
+    let exec = http_exec::Executor::new(open_store(root, &s), env, source);
     exec.set_options(exec_options(&s));
     // Browser and device sign-ins: stdout stays the result, the instructions go to stderr.
     exec.set_auth_ui(http_exec::AuthUi {
