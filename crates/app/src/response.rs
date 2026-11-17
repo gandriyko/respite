@@ -97,6 +97,26 @@ pub fn jsonpath(text: &str, expr: &str) -> Result<String, String> {
     serde_json::to_string_pretty(&found).map_err(|e| e.to_string())
 }
 
+/// Left-to-right mark: invisible, pins a line's direction.
+const LRM: char = '\u{200E}';
+
+/// The text layout picks a line's direction from its first letter, so a line starting with Hebrew
+/// or Arabic (`"דיור",`) is laid out right-to-left: the comma jumps left, the indent goes right.
+/// An LRM in front keeps such lines left-to-right; `strip_ltr` takes it out again on copy.
+pub fn ltr_lines(text: String) -> String {
+    let rtl = |c: char| matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}');
+    if !text.chars().any(rtl) {
+        return text;
+    }
+    text.split_inclusive('\n')
+        .map(|l| if l.chars().find(|c| c.is_alphabetic()).is_some_and(rtl) { format!("{LRM}{l}") } else { l.into() })
+        .collect()
+}
+
+pub fn strip_ltr(text: &str) -> String {
+    text.replace(LRM, "")
+}
+
 /// JSONPath (`$.items[2].id`) of the JSON node at byte `offset` of `text`.
 pub fn path_at(text: &str, offset: usize) -> Option<String> {
     #[derive(Debug)]
@@ -413,7 +433,8 @@ impl Respite {
     /// Right-click → Copy JSON Path: the path of the node under the caret in the body.
     pub(crate) fn copy_json_path(&self, window: &mut Window, cx: &mut App) {
         let (text, at) = self.resp_body.read_with(cx, |s, _| (s.value().to_string(), s.cursor()));
-        let Some(path) = path_at(&text, at) else { return };
+        let at = at - text[..at].matches(LRM).count() * LRM.len_utf8();
+        let Some(path) = path_at(&strip_ltr(&text), at) else { return };
         cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
         window.push_notification(format!("Copied {path}"), cx);
     }
@@ -447,7 +468,7 @@ impl Respite {
                         if !wrap {
                             s.set_soft_wrap(false, window, cx);
                         }
-                        s.set_value(text, window, cx);
+                        s.set_value(ltr_lines(text), window, cx);
                         if wrap {
                             s.set_soft_wrap(true, window, cx);
                         }
@@ -476,7 +497,7 @@ impl Respite {
                 4 => timeline_text(&ex),
                 _ => tests_text(&ex, has_scripts),
             };
-            self.resp_meta.update(cx, |s, cx| s.set_value(text, window, cx));
+            self.resp_meta.update(cx, |s, cx| s.set_value(ltr_lines(text), window, cx));
             self.shown_meta = Some((ptr, self.tab));
         }
     }
@@ -721,7 +742,16 @@ impl Respite {
                     });
                 }
                 let filter = (body_tab && self.body_json).then(|| div().flex_none().py_1().child(Input::new(&self.body_filter).small().cleanable(true)));
-                v_flex().flex_1().min_h_0().child(div().flex_1().min_h_0().child(editor)).children(filter).into_any_element()
+                // Copy without the LRMs `ltr_lines` put in: they aren't JSON whitespace.
+                let copy_view = view.clone();
+                let editor = div().flex_1().min_h_0().child(editor).capture_action(move |_: &gpui_component::input::Copy, _, cx| {
+                    let sel = copy_view.read(cx).selected_value();
+                    if sel.contains(LRM) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(strip_ltr(&sel)));
+                        cx.stop_propagation();
+                    }
+                });
+                v_flex().flex_1().min_h_0().child(editor).children(filter).into_any_element()
             }
         };
         panel.children(deps).child(tabs).child(content).into_any_element()
@@ -731,7 +761,16 @@ impl Respite {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
-    use super::{BodyView, Limits, body_view, cap, cookies_text, diff, path_at};
+    use super::{BodyView, Limits, body_view, cap, cookies_text, diff, ltr_lines, path_at, strip_ltr};
+
+    #[test]
+    fn rtl_lines_pinned_left_to_right() {
+        let text = "[\n  \"דיור\",\n  \"a ש\"\n]".to_string();
+        let shown = ltr_lines(text.clone());
+        assert_eq!(shown, "[\n\u{200E}  \"דיור\",\n  \"a ש\"\n]");
+        assert_eq!(strip_ltr(&shown), text);
+        assert_eq!(ltr_lines("plain".into()), "plain");
+    }
     use gpui::ImageFormat;
     use http_exec::Response;
 
