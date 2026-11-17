@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-/// An acquired token, as cached in `~/.respite/history/<project>/oauth.<env>.json`.
+/// An acquired token, as cached in `~/.respite/history/oauth.<env>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Token {
     /// Hash of the resolved config: a changed Client ID, scope, URL or secret drops the token.

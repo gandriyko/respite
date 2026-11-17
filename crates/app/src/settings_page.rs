@@ -9,7 +9,7 @@ use gpui_component::{
     switch::Switch,
     tab::{Tab, TabBar},
 };
-use respite_settings::{Appearance, Keymap, Loaded, Split};
+use respite_settings::{Appearance, Keymap, Split};
 use serde_json::json;
 
 use crate::{CloseTab, Respite, themes::FAMILIES};
@@ -133,17 +133,9 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    /// Label, control, and a note when the project file overrides the key.
-    fn row(l: &Loaded, label: &str, key: &str, control: AnyElement, cx: &App) -> Div {
-        let note = l.overridden(key).then(|| div().text_xs().text_color(cx.theme().warning).child("overridden by .respite/settings.json"));
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .py_1p5()
-            .child(div().flex().flex_col().child(label.to_string()).children(note))
-            .child(control)
+    /// Label and control.
+    fn row(label: &str, control: AnyElement) -> Div {
+        div().flex().items_center().justify_between().gap_4().py_1p5().child(label.to_string()).child(control)
     }
 
     fn switch(key: &'static str, checked: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -220,51 +212,40 @@ impl Render for SettingsWindow {
             .flex()
             .flex_col()
             .child(section("Appearance"))
-            .child(Self::row(&l, "Theme", "theme", families.into_any_element(), cx))
-            .child(Self::row(&l, "Appearance", "appearance", mode.into_any_element(), cx))
-            .child(Self::row(&l, "Interface font size", "ui_font_size", Self::stepper("ui_font_size", s.ui_font_size as f64, 1., 10., 24., cx), cx))
-            .child(Self::row(&l, "Editor font", "font_family", Input::new(&self.font_input).w(px(260.)).into_any_element(), cx))
-            .child(Self::row(&l, "Editor font size", "font_size", Self::stepper("font_size", s.font_size as f64, 1., 9., 32., cx), cx))
+            .child(Self::row("Theme", families.into_any_element()))
+            .child(Self::row("Appearance", mode.into_any_element()))
+            .child(Self::row("Interface font size", Self::stepper("ui_font_size", s.ui_font_size as f64, 1., 10., 24., cx)))
+            .child(Self::row("Editor font", Input::new(&self.font_input).w(px(260.)).into_any_element()))
+            .child(Self::row("Editor font size", Self::stepper("font_size", s.font_size as f64, 1., 9., 32., cx)))
             .child(section("Editor"))
-            .child(Self::row(&l, "Line numbers", "editor.line_numbers", switch("editor.line_numbers", s.editor.line_numbers, cx), cx))
-            .child(Self::row(&l, "Soft wrap", "editor.soft_wrap", switch("editor.soft_wrap", s.editor.soft_wrap, cx), cx))
-            .child(Self::row(
-                &l,
-                "Highlight the current line",
-                "editor.highlight_current_line",
-                switch("editor.highlight_current_line", s.editor.highlight_current_line, cx),
-                cx,
-            ))
+            .child(Self::row("Line numbers", switch("editor.line_numbers", s.editor.line_numbers, cx)))
+            .child(Self::row("Soft wrap", switch("editor.soft_wrap", s.editor.soft_wrap, cx)))
+            .child(Self::row("Highlight the current line", switch("editor.highlight_current_line", s.editor.highlight_current_line, cx)))
+            .child(Self::row("Run arrow next to each request's line number", switch("editor.send_button", s.editor.send_button, cx)))
             .child(section("Response"))
-            .child(Self::row(&l, "Layout", "split", split.into_any_element(), cx))
-            .child(Self::row(&l, "Pretty-print bodies up to, MB", "response.format_limit_mb", Self::stepper("response.format_limit_mb", s.response.format_limit_mb, 5., 1., 1000., cx), cx))
-            .child(Self::row(&l, "Show bodies up to, MB", "response.preview_limit_mb", Self::stepper("response.preview_limit_mb", s.response.preview_limit_mb, 10., 1., 2000., cx), cx))
+            .child(Self::row("Layout", split.into_any_element()))
+            .child(Self::row("Pretty-print bodies up to, MB", Self::stepper("response.format_limit_mb", s.response.format_limit_mb, 5., 1., 1000., cx)))
+            .child(Self::row("Show bodies up to, MB", Self::stepper("response.preview_limit_mb", s.response.preview_limit_mb, 10., 1., 2000., cx)))
             .child(section("Keyboard"))
-            .child(Self::row(&l, "Extra shortcuts", "keymap", keymap.into_any_element(), cx))
+            .child(Self::row("Extra shortcuts", keymap.into_any_element()))
             .child(div().text_xs().text_color(muted).child("Your own: keymap.json next to the settings file (Zed's format)."))
             .child(section("Requests"))
-            .child(Self::row(&l, "Default timeout, ms", "request.timeout_ms", Input::new(&self.timeout_input).w(px(160.)).into_any_element(), cx))
-            .child(Self::row(&l, "Follow redirects", "request.follow_redirects", switch("request.follow_redirects", s.request.follow_redirects, cx), cx))
-            .child(Self::row(&l, "Max redirects", "request.max_redirects", Self::stepper("request.max_redirects", s.request.max_redirects as f64, 1., 0., 50., cx), cx))
-            .child(Self::row(&l, "Skip TLS certificate verification", "request.insecure", switch("request.insecure", s.request.insecure, cx), cx))
-            .child(Self::row(&l, "Proxy", "request.proxy", Input::new(&self.proxy_input).w(px(260.)).into_any_element(), cx))
-            .child(Self::row(&l, "No proxy for", "request.no_proxy", Input::new(&self.no_proxy_input).w(px(260.)).into_any_element(), cx))
+            .child(Self::row("Default timeout, ms", Input::new(&self.timeout_input).w(px(160.)).into_any_element()))
+            .child(Self::row("Follow redirects", switch("request.follow_redirects", s.request.follow_redirects, cx)))
+            .child(Self::row("Max redirects", Self::stepper("request.max_redirects", s.request.max_redirects as f64, 1., 0., 50., cx)))
+            .child(Self::row("Skip TLS certificate verification", switch("request.insecure", s.request.insecure, cx)))
+            .child(Self::row("Proxy", Input::new(&self.proxy_input).w(px(260.)).into_any_element()))
+            .child(Self::row("No proxy for", Input::new(&self.no_proxy_input).w(px(260.)).into_any_element()))
             .child(div().text_xs().text_color(muted).child(
                 "Empty proxy: the system one (macOS settings, HTTPS_PROXY). Client certificates: SSLConfiguration in an env file.",
             ))
             .child(section("History"))
-            .child(Self::row(&l, "Entries per request", "history.per_request", Self::stepper("history.per_request", s.history.per_request as f64, 10., 0., 1000., cx), cx))
-            .child(Self::row(&l, "Entries in total", "history.total", Self::stepper("history.total", s.history.total as f64, 100., 0., 10000., cx), cx))
+            .child(Self::row("Entries per request", Self::stepper("history.per_request", s.history.per_request as f64, 10., 0., 1000., cx)))
+            .child(Self::row("Entries in total", Self::stepper("history.total", s.history.total as f64, 100., 0., 10000., cx)))
             .child(section("cURL"))
-            .child(Self::row(&l, "Convert cURL on paste", "curl.auto_convert_on_paste", switch("curl.auto_convert_on_paste", s.curl.auto_convert_on_paste, cx), cx))
-            .child(Self::row(
-                &l,
-                "Keep the original command as a comment",
-                "curl.keep_original_as_comment",
-                switch("curl.keep_original_as_comment", s.curl.keep_original_as_comment, cx),
-                cx,
-            ))
-            .child(div().mt_8().text_xs().text_color(muted).child(format!("Saved to {path}. A project's .respite/settings.json overrides these values.")));
+            .child(Self::row("Convert cURL on paste", switch("curl.auto_convert_on_paste", s.curl.auto_convert_on_paste, cx)))
+            .child(Self::row("Keep the original command as a comment", switch("curl.keep_original_as_comment", s.curl.keep_original_as_comment, cx)))
+            .child(div().mt_8().text_xs().text_color(muted).child(format!("Saved to {path}.")));
 
         div()
             .id("settings")

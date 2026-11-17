@@ -76,7 +76,7 @@ impl Respite {
         let asked = prompts(&reqs);
         let missing = undefined(&reqs, &d.file, &d.env, &asked);
         let mut reasons = vec![];
-        if let Some(env) = self.env_name.as_deref().filter(|n| self.settings.settings.env.is_prod(n)) {
+        if let Some(env) = d.env_name.as_deref().filter(|n| self.settings.settings.env.is_prod(n)) {
             reasons.push(format!("Environment \"{env}\" is production."));
         }
         for r in &reqs {
@@ -203,7 +203,7 @@ impl Respite {
     pub(crate) fn cancel_all(&mut self, cx: &mut Context<Self>) {
         self.batch = None;
         if let Some(ix) = self.current {
-            let running: Vec<usize> = self.docs[ix].tasks.keys().copied().collect();
+            let running: Vec<usize> = self.docs[ix].running_lines();
             for line in running {
                 self.cancel(ix, line, cx);
             }

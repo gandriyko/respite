@@ -165,29 +165,56 @@ fn har_and_write() {
     let files = assert_valid(&c);
     assert_eq!(files[0].1, "### POST /api/items\n# recorded response: 201\nPOST https://x.dev/api/items?a=1\naccept: */*\nContent-Type: application/json\n\n{\n  \"q\": 1\n}\n");
 
-    // write(): new folder, never overwrites; env-only imports go next to existing env files.
-    let dest = tempfile::tempdir().unwrap();
-    let first = write(&c, dest.path()).unwrap();
-    let second = write(&c, dest.path()).unwrap();
+    // write(): new folder, never overwrites; environments go to the env dir, never replaced.
+    let (dest, envs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let first = write(&c, dest.path(), envs.path()).unwrap();
+    let second = write(&c, dest.path(), envs.path()).unwrap();
     assert!(first[0].starts_with(dest.path().join("har-import")) && second[0].starts_with(dest.path().join("har-import-2")));
     let env = import_str(
         r#"{"name": "dev", "_postman_variable_scope": "environment", "values": [{"key": "a", "value": "1"}, {"key": "t", "value": "s", "type": "secret"}]}"#,
         "x",
     )
     .unwrap();
-    std::fs::write(dest.path().join("respite-dev.json"), r#"{"keep": "me"}"#).unwrap();
-    let written = write(&env, dest.path()).unwrap();
-    let read = |name: &str| serde_json::from_str::<Value>(&std::fs::read_to_string(dest.path().join(name)).unwrap()).unwrap();
-    assert_eq!(written, [dest.path().join("respite-dev-2.json"), dest.path().join("respite-dev-2.private.json")]);
+    std::fs::write(envs.path().join("respite-dev.json"), r#"{"keep": "me"}"#).unwrap();
+    let written = write(&env, dest.path(), envs.path()).unwrap();
+    let read = |name: &str| serde_json::from_str::<Value>(&std::fs::read_to_string(envs.path().join(name)).unwrap()).unwrap();
+    assert_eq!(written, [envs.path().join("respite-dev-2.json")]);
     assert_eq!(read("respite-dev.json"), serde_json::json!({"keep": "me"}));
-    assert_eq!((read("respite-dev-2.json"), read("respite-dev-2.private.json")), (serde_json::json!({"a": "1"}), serde_json::json!({"t": "s"})));
+    assert_eq!(read("respite-dev-2.json"), serde_json::json!({"a": "1", "t": "s"})); // secrets in the same file
 
     assert!(import_str("{\"hello\": 1}", "x").is_err());
 }
 
 #[test]
+fn collection_variables_become_its_environments() {
+    let read = |p: &Path| serde_json::from_str::<Value>(&std::fs::read_to_string(p).unwrap()).unwrap();
+    let (dest, envs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    // Someone else's shared values are never touched.
+    std::fs::write(envs.path().join("respite.json"), r#"{"mine": "1"}"#).unwrap();
+
+    // Only collection variables: one environment named after the collection.
+    let mut c = import_str(r#"{"openapi": "3.0.0", "info": {"title": "My Shop API"}, "servers": [{"url": "https://api.shop.dev"}],
+        "paths": {"/ping": {"get": {}}}}"#, "x").unwrap();
+    let written = write(&c, dest.path(), envs.path()).unwrap();
+    assert_eq!(read(&envs.path().join("respite-my-shop-api.json")), serde_json::json!({"baseUrl": "https://api.shop.dev"}));
+    assert_eq!(read(&envs.path().join("respite.json")), serde_json::json!({"mine": "1"}));
+    let http = written.iter().find(|p| p.extension().is_some_and(|e| e == "http")).unwrap();
+    let text = std::fs::read_to_string(http).unwrap();
+    assert!(text.starts_with("# @env my-shop-api\n"), "{text}");
+    assert_eq!(http_syntax::parse(&text).env.as_deref(), Some("my-shop-api"));
+
+    // With its own environments: the collection's values go into each, theirs win.
+    c.envs.insert("dev".into(), vec![("baseUrl".into(), "http://localhost".into()), ("x".into(), "1".into())]);
+    c.envs.insert("prod".into(), vec![("x".into(), "2".into())]);
+    let written = write(&c, dest.path(), envs.path()).unwrap();
+    assert_eq!(read(&envs.path().join("respite-dev.json")), serde_json::json!({"baseUrl": "http://localhost", "x": "1"}));
+    assert_eq!(read(&envs.path().join("respite-prod.json")), serde_json::json!({"baseUrl": "https://api.shop.dev", "x": "2"}));
+    let http = written.iter().find(|p| p.extension().is_some_and(|e| e == "http")).unwrap();
+    assert!(std::fs::read_to_string(http).unwrap().starts_with("# @env dev\n"));
+}
+
+#[test]
 fn env_named_like_private_file() {
-    assert_eq!(env_file("x.private", false), "respite-x-private.json");
-    assert_eq!(env_file("x.private", true), "respite-x-private.private.json");
-    assert_eq!(env_file("$shared", true), "respite.private.json");
+    assert_eq!(env_file("x.private"), "respite-x-private.json");
+    assert_eq!(env_file("$shared"), "respite.json");
 }

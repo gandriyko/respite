@@ -34,13 +34,13 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 |---|---|
 | **Editor** | `.http` syntax highlighting (JSON, XML, GraphQL and JS bodies), completion, diagnostics with quick fixes, rename, live templates, folding; a syntax reference with runnable examples (<kbd>F1</kbd>) |
 | **Response** | Body, headers, cookies, the request as sent, timeline (redirects, time to first byte, download); multi-MB bodies, images, JSONPath filter, run history ‹ › with diff, pin |
-| **Variables** | File variables, one file per environment (`respite-dev.json`) with private overrides, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
+| **Variables** | File variables, environments in one central folder (`respite-dev.json`, secrets masked by name) picked per file with `# @env dev`, dynamic values (`{{$uuid}}`, `{{$timestamp}}`, …), values taken from earlier responses |
 | **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings |
 | **Auth & network** | OAuth 2.0 via `{{$auth.token("id")}}` (Client Credentials, Password, Authorization Code + PKCE in the system browser, Device Authorization) with cached, refreshed tokens; client certificates (mTLS) and extra CAs per environment; system or custom proxy. Configured the JetBrains way, so files stay portable |
 | **Tests** | `# @assert status == 201`, `# @assert body $.id exists`, `# @assert duration < 500ms`: httpyac's operators, written as comments so the file still runs in VS Code and JetBrains; results in the Tests tab, `respite run` exits 1 on a failure |
-| **History** | Every run is stored per project: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
+| **History** | Every run is stored: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
-| **Workspace** | Collections in `~/.config/respite` plus any project folders, light and dark themes, settings, state restored on launch |
+| **Workspace** | Collections in `~/.config/respite` (with subfolders) plus `.http` files added from anywhere, light and dark themes, settings, state restored on launch |
 
 ## Quick start
 
@@ -87,7 +87,12 @@ You need a recent stable Rust toolchain (edition 2024); see [Development setup](
 
 ## Desktop app
 
-Run `respite` with no arguments to open your collections in `~/.config/respite`. Run `respite path/to/dir` or `respite file.http` to open a specific project. Each folder in `~/.config/respite` shows up as a collection at the top of the sidebar, and imported collections are saved there too.
+The sidebar has two parts:
+
+- **Collections**: the central folder, `~/.config/respite`. Create files and folders there from the sidebar (hover a folder for its buttons). Imports from Postman, Insomnia, OpenAPI, Bruno and HAR land here too, keeping their subfolders.
+- **Files**: `.http` / `.rest` files that live elsewhere, for example in a repository. **+** adds them (several at once); **×** drops one from the list without touching the file.
+
+Run `respite file.http` to open a file; it joins the Files list. Each file picks its environment with `# @env dev` on its first line, and the environment menu above the editor writes that line for you.
 
 | Shortcut | Action |
 |---|---|
@@ -113,15 +118,16 @@ respite check        Diagnostics without sending anything (pre-commit / CI)
 respite import       Postman / Insomnia / OpenAPI / Swagger / Bruno / HAR → .http files
 respite import-curl  cURL from stdin or the clipboard → request block(s)
 respite export-curl  Request → cURL command
-respite env          Environments from respite-<env>(.private).json
+respite env          Environments in ~/.config/respite/env
 respite auth         OAuth 2.0 tokens: print one (token ID), forget them (clear)
-respite history      Past executions of this workspace
+respite history      Past executions
 ```
 
 Some useful flags:
 
 ```sh
-respite run api.http --env prod --output json        # machine-readable output
+respite run api.http --env prod --output json        # override the file's # @env; machine-readable output
+respite run api.http --env-file ci/respite-ci.json   # env files from elsewhere (CI has no ~/.config/respite)
 respite run api.http createUser --dry-run            # show the resolved request, send nothing
 respite run api.http --fail-on-status --fail-fast    # use it as a smoke test in CI
 respite run api.http --jsonpath '$.items[*].id'      # print only the matching values
@@ -136,10 +142,10 @@ GET https://api.example.com/me
 Authorization: Bearer {{$auth.token("api")}}
 ```
 
-The config lives in an env file under `Security` → `Auth`, with JetBrains' field names. Commit the config, and keep the secret in the git-ignored private file:
+The config lives in an env file under `Security` → `Auth`, with JetBrains' field names; the secret sits next to it and is masked by its name:
 
 ```jsonc
-// respite-dev.json
+// ~/.config/respite/env/respite-dev.json
 {
   "Security": { "Auth": { "api": {
     "Type": "OAuth2",
@@ -148,11 +154,9 @@ The config lives in an env file under `Security` → `Auth`, with JetBrains' fie
     "Client ID": "respite",
     "Client Secret": "{{clientSecret}}",
     "Scope": "read write"
-  }}}
+  }}},
+  "clientSecret": "…"
 }
-
-// respite-dev.private.json
-{ "clientSecret": "…" }
 ```
 
 - **Grants.**
@@ -163,7 +167,7 @@ The config lives in an env file under `Security` → `Auth`, with JetBrains' fie
   - Implicit is not supported.
 - **Other fields.** `Client Credentials` (`basic`, `in body` or `none`), `Custom Request Parameters`, `Custom Request Headers` and `Acquire Automatically`. `{{$auth.idToken("api")}}` gives the ID token.
 - **When a token is fetched.** Only when a request first needs it. It is reused until shortly before it expires, renewed with the refresh token when there is one, and fetched again when the config changes.
-- **Cache.** Tokens are kept per environment in `~/.respite/history/<project>/oauth.<env>.json`, a file only you can read. The app and the CLI share it, and history masks the tokens.
+- **Cache.** Tokens are kept per environment in `~/.respite/history/oauth.<env>.json`, a file only you can read. The app and the CLI share it, and history masks the tokens.
 - **Commands.** `respite auth token api --env dev` prints a token, `respite auth clear --env dev` forgets them. In the app, use **Clear OAuth 2.0 Tokens** in the command palette.
 
 To try it, use the public Duende demo server. Its token endpoint is `https://demo.duendesoftware.com/connect/token` and its API is `https://demo.duendesoftware.com/api/test`. Test clients:
@@ -174,10 +178,10 @@ To try it, use the public Duende demo server. Its token endpoint is `https://dem
 
 ## Certificates and proxy
 
-Client certificates (mTLS) are set up the JetBrains way, in an env file. The private one is the right place, since it is git-ignored:
+Client certificates (mTLS) are set up the JetBrains way, in an env file:
 
 ```jsonc
-// respite-dev.private.json
+// respite-dev.json
 {
   "SSLConfiguration": {
     "clientCertificate": "certs/client.pem",
@@ -235,24 +239,31 @@ For clients that talk MCP instead of running commands, `respite mcp` is a stdio 
 claude mcp add respite -- respite mcp
 ```
 
+The server works in one workspace: the directory it was started in, or `--root /path/to/project` for clients that start it elsewhere (Claude Desktop). Paths outside it, and files other than `.http` / `.rest` where a request file is expected, are refused, so env files can't be read through it. Nothing returns secrets in clear: `show` gives the block as written, `export_curl` keeps `{{variables}}`, and `run` masks secret env values, OAuth tokens and `$processEnv` / `$dotenv` values. The requests themselves still carry the secrets, to whatever host the `.http` file names.
+
 ## Environments
 
-One flat file per environment, found in every folder from the workspace root down to the `.http` file (deeper folders win). `respite.json` holds values shared by all environments.
-
-A single file per environment is enough: `respite-dev.json`, or just `respite-dev.private.json`. Split it in two only when the folder is in git. The public file holds what the team shares (hosts, OAuth configs). The `.private` file is git-ignored and holds secrets; its values are masked in history and CLI output:
+All environments live in one folder, `~/.config/respite/env/`, and serve every `.http` file wherever it is. One flat file per environment, secrets included; `respite.json` holds values shared by all of them. Values whose key contains `pass`, `pwd`, `secret`, `token`, `key` or `credential` are masked in history and CLI output:
 
 ```jsonc
 // respite-dev.json
 { "host": "http://localhost:8080" }
 
 // respite-prod.json
-{ "host": "https://api.example.com" }
-
-// respite-prod.private.json  (git-ignored)
-{ "token": "…" }
+{ "host": "https://api.example.com", "token": "…" }
 ```
 
-The workspace root, shared by the app and the CLI, is the first of: the deepest project folder added to the sidebar, the nearest folder with `.git` or `.respite`, the collection folder (`~/.config/respite/<name>`), the `.http` file's own folder. History and saved state are kept per root in `~/.respite`.
+A file picks its environment on its first line; the app's environment menu writes it, and `respite run --env` overrides it:
+
+```http
+# @env prod
+GET {{host}}/me
+Authorization: Bearer {{token}}
+```
+
+Env files next to `.http` files are not read. In CI, where there is no `~/.config/respite`, pass them with `--env-file`. 
+
+Two folders, kept apart on purpose: `~/.config/respite` holds what you write (settings, keymap, collections, environments), `~/.respite` what the app writes (history, cookies and OAuth tokens per environment in `history/`, the added files list, the last open file). The second one holds tokens and response bodies, so keep it out of a dotfiles repo.
 
 ## Project layout
 
@@ -265,7 +276,7 @@ crates/
   http-exec/    executor on reqwest: cookies, timings, history store
   http-curl/    cURL ⇄ request conversion
   http-import/  Postman, Insomnia, OpenAPI, Bruno and HAR importers
-  settings/     ~/.config/respite/settings.json plus per-project overrides
+  settings/     ~/.config/respite/settings.json
 ```
 
 ## Development setup (macOS)

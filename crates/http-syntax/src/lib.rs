@@ -8,6 +8,8 @@ use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HttpFile {
+    /// `# @env dev` on the first line: the environment the file runs with.
+    pub env: Option<String>,
     pub variables: Vec<FileVariable>,
     pub requests: Vec<Request>,
     pub diagnostics: Vec<Diagnostic>,
@@ -86,6 +88,7 @@ pub struct Diagnostic {
 }
 
 pub const DIRECTIVES: &[&str] = &[
+    "env",
     "name",
     "prompt",
     "note",
@@ -259,6 +262,15 @@ pub fn json_error(text: &str) -> Option<(usize, usize, String)> {
     Some((e.line().max(1), e.column().max(1), msg))
 }
 
+/// The edit that makes `src` run with `env` (`None`: no environment): replaces the
+/// `# @env …` first line, inserts one, or removes it. `(byte range, replacement)`.
+pub fn env_edit(src: &str, env: Option<&str>) -> (std::ops::Range<usize>, String) {
+    let first = src.split_inclusive('\n').next().unwrap_or("");
+    let has = comment(first.trim()).and_then(|c| c.strip_prefix("@env")).is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace));
+    let line = env.map(|e| format!("# @env {e}\n")).unwrap_or_default();
+    if has { (0..first.len(), line) } else { (0..0, line) }
+}
+
 /// Byte offset of the comma a "trailing comma" error is about.
 pub fn trailing_comma(text: &str) -> Option<usize> {
     let (line, col, msg) = json_error(text)?;
@@ -329,6 +341,16 @@ fn parse_block(
                 if !DIRECTIVES.contains(&name) {
                     file.diagnostics.push(diag(i + 1, Severity::Warning, "unknown_directive",
                         format!("unknown directive '@{name}'")));
+                }
+                // File-level, not the request's.
+                if name == "env" {
+                    match (i, value) {
+                        (0, Some(v)) => file.env = Some(v),
+                        _ => file.diagnostics.push(diag(i + 1, Severity::Warning, "misplaced_env",
+                            "'@env NAME' works only on the first line of the file".into())),
+                    }
+                    i += 1;
+                    continue;
                 }
                 if name == "assert"
                     && let Err(e) = parse_assert(value.as_deref().unwrap_or(""))
@@ -527,6 +549,26 @@ mod tests {
             (17, "duplicate_name"),
             (19, "scripts_not_supported"),
         ]);
+    }
+
+    #[test]
+    fn env_on_first_line() {
+        let f = parse("# @env dev\n# @name a\nGET /a\n\n### b\n# @env prod\nGET /b\n");
+        assert_eq!(f.env.as_deref(), Some("dev"));
+        assert!(f.requests[0].directives.iter().all(|d| d.name != "env"));
+        assert_eq!(f.requests[0].name.as_deref(), Some("a"));
+        let codes: Vec<_> = f.diagnostics.iter().map(|d| (d.line, d.code)).collect();
+        assert_eq!(codes, [(6, "misplaced_env")]);
+        assert_eq!(parse("GET /a\n").env, None);
+
+        let apply = |src: &str, env| {
+            let (r, t) = env_edit(src, env);
+            format!("{}{t}{}", &src[..r.start], &src[r.end..])
+        };
+        assert_eq!(apply("GET /a\n", Some("dev")), "# @env dev\nGET /a\n");
+        assert_eq!(apply("# @env dev\nGET /a\n", Some("prod")), "# @env prod\nGET /a\n");
+        assert_eq!(apply("// @env dev\nGET /a\n", None), "GET /a\n");
+        assert_eq!(apply("# @envoy\nGET /a\n", Some("x")), "# @env x\n# @envoy\nGET /a\n");
     }
 
     #[test]

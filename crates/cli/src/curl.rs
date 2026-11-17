@@ -47,8 +47,7 @@ pub(crate) fn import(args: ImportArgs) -> Result<u8, CliError> {
         s
     };
     let vars = substitution_vars(args.to.as_deref(), args.env.as_deref());
-    let cwd = std::path::absolute(".").unwrap_or_default();
-    let s = crate::settings(&http_env::workspace_root(&cwd.join("_.http")));
+    let s = crate::settings();
     let strip: Vec<&str> = s.curl.strip_headers.iter().map(String::as_str).collect();
     let opts = http_curl::Options {
         keep_original: s.curl.keep_original_as_comment && !args.no_original,
@@ -75,14 +74,13 @@ pub(crate) fn import(args: ImportArgs) -> Result<u8, CliError> {
     Ok(0)
 }
 
-/// Values that become `{{name}}`: env variables (`env` or just `$shared`) and the target
-/// file's own `@variables`, resolved.
+/// Values that become `{{name}}`: env variables (`env`, else the target file's `# @env`, else
+/// just `$shared`) and the target file's own `@variables`, resolved.
 fn substitution_vars(target: Option<&Path>, env: Option<&str>) -> Vec<(String, String)> {
     let probe = target.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("_.http"));
     let path = std::path::absolute(&probe).unwrap_or(probe);
-    let root = http_env::workspace_root(&path);
-    let env_vars = Environments::load(&path, &root, &[]).variables(env);
     let file = http_syntax::parse(&std::fs::read_to_string(&path).unwrap_or_default());
+    let env_vars = Environments::load(&[]).variables(env.or(file.env.as_deref()));
     http_env::known_values(&file, &env_vars, path.parent().unwrap_or(Path::new(".")))
 }
 
@@ -94,8 +92,8 @@ pub(crate) fn export(args: ExportArgs) -> Result<u8, CliError> {
         println!("{}", http_curl::export_raw(req));
         return Ok(0);
     }
-    let (env, overrides) = environment(&loaded, &args.env)?;
-    let exec = crate::executor(&loaded.root, args.env.env.as_deref());
+    let (env, overrides, name) = environment(&loaded, &args.env)?;
+    let exec = crate::executor(name.as_deref());
     let cx = http_exec::Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
     let sent = exec.prepare(&cx, index).map_err(|e| crate::run::exec_error(e, &loaded, req))?;
     println!("{}", http_curl::export(&sent, req));

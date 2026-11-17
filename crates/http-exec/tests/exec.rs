@@ -116,6 +116,24 @@ async fn bodies_auth_graphql_redirect() {
 }
 
 #[test]
+fn secrets_cover_private_env_and_process_env() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), "DOT_KEY=dotenv-secret\n").unwrap();
+    let path = dir.path().join("api.http");
+    // ponytail: PATH is always set; a test-only env var would need unsafe set_var.
+    let file = http_syntax::parse("@k = {{$dotenv DOT_KEY}}\nGET /a?p={{$processEnv PATH}}\nX-K: {{k}}\n");
+    let mut env = env("http://x");
+    env.insert("pw".into(), Variable { value: "private-pw".into(), source: "p".into(), secret: true });
+    env.insert("short".into(), Variable { value: "abc".into(), source: "p".into(), secret: true });
+    let overrides = HashMap::new();
+    let cx = Context { path: &path, file: &file, env: &env, overrides: &overrides };
+    let secrets = Executor::default().secrets(&cx);
+    let mut want = vec!["dotenv-secret".to_string(), "private-pw".into(), std::env::var("PATH").unwrap()];
+    want.sort();
+    assert_eq!(secrets, want);
+}
+
+#[test]
 fn literal_variable_in_url_is_named() {
     // The GUI sends an undefined variable as written (an override equal to `{{name}}`).
     let file = http_syntax::parse("GET {{host}}/a\nX-Note: {{host}}\n");

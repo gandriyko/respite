@@ -1,10 +1,8 @@
-//! Per-project history in `<base>/history/<project>/` (base is `~/.respite`):
-//! `<id>.json` (request + response metadata) and `<id>.body` (raw response body),
-//! plus `cookies.<env>.json`. The newest entry of a named request doubles as its
-//! cross-run response cache.
+//! History in `<base>/history/` (base is `~/.respite`): `<id>.json` (request + response
+//! metadata) and `<id>.body` (raw response body), plus `cookies.<env>.json` and
+//! `oauth.<env>.json`. The newest entry of a named request doubles as its cross-run
+//! response cache.
 
-use std::collections::{HashMap, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -64,10 +62,9 @@ impl Store {
         Some(std::env::home_dir()?.join(".respite"))
     }
 
-    /// `base` is `~/.respite`; `root` is the workspace root (its dir name names the project).
+    /// `base` is `~/.respite`; `Entry::file` is relative to `root` (absolute outside it).
     pub fn open(base: &Path, root: &Path) -> io::Result<Self> {
-        let name = project_name(base, root)?;
-        let dir = base.join("history").join(name);
+        let dir = base.join("history");
         std::fs::create_dir_all(&dir)?;
         Ok(Self { root: root.to_path_buf(), dir, per_request: 50, total: 500 })
     }
@@ -150,7 +147,7 @@ impl Store {
             .flatten()
             .flatten()
             .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json").map(str::to_string))
-            .filter(|id| !id.starts_with("cookies."))
+            .filter(|id| !id.starts_with("cookies.") && !id.starts_with("oauth."))
             .collect();
         ids.sort_unstable_by(|a, b| b.cmp(a));
         ids.iter().filter_map(|id| self.entry(id)).collect()
@@ -176,7 +173,7 @@ impl Store {
         self.list().into_iter().filter(|e| e.file == rel).collect()
     }
 
-    /// Workspace root; `Entry::file` is relative to it.
+    /// `Entry::file` is relative to it.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -233,29 +230,6 @@ fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
-/// Root dir name, or `name-<4 hex>` if another root already took it; kept in `projects.json`.
-fn project_name(base: &Path, root: &Path) -> io::Result<String> {
-    std::fs::create_dir_all(base)?;
-    let map_path = base.join("projects.json");
-    let mut map: HashMap<String, String> =
-        std::fs::read(&map_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    let key = root.to_string_lossy().into_owned();
-    if let Some(name) = map.get(&key) {
-        return Ok(name.clone());
-    }
-    let plain = sanitize(&root.file_name().map_or("root".into(), |n| n.to_string_lossy().into_owned()));
-    let name = if map.values().any(|v| *v == plain) {
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        format!("{plain}-{:04x}", h.finish() & 0xffff)
-    } else {
-        plain
-    };
-    map.insert(key, name.clone());
-    std::fs::write(&map_path, serde_json::to_vec_pretty(&map).map_err(io::Error::other)?)?;
-    Ok(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,15 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn project_names_record_latest_prune() {
+    fn record_latest_prune() {
         let base = tempfile::tempdir().unwrap();
-        let (a, b) = (Path::new("/w1/api"), Path::new("/w2/api"));
-        let sa = Store::open(base.path(), a).unwrap();
-        let sb = Store::open(base.path(), b).unwrap();
-        assert!(sa.dir().ends_with("history/api"));
-        let other = sb.dir().file_name().unwrap().to_string_lossy().into_owned();
-        assert!(other.starts_with("api-") && other.len() == 8, "{other}");
-        assert_eq!(Store::open(base.path(), b).unwrap().dir(), sb.dir());
+        let a = Path::new("/w1/api");
+        assert_eq!(Store::open(base.path(), a).unwrap().dir(), base.path().join("history"));
 
         let mut s = Store::open(base.path(), a).unwrap();
         (s.per_request, s.total) = (2, 3);

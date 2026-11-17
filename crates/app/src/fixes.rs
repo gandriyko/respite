@@ -51,12 +51,9 @@ pub fn fixes(src: &str, row: usize, ctx: &crate::lang::Ctx) -> Vec<Fix> {
         }
         seen.push(name.clone());
         out.push(Fix::Edit { title: format!("Define @{name} in this file"), range: 0..0, text: format!("@{name} = \n") });
-        let root = http_env::workspace_root(&ctx.path);
-        let stem = ctx.env_name.as_ref().map_or("respite".to_string(), |e| format!("respite-{e}"));
-        for private in [false, true] {
-            let f = format!("{stem}{}.json", if private { ".private" } else { "" });
-            out.push(Fix::DefineInEnv { title: format!("Define {name} in {f}"), file: root.join(&f), name: name.clone() });
-        }
+        let dir = crate::workspace::env_dir();
+        let f = ctx.env_name.as_ref().map_or("respite.json".to_string(), |e| format!("respite-{e}.json"));
+        out.push(Fix::DefineInEnv { title: format!("Define {name} in {f}"), file: dir.join(&f), name: name.clone() });
     }
 
     if let Some(r) = req {
@@ -173,7 +170,6 @@ mod tests {
             [
                 "Define @id in this file",
                 "Define id in respite-dev.json",
-                "Define id in respite-dev.private.json",
                 "Add Content-Type: application/json",
                 "Remove trailing comma",
             ]

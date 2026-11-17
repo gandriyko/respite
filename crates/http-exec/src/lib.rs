@@ -263,15 +263,8 @@ impl Executor {
     fn persist(&self, cx: &Context<'_>, req: &Request, ex: &mut Exchange) {
         let Some(store) = &self.store else { return };
         if req.directive("no-log").is_none() {
-            // Short values would mask unrelated text.
-            let tokens = self.tokens.lock().unwrap();
-            let secrets: Vec<&str> = cx
-                .env
-                .values()
-                .filter(|v| v.secret && v.value.len() >= 4)
-                .map(|v| v.value.as_str())
-                .chain(tokens.values().flat_map(Token::secrets))
-                .collect();
+            let secrets = self.secrets(cx);
+            let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
             match store.record(self.source, cx.path, req, ex, &secrets) {
                 Ok(id) => ex.history_id = Some(id),
                 Err(e) => eprintln!("respite: history not saved: {e}"),
@@ -283,6 +276,33 @@ impl Executor {
         if let Err(e) = saved {
             eprintln!("respite: cookies not saved: {e}");
         }
+    }
+
+    /// Values to mask in output and history: private env values, this environment's OAuth
+    /// tokens, and the `$processEnv` / `$dotenv` values the file uses. Short values are left
+    /// out: they would mask unrelated text.
+    // ponytail: `$processEnv` inside a `<@ file` body or an auth config is not scanned.
+    pub fn secrets(&self, cx: &Context<'_>) -> Vec<String> {
+        let mut out: Vec<String> = cx.env.values().filter(|v| v.secret).map(|v| v.value.clone()).collect();
+        out.extend(self.tokens.lock().unwrap().values().flat_map(Token::secrets).map(String::from));
+        let dir = cx.path.parent().unwrap_or(Path::new("."));
+        let resolver = Resolver { overrides: cx.overrides, file_vars: &cx.file.variables, env: cx.env, dir };
+        let texts = cx.file.variables.iter().map(|v| v.value.as_str()).chain(cx.file.requests.iter().flat_map(|r| {
+            std::iter::once(r.url.as_str()).chain(r.headers.iter().map(|h| h.value.as_str())).chain(r.body.as_ref().map(|b| b.text.as_str()))
+        }));
+        for text in texts {
+            for expr in text.split("{{").skip(1).filter_map(|s| s.split_once("}}")).map(|(e, _)| e.trim()) {
+                if (expr.starts_with("$processEnv ") || expr.starts_with("$dotenv "))
+                    && let Ok(v) = resolver.resolve(&format!("{{{{{expr}}}}}"), &|_, _| None)
+                {
+                    out.push(v);
+                }
+            }
+        }
+        out.retain(|s| s.len() >= 4);
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Build the request without sending it (`--dry-run`, "Copy as cURL").

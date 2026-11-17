@@ -27,11 +27,12 @@ httpbin.org/get
 GET https://{{host}}/get
 
 ### Environments
-# respite.json, respite-dev.json,
-# respite-dev.private.json (secrets):
-#   {"token": "dev-token"}
-# One file per env is enough; .private is for
-# secrets kept out of git.
+# In ~/.config/respite/env: respite.json (shared),
+# respite-dev.json, secrets included:
+#   {"baseUrl": "https://httpbin.org", "token": "dev-token"}
+# Keys with pass/secret/token/key are masked in history.
+# A file picks one on its FIRST line: # @env dev
+# (the environment menu above the editor writes it).
 GET {{baseUrl}}/bearer
 Authorization: Bearer {{token}}
 
@@ -94,7 +95,7 @@ GET {{baseUrl}}/redirect/1
 GET https://self-signed.badssl.com/
 
 ### Client certificate (mTLS)
-# In respite-<env>.private.json, for every request of that env:
+# In respite-<env>.json, for every request of that env:
 #   {"SSLConfiguration": {
 #     "clientCertificate": "certs/client.pem",
 #     "clientCertificateKey": "certs/client.key",

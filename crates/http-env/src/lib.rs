@@ -1,9 +1,9 @@
 //! Environments and `{{variable}}` resolution.
 //!
-//! Env files, one per environment (flat `{"baseUrl": "…"}`): `respite.json` (shared by all),
-//! `respite-<env>.json`, and `respite-<env>.private.json` / `respite.private.json` for secrets.
-//! Searched in every directory from the workspace root down to the `.http` file; within a
-//! directory public before private, deeper directories override shallower ones.
+//! Env files, one per environment (flat `{"baseUrl": "…"}`): `respite.json` (shared by all)
+//! and `respite-<env>.json`, secrets included (masked by name, [`is_secret_name`]). They all
+//! live in one folder, [`env_dir`]. A `.http` file picks its environment with `# @env NAME` on
+//! its first line.
 
 mod dynamic;
 
@@ -14,17 +14,14 @@ use std::path::{Path, PathBuf};
 use http_syntax::{Diagnostic, FileVariable, HttpFile, Severity};
 use serde_json::{Map, Value};
 
-/// Respite env file name → (environment key, private): `respite-<env>.json`,
-/// `respite-<env>.private.json`; `respite.json` / `respite.private.json` hold `$shared`.
-pub fn respite_env_file(name: &str) -> Option<(String, bool)> {
-    match name {
-        "respite.json" => return Some(("$shared".into(), false)),
-        "respite.private.json" => return Some(("$shared".into(), true)),
-        _ => {}
+/// Respite env file name → environment key: `respite-<env>.json`; `respite.json` holds
+/// `$shared`. The old `*.private.json` split is not a name any more.
+pub fn respite_env_file(name: &str) -> Option<String> {
+    if name == "respite.json" {
+        return Some("$shared".into());
     }
-    let mid = name.strip_prefix("respite-")?.strip_suffix(".json")?;
-    let (env, private) = mid.strip_suffix(".private").map_or((mid, false), |env| (env, true));
-    (!env.is_empty()).then(|| (env.to_string(), private))
+    let env = name.strip_prefix("respite-")?.strip_suffix(".json")?;
+    (!env.is_empty() && !env.ends_with(".private")).then(|| env.to_string())
 }
 
 /// An env file (for UIs listing / opening them as JSON).
@@ -32,18 +29,25 @@ pub fn is_env_file(path: &Path) -> bool {
     path.file_name().is_some_and(|n| respite_env_file(&n.to_string_lossy()).is_some())
 }
 
-/// Respite env files in `dir`, public before private, by name.
-fn respite_files(dir: &Path) -> Vec<(PathBuf, String, bool)> {
-    let mut found: Vec<(PathBuf, String, bool)> = std::fs::read_dir(dir)
+/// A name that says its value is a secret (`password`, `apiKey`, `clientSecret`, …): masked in
+/// output and history.
+pub fn is_secret_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["pass", "pwd", "secret", "token", "key", "credential"].iter().any(|s| lower.contains(s))
+}
+
+/// `respite*.json` files in `dir`, by name: env files, and the ones whose name isn't one.
+fn respite_files(dir: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let mut found: Vec<(PathBuf, Option<String>)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
-            let (env, private) = respite_env_file(&e.file_name().to_string_lossy())?;
-            e.path().is_file().then(|| (e.path(), env, private))
+            let name = e.file_name().to_string_lossy().into_owned();
+            (name.starts_with("respite") && name.ends_with(".json") && e.path().is_file()).then(|| (e.path(), respite_env_file(&name)))
         })
         .collect();
-    found.sort_by(|a, b| (a.2, &a.0).cmp(&(b.2, &b.0)));
+    found.sort();
     found
 }
 
@@ -51,7 +55,7 @@ fn respite_files(dir: &Path) -> Vec<(PathBuf, String, bool)> {
 pub struct Variable {
     pub value: String,
     pub source: PathBuf,
-    /// Came from a private env file: mask it in output for agents.
+    /// Its name says it's a secret ([`is_secret_name`]): mask it in output and history.
     pub secret: bool,
 }
 
@@ -65,26 +69,30 @@ pub struct Environments {
 #[derive(Debug)]
 struct EnvFile {
     path: PathBuf,
-    private: bool,
     json: Map<String, Value>,
 }
 
 impl Environments {
-    /// Env files from `root` down to the `.http` file's directory (public, then private in each),
-    /// then `extra` files (`envFiles` / `--env-file`, named like the others), later ones
-    /// overriding earlier ones.
-    pub fn load(http_file: &Path, root: &Path, extra: &[PathBuf]) -> Self {
-        let dir = http_file.parent().unwrap_or(root);
-        let mut dirs: Vec<&Path> = dir.ancestors().take_while(|d| d.starts_with(root)).collect();
-        dirs.reverse();
-        let mut paths: Vec<(PathBuf, Option<(String, bool)>)> =
-            dirs.into_iter().flat_map(respite_files).map(|(p, env, private)| (p, Some((env, private)))).collect();
+    /// The env files of [`env_dir`], then `extra` files (`--env-file`, named like the others).
+    pub fn load(extra: &[PathBuf]) -> Self {
+        Self::load_from(env_dir().as_deref(), extra)
+    }
+
+    /// Env files in `dir`, then `extra` ones, later ones overriding earlier ones.
+    pub fn load_from(dir: Option<&Path>, extra: &[PathBuf]) -> Self {
+        let mut paths: Vec<(PathBuf, Option<String>)> = dir.into_iter().flat_map(respite_files).collect();
         paths.extend(extra.iter().map(|p| (p.clone(), p.file_name().and_then(|n| respite_env_file(&n.to_string_lossy())))));
 
         let mut envs = Self::default();
         for (path, key) in paths {
-            let Some((env, private)) = key else {
-                envs.errors.push((path, "not an env file name: respite.json, respite-<env>.json or respite-<env>.private.json".into()));
+            let Some(env) = key else {
+                let private = path.to_string_lossy().ends_with(".private.json");
+                let e = if private {
+                    "private env files are gone: move its values into respite-<env>.json (secrets are masked by name)"
+                } else {
+                    "not an env file name: respite.json or respite-<env>.json"
+                };
+                envs.errors.push((path, e.into()));
                 continue;
             };
             let parsed = std::fs::read_to_string(&path)
@@ -92,7 +100,7 @@ impl Environments {
                 .and_then(|s| serde_json::from_str::<Map<String, Value>>(&s).map_err(|e| e.to_string()));
             match parsed {
                 // Keyed by environment, so merging and listing work across files.
-                Ok(vars) => envs.files.push(EnvFile { path, private, json: Map::from_iter([(env, Value::Object(vars))]) }),
+                Ok(vars) => envs.files.push(EnvFile { path, json: Map::from_iter([(env, Value::Object(vars))]) }),
                 Err(e) => envs.errors.push((path, e)),
             }
         }
@@ -125,8 +133,9 @@ impl Environments {
     /// Shallow merge by key; objects (e.g. `SSLConfiguration`) are not variables.
     ///
     /// `Security.Auth.<id>` (JetBrains HTTP Client's OAuth 2.0 config) is merged field by field
-    /// across files, so a private file can add just `"Client Secret"`. Each config comes back as
-    /// `$auth.<id>` holding its JSON — a name no `{{variable}}` can reach (`{{$…}}` is dynamic).
+    /// across files (`respite.json`, then the environment's). Each config comes back as
+    /// `$auth.<id>` holding its JSON — a name no `{{variable}}` can reach (`{{$…}}` is dynamic) —
+    /// and counts as secret.
     ///
     /// `SSLConfiguration` (JetBrains' client certificate block, plus our `caCertificate`) is merged
     /// the same way into `$ssl`, its file paths made absolute against the env file that names them.
@@ -144,9 +153,8 @@ impl Environments {
                             let Some(Value::Object(configs)) = o.get("Auth") else { continue };
                             for (id, cfg) in configs {
                                 let Value::Object(cfg) = cfg else { continue };
-                                let e = auth.entry(id.clone()).or_insert_with(|| (Map::new(), Variable { value: String::new(), source: f.path.clone(), secret: false }));
+                                let e = auth.entry(id.clone()).or_insert_with(|| (Map::new(), Variable { value: String::new(), source: f.path.clone(), secret: true }));
                                 e.0.extend(cfg.clone());
-                                e.1.secret |= f.private;
                             }
                             continue;
                         }
@@ -166,7 +174,7 @@ impl Environments {
                         Value::Object(_) | Value::Array(_) => continue,
                         other => other.to_string(),
                     };
-                    out.insert(k.clone(), Variable { value, source: f.path.clone(), secret: f.private });
+                    out.insert(k.clone(), Variable { value, source: f.path.clone(), secret: is_secret_name(k) });
                 }
             }
         }
@@ -180,43 +188,29 @@ impl Environments {
     }
 }
 
-/// Root of a `.http` file's env chain, history and saved state; the app and the CLI share it.
-/// See [`root_in`]; the sidebar's projects come from `~/.respite/workspaces.json`.
-pub fn workspace_root(file: &Path) -> PathBuf {
-    let home = std::env::home_dir();
-    let projects: Vec<PathBuf> = home
-        .as_ref()
-        .and_then(|h| std::fs::read(h.join(".respite/workspaces.json")).ok())
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    root_in(file, home.as_deref(), collections_dir().as_deref(), &projects)
-}
-
-/// In order: the deepest sidebar project holding `file`; the nearest ancestor with `.git` or
-/// `.respite`; its collection (`<collections>/<name>`, each one its own root); its directory.
-/// Neither `home` (its `.respite` is the app's data folder) nor `collections` itself is a root.
-pub fn root_in(file: &Path, home: Option<&Path>, collections: Option<&Path>, projects: &[PathBuf]) -> PathBuf {
-    let dir = file.parent().unwrap_or(Path::new("."));
-    if let Some(p) = projects.iter().filter(|p| file.starts_with(p) && Some(p.as_path()) != collections).max_by_key(|p| p.components().count()) {
-        return p.clone();
-    }
-    for d in dir.ancestors().take_while(|d| Some(*d) != home && Some(*d) != collections) {
-        if d.parent() == collections || d.join(".git").exists() || d.join(".respite").exists() {
-            return d.to_path_buf();
-        }
-    }
-    dir.to_path_buf()
-}
-
-/// `~/.config/respite`: the default home of collections (one folder each), next to `settings.json`.
+/// `~/.config/respite`: the central folder. Next to `settings.json` it holds the collections
+/// (`.http` files, in subfolders as the user likes) and [`env_dir`].
 pub fn collections_dir() -> Option<PathBuf> {
     Some(std::env::home_dir()?.join(".config/respite"))
 }
 
+/// `~/.config/respite/env`: every environment, for every `.http` file wherever it lives.
+pub fn env_dir() -> Option<PathBuf> {
+    Some(collections_dir()?.join("env"))
+}
+
 /// Undefined `{{variables}}`, unknown `{{name.response…}}` requests, cycles and bad `{{$…}}`,
 /// checked against the union of all environments (a variable defined in any of them is fine).
+/// Also a `# @env` naming no environment.
 pub fn check(file: &HttpFile, envs: &Environments, dir: &Path) -> Vec<Diagnostic> {
-    check_vars(file, &envs.all_variables(), dir)
+    let mut out = check_vars(file, &envs.all_variables(), dir);
+    if let Some(env) = &file.env
+        && !envs.names().contains(env)
+    {
+        let message = format!("no environment '{env}': add respite-{env}.json to the env folder");
+        out.insert(0, Diagnostic { line: 1, severity: Severity::Error, code: "unknown_environment", message });
+    }
+    out
 }
 
 /// [`check`] against already merged variables ([`Environments::all_variables`]).
@@ -402,9 +396,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
         let auth = |cfg: &str| format!(r#"{{"Security": {{"Auth": {{"api": {cfg}}}}}}}"#);
-        fs::write(r.join("respite-dev.json"), auth(r#"{"Type": "OAuth2", "Client ID": "c", "Client Secret": "{{secret}}"}"#)).unwrap();
-        fs::write(r.join("respite-dev.private.json"), auth(r#"{"Client Secret": "s3"}"#)).unwrap();
-        let envs = Environments::load(&r.join("a.http"), r, &[]);
+        // Merged field by field: `respite.json` has the config, the environment adds the secret.
+        fs::write(r.join("respite.json"), auth(r#"{"Type": "OAuth2", "Client ID": "c", "Client Secret": "{{secret}}"}"#)).unwrap();
+        fs::write(r.join("respite-dev.json"), auth(r#"{"Client Secret": "s3"}"#)).unwrap();
+        let envs = Environments::load_from(Some(r), &[]);
         let v = envs.variables(Some("dev"));
         let cfg: Value = serde_json::from_str(&v["$auth.api"].value).unwrap();
         assert_eq!((cfg["Client ID"].as_str(), cfg["Client Secret"].as_str(), v["$auth.api"].secret), (Some("c"), Some("s3"), true));
@@ -413,12 +408,10 @@ mod tests {
         // SSLConfiguration: merged field by field, paths absolute against their own file.
         fs::create_dir_all(r.join("api")).unwrap();
         fs::write(r.join("respite.json"), r#"{"SSLConfiguration": {"caCertificate": "certs/ca.pem", "verifyHostCertificate": true}}"#).unwrap();
-        fs::write(
-            r.join("api/respite-dev.private.json"),
-            r#"{"SSLConfiguration": {"clientCertificate": {"path": "c.der", "format": "DER"}, "clientCertificateKey": "/abs/k.pem"}}"#,
-        )
-        .unwrap();
-        let v = Environments::load(&r.join("api/a.http"), r, &[]).variables(Some("dev"));
+        let extra = r.join("api/respite-dev.json");
+        fs::write(&extra, r#"{"SSLConfiguration": {"clientCertificate": {"path": "c.der", "format": "DER"}, "clientCertificateKey": "/abs/k.pem"}}"#)
+            .unwrap();
+        let v = Environments::load_from(Some(r), &[extra]).variables(Some("dev"));
         let ssl: Value = serde_json::from_str(&v["$ssl"].value).unwrap();
         assert_eq!(ssl["caCertificate"], Value::String(r.join("certs/ca.pem").to_string_lossy().into()));
         assert_eq!(ssl["clientCertificate"]["path"], Value::String(r.join("api/c.der").to_string_lossy().into()));
@@ -436,88 +429,46 @@ mod tests {
     }
 
     #[test]
-    fn root_resolution() {
-        let tmp = tempfile::tempdir().unwrap();
-        let t = tmp.path();
-        let (home, cols) = (t.join("home"), t.join("home/.config/respite"));
-        let root = |f: &str, projects: &[PathBuf]| root_in(&t.join(f), Some(&home), Some(&cols), projects);
-        fs::create_dir_all(cols.join("Shop/orders")).unwrap();
-        fs::create_dir_all(home.join("repo/.git")).unwrap();
-        fs::create_dir_all(home.join("repo/api/v1")).unwrap();
-        fs::create_dir_all(home.join("plain/sub")).unwrap();
-        fs::create_dir_all(home.join(".respite")).unwrap();
-        fs::create_dir_all(home.join(".config/.git")).unwrap(); // a dotfiles repo must not swallow collections
-
-        assert_eq!(root("home/.config/respite/Shop/orders/a.http", &[]), cols.join("Shop"));
-        assert_eq!(root("home/.config/respite/respite-dev.json", &[]), cols);
-        assert_eq!(root("home/repo/api/v1/a.http", &[]), home.join("repo"));
-        // A sidebar project wins over `.git`, the deepest one first; the collections dir never does.
-        let projects = [home.join("repo"), home.join("repo/api"), cols.clone(), home.join("plain")];
-        assert_eq!(root("home/repo/api/v1/a.http", &projects), home.join("repo/api"));
-        assert_eq!(root("home/plain/sub/a.http", &projects), home.join("plain"));
-        assert_eq!(root("home/.config/respite/Shop/a.http", &projects), cols.join("Shop"));
-        // No marker, no project: the file's folder; `~/.respite` doesn't make home a root.
-        assert_eq!(root("home/plain/sub/a.http", &[]), home.join("plain/sub"));
-    }
-
-    #[test]
-    fn env_chain_merge_order() {
+    fn env_dir_merge_order() {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
-        fs::create_dir_all(r.join("billing")).unwrap();
         fs::create_dir_all(r.join("secrets")).unwrap();
         fs::write(r.join("respite.json"), r#"{"apiVersion":"v1","host":"shared"}"#).unwrap();
-        fs::write(r.join("respite-dev.json"), r#"{"host":"localhost","token":"pub","port":8080}"#).unwrap();
+        fs::write(r.join("respite-dev.json"), r#"{"host":"localhost","token":"root-secret","port":8080}"#).unwrap();
         fs::write(r.join("respite-prod.json"), "{}").unwrap();
-        fs::write(r.join("respite-dev.private.json"), r#"{"token":"root-secret"}"#).unwrap();
-        fs::write(r.join("respite-local-anya.private.json"), "{}").unwrap();
-        fs::write(r.join("billing/respite-dev.json"), r#"{"host":"billing"}"#).unwrap();
-        fs::write(r.join("billing/respite-dev.private.json"), "{ broken").unwrap();
+        fs::write(r.join("respite-local-anya.json"), "{}").unwrap();
+        fs::write(r.join("respite-dev.private.json"), r#"{"token":"old"}"#).unwrap(); // the old split: an error, not read
+        fs::write(r.join("respite-broken.json"), "{ broken").unwrap();
         fs::write(r.join("http-client.env.json"), r#"{"dev":{"host":"jetbrains"}}"#).unwrap(); // not read
-        let extra = r.join("secrets/respite-dev.private.json");
-        fs::write(&extra, r#"{"stripe":"sk"}"#).unwrap();
+        let extra = r.join("secrets/respite-dev.json");
+        fs::write(&extra, r#"{"apiKey":"sk","host":"ci"}"#).unwrap();
         let unnamed = r.join("secrets/acme.json");
         fs::write(&unnamed, r#"{"stripe":"x"}"#).unwrap();
 
-        let envs = Environments::load(&r.join("billing/invoices.http"), r, &[extra, unnamed]);
-        assert_eq!(envs.errors.len(), 2); // broken JSON, extra file without an env name
+        let envs = Environments::load_from(Some(r), &[extra, unnamed]);
+        // Broken JSON, the private file, an extra file without an env name.
+        assert_eq!(envs.errors.len(), 3, "{:?}", envs.errors);
+        assert!(envs.errors.iter().any(|(p, e)| p.ends_with("respite-dev.private.json") && e.contains("respite-<env>.json")));
         assert_eq!(envs.names(), ["dev", "local-anya", "prod"]);
         let v = envs.variables(Some("dev"));
         let get = |k: &str| (v[k].value.as_str(), v[k].secret);
-        assert_eq!(get("host"), ("billing", false));
-        assert_eq!(get("token"), ("root-secret", true));
-        assert_eq!(get("apiVersion"), ("v1", false));
+        assert_eq!(get("host"), ("ci", false)); // --env-file wins
+        assert_eq!(get("token"), ("root-secret", true)); // secret by name
+        assert_eq!(get("apiVersion"), ("v1", false)); // respite.json = $shared
         assert_eq!(get("port"), ("8080", false));
-        assert_eq!(get("stripe"), ("sk", true));
+        assert_eq!(get("apiKey"), ("sk", true));
         assert_eq!(envs.variables(None)["host"].value, "shared");
+        assert!(Environments::load_from(None, &[]).names().is_empty());
     }
 
     #[test]
-    fn respite_per_environment_files() {
-        let root = tempfile::tempdir().unwrap();
-        let r = root.path();
-        fs::create_dir(r.join("api")).unwrap();
-        fs::write(r.join("respite.json"), r#"{"apiVersion":"v2"}"#).unwrap();
-        fs::write(r.join("respite-dev.json"), r#"{"host":"respite-root"}"#).unwrap();
-        fs::write(r.join("respite-local.json"), r#"{"host":"localhost"}"#).unwrap();
-        fs::write(r.join("api/respite-dev.json"), r#"{"host":"api"}"#).unwrap();
-        fs::write(r.join("api/respite-dev.private.json"), r#"{"token":"s3cret"}"#).unwrap();
-        fs::write(r.join("respite-broken.json"), "{").unwrap();
+    fn env_file_names() {
 
-        let envs = Environments::load(&r.join("api/users.http"), r, &[]);
-        assert_eq!(envs.names(), ["dev", "local"]); // respite-broken.json is an error, not an environment
-        assert_eq!(envs.errors.len(), 1);
-        let v = envs.variables(Some("dev"));
-        let get = |k: &str| (v[k].value.as_str(), v[k].secret);
-        assert_eq!(get("host"), ("api", false)); // deeper dir wins
-        assert_eq!(get("apiVersion"), ("v2", false)); // respite.json = $shared
-        assert_eq!(get("token"), ("s3cret", true));
-        assert_eq!(envs.variables(Some("local"))["host"].value, "localhost");
-
-        assert_eq!(respite_env_file("respite.json"), Some(("$shared".into(), false)));
-        assert_eq!(respite_env_file("respite.private.json"), Some(("$shared".into(), true)));
-        assert_eq!(respite_env_file("respite-prod.private.json"), Some(("prod".into(), true)));
-        assert_eq!(respite_env_file("respite-my-local.json"), Some(("my-local".into(), false)));
+        assert_eq!(respite_env_file("respite.json"), Some("$shared".into()));
+        assert_eq!(respite_env_file("respite-my-local.json"), Some("my-local".into()));
+        assert_eq!([respite_env_file("respite.private.json"), respite_env_file("respite-prod.private.json")], [None, None]);
+        assert!(is_secret_name("password") && is_secret_name("apiKey") && is_secret_name("Client Secret") && is_secret_name("access_token"));
+        assert!(!is_secret_name("baseUrl") && !is_secret_name("user"));
         assert_eq!(respite_env_file("respite.dev.json"), None); // dot form is not the format
         assert_eq!(respite_env_file("respite-.json"), None);
         assert_eq!(respite_env_file("respite.toml"), None);
@@ -530,8 +481,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("respite-dev.json"), r#"{"host":"h"}"#).unwrap();
         fs::write(root.path().join("respite-prod.json"), r#"{"token":"t"}"#).unwrap();
-        let path = root.path().join("a.http");
-        let envs = Environments::load(&path, root.path(), &[]);
+        let envs = Environments::load_from(Some(root.path()), &[]);
         let file = http_syntax::parse(
             "# @name login\n# @prompt pass\nPOST https://{{host}}/{{pass}}\nX-T: {{token}} {{nope}} {{nope}}\n\n\
              {\"a\": \"{{login.response.body.*}}\",\n \"b\": \"{{ghost.response.body.*}}\", \"c\": \"{{$processEnv RESPITE_NOPE}}\"}\n",

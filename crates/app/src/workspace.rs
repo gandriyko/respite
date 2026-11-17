@@ -1,156 +1,80 @@
-//! Projects for the sidebar and their `.http` / `.rest` files.
+//! What the sidebar shows: the central folder (`~/.config/respite`, with subfolders) and the
+//! `.http` / `.rest` files added from elsewhere.
 //!
-//! The list lives in `~/.respite/workspaces.json` (a JSON array of roots). Removing a
-//! project only drops it from that list: files and history stay. Until the file exists it
-//! is seeded from the roots the history store has seen (`~/.respite/projects.json`).
+//! The added files are listed in `~/.respite/files.json` (a JSON array of paths). Removing one
+//! only drops it from that list: the file and its history stay.
 
 use std::path::{Path, PathBuf};
 
-pub struct Project {
-    pub root: PathBuf,
-    pub name: String,
-    /// `None` until first expanded (other projects may be big; scan lazily).
-    pub files: Option<Vec<PathBuf>>,
-    /// The collections folder: its contents sit at the sidebar root, with no project row.
-    pub flat: bool,
-}
-
-impl Project {
-    pub fn new(root: PathBuf) -> Self {
-        Self { name: name_of(&root), files: None, root, flat: false }
-    }
-}
-
+/// `~/.config/respite`: collections live here, environments in its `env/` subfolder.
 pub fn collections_dir() -> PathBuf {
     http_env::collections_dir().unwrap_or_default()
 }
 
-/// `collections` (flat, always scanned) first, then `current` (added to the saved list if new),
-/// then the other listed roots that still exist, by name.
-pub fn projects(base: Option<&Path>, collections: &Path, current: &Path) -> Vec<Project> {
-    let mut roots = load_list(base);
-    if current != collections && !roots.iter().any(|r| r == current) {
-        roots.push(current.to_path_buf());
-        save_list(base, &roots);
-    }
-    let mut others: Vec<PathBuf> = roots.into_iter().filter(|r| r != current && r != collections && r.is_dir()).collect();
-    others.sort_by_key(|r| name_of(r).to_lowercase());
-    let current = (current != collections).then(|| current.to_path_buf());
-    let flat = Project { files: Some(scan(collections)), flat: true, ..Project::new(collections.to_path_buf()) };
-    std::iter::once(flat).chain(current.into_iter().chain(others).map(Project::new)).collect()
+pub fn env_dir() -> PathBuf {
+    http_env::env_dir().unwrap_or_default()
 }
 
-fn load_list(base: Option<&Path>) -> Vec<PathBuf> {
+pub fn is_request_file(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e == "http" || e == "rest")
+}
+
+/// Added files that still exist.
+pub fn load_files(base: Option<&Path>) -> Vec<PathBuf> {
     let Some(base) = base else { return vec![] };
-    if let Some(list) = std::fs::read(base.join("workspaces.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
-        return list;
-    }
-    std::fs::read(base.join("projects.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok())
-        .map(|m| m.keys().map(PathBuf::from).collect())
-        .unwrap_or_default()
+    let list: Vec<PathBuf> = std::fs::read(base.join("files.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    list.into_iter().filter(|p| p.is_file()).collect()
 }
 
-/// Persist the sidebar's project roots; failures are reported, not fatal.
-pub fn save_list(base: Option<&Path>, roots: &[PathBuf]) {
+/// Persist the added files; failures are reported, not fatal.
+pub fn save_files(base: Option<&Path>, files: &[PathBuf]) {
     let Some(base) = base else { return };
     let write = std::fs::create_dir_all(base)
-        .and_then(|()| std::fs::write(base.join("workspaces.json"), serde_json::to_vec_pretty(roots).unwrap_or_default()));
+        .and_then(|()| std::fs::write(base.join("files.json"), serde_json::to_vec_pretty(files).unwrap_or_default()));
     if let Err(e) = write {
-        eprintln!("respite: project list not saved: {e}");
+        eprintln!("respite: file list not saved: {e}");
     }
-}
-
-fn name_of(root: &Path) -> String {
-    root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 fn read_state(base: &Path) -> serde_json::Value {
     std::fs::read(base.join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}))
 }
 
-fn write_state(base: &Path, state: &serde_json::Value) {
-    if let Err(e) = std::fs::create_dir_all(base).and_then(|()| std::fs::write(base.join("state.json"), state.to_string())) {
-        eprintln!("respite: state not saved: {e}");
-    }
-}
-
-/// File last selected in `root` and its cursor (0-based line, column), if the file still exists.
-pub fn last_file(base: Option<&Path>, root: &Path) -> Option<(PathBuf, u32, u32)> {
-    let v = &read_state(base?)["files"][root.to_string_lossy().as_ref()];
+/// File last selected and its cursor (0-based line, column), if the file still exists.
+pub fn last_opened(base: Option<&Path>) -> Option<(PathBuf, u32, u32)> {
+    let v = &read_state(base?)["last_file"];
     let path = PathBuf::from(v["path"].as_str()?);
     let pos = |k: &str| v[k].as_u64().unwrap_or(0) as u32;
     path.is_file().then(|| (path, pos("line"), pos("column")))
 }
 
-/// File last selected in any project: a plain launch (no file or folder given) reopens it.
-pub fn last_opened(base: Option<&Path>) -> Option<(PathBuf, u32, u32)> {
-    let key = read_state(base?)["last"].as_str()?.to_string();
-    last_file(base, Path::new(&key))
-}
-
-pub fn save_last_file(base: Option<&Path>, root: &Path, path: &Path, line: u32, column: u32) {
+pub fn save_last_file(base: Option<&Path>, path: &Path, line: u32, column: u32) {
     let Some(base) = base else { return };
     let mut state = read_state(base);
-    if !state["files"].is_object() {
-        state["files"] = serde_json::json!({});
+    state["last_file"] = serde_json::json!({ "path": path, "line": line, "column": column });
+    if let Err(e) = std::fs::create_dir_all(base).and_then(|()| std::fs::write(base.join("state.json"), state.to_string())) {
+        eprintln!("respite: state not saved: {e}");
     }
-    state["files"][root.to_string_lossy().as_ref()] = serde_json::json!({ "path": path, "line": line, "column": column });
-    state["last"] = root.to_string_lossy().into();
-    write_state(base, &state);
-}
-
-/// Environment last chosen for `root` (`~/.respite/state.json` → `{"env": {root: name}}`).
-pub fn load_env(base: Option<&Path>, root: &Path) -> Option<String> {
-    read_state(base?)["env"][root.to_string_lossy().as_ref()].as_str().map(str::to_string)
-}
-
-/// Remember the environment for `root`; `None` = "Shared" (no named environment).
-pub fn save_env(base: Option<&Path>, root: &Path, env: Option<&str>) {
-    let Some(base) = base else { return };
-    let mut state = read_state(base);
-    if !state["env"].is_object() {
-        state["env"] = serde_json::json!({});
-    }
-    state["env"][root.to_string_lossy().as_ref()] = env.map_or(serde_json::Value::Null, Into::into);
-    write_state(base, &state);
 }
 
 pub use http_env::is_env_file;
 
-/// `.http` / `.rest` and env files (`respite*.json`) under `root`, respecting
-/// `.gitignore`. Private env files are usually git-ignored, so they are added back.
+/// Folders and `.http` / `.rest` files under the central folder `root`, sorted; the `env`
+/// folder (environments, edited from the environment menu) is left out. Folders are listed
+/// so that an empty new one shows up.
 pub fn scan(root: &Path) -> Vec<PathBuf> {
-    // ponytail: depth cap guards against a root like $HOME; raise if real projects nest deeper.
-    // Editor folders are hidden and usually git-ignored, yet people keep personal requests
-    // there — walk them without filters.
-    // ponytail: only at the root; nested `.vscode` in monorepo subprojects stays skipped.
-    let editor_dirs = [".vscode", ".idea"].map(|d| root.join(d));
-    let editor = editor_dirs.iter().filter(|d| d.is_dir()).flat_map(|d| {
-        ignore::WalkBuilder::new(d).standard_filters(false).max_depth(Some(8)).build()
-    });
-    let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(root)
+    let env = root.join("env");
+    // ponytail: depth cap guards against a runaway tree; raise if real collections nest deeper.
+    let mut found: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .max_depth(Some(8))
+        .filter_entry(move |e| e.path() != env)
         .build()
-        .chain(editor)
         .flatten()
         .map(|e| e.into_path())
-        .filter(|p| p.is_file() && (p.extension().is_some_and(|e| e == "http" || e == "rest") || is_env_file(p)))
+        .filter(|p| p != root && (p.is_dir() || (p.is_file() && is_request_file(p))))
         .collect();
-    // Git-ignored private env files next to the ones found (or at the root).
-    let dirs: std::collections::BTreeSet<PathBuf> =
-        files.iter().filter_map(|f| f.parent().map(Path::to_path_buf)).chain([root.to_path_buf()]).collect();
-    for d in dirs {
-        for p in std::fs::read_dir(&d).into_iter().flatten().flatten().map(|e| e.path()) {
-            let private = p.file_name().is_some_and(|n| n.to_string_lossy().contains(".private."));
-            if private && is_env_file(&p) && p.is_file() && !files.contains(&p) {
-                files.push(p);
-            }
-        }
-    }
-    files.sort();
-    files
+    found.sort();
+    found
 }
 
 #[cfg(test)]
@@ -158,62 +82,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projects_and_scan() {
+    fn files_state_and_scan() {
         let base = tempfile::tempdir().unwrap();
-        let (cur, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let map = serde_json::json!({
-            other.path().to_string_lossy(): "o",
-            cur.path().to_string_lossy(): "c",
-            "/definitely/not/here": "gone",
-        });
-        std::fs::write(base.path().join("projects.json"), map.to_string()).unwrap();
-        let coll = tempfile::tempdir().unwrap();
-        let ps = projects(Some(base.path()), coll.path(), cur.path());
-        assert_eq!(ps.iter().map(|p| p.root.as_path()).collect::<Vec<_>>(), [coll.path(), cur.path(), other.path()]);
-        assert!(ps[0].flat && !ps[1].flat);
-        // Collections as current: shown once and never saved to the project list.
-        let ps = projects(Some(base.path()), coll.path(), coll.path());
-        assert_eq!((ps.len(), ps[0].root.as_path()), (3, coll.path())); // the other two are sorted by (random) name
-        assert!(!load_list(Some(base.path())).iter().any(|r| r == coll.path()));
+        let other = tempfile::tempdir().unwrap();
+        let (a, gone) = (other.path().join("a.http"), other.path().join("gone.http"));
+        std::fs::write(&a, "GET /").unwrap();
+        save_files(Some(base.path()), &[a.clone(), gone]);
+        assert_eq!(load_files(Some(base.path())), std::slice::from_ref(&a)); // a deleted file drops out
 
-        // Seeded list is saved; a removed root stays removed, a new current one is appended.
-        let mut list = load_list(Some(base.path()));
-        list.retain(|r| r != other.path());
-        save_list(Some(base.path()), &list);
-        let fresh = tempfile::tempdir().unwrap();
-        let ps = projects(Some(base.path()), coll.path(), fresh.path());
-        assert_eq!(ps.iter().map(|p| p.root.as_path()).collect::<Vec<_>>(), [coll.path(), fresh.path(), cur.path()]);
+        assert_eq!(last_opened(Some(base.path())), None);
+        save_last_file(Some(base.path()), &a, 12, 4);
+        assert_eq!(last_opened(Some(base.path())), Some((a.clone(), 12, 4)));
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(last_opened(Some(base.path())), None); // deleted file is not reopened
 
-        assert_eq!(load_env(Some(base.path()), cur.path()), None);
-        save_env(Some(base.path()), cur.path(), Some("dev"));
-        save_env(Some(base.path()), other.path(), Some("prod"));
-        assert_eq!(load_env(Some(base.path()), cur.path()).as_deref(), Some("dev"));
-        save_env(Some(base.path()), cur.path(), None);
-        assert_eq!(load_env(Some(base.path()), cur.path()), None);
-        assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod"));
-        let f = other.path().join("x.http");
-        std::fs::write(&f, "GET /").unwrap();
-        save_last_file(Some(base.path()), other.path(), &f, 12, 4);
-        assert_eq!(load_env(Some(base.path()), other.path()).as_deref(), Some("prod")); // same file, other keys kept
-        assert_eq!(last_file(Some(base.path()), other.path()), Some((f.clone(), 12, 4)));
-        assert_eq!(last_opened(Some(base.path())), Some((f.clone(), 12, 4))); // a plain launch reopens it
-        std::fs::remove_file(&f).unwrap();
-        assert_eq!(last_file(Some(base.path()), other.path()), None); // deleted file is not reopened
-
-        let r = cur.path();
-        std::fs::create_dir_all(r.join("api/v2")).unwrap();
-        std::fs::create_dir_all(r.join("ignored")).unwrap();
-        std::fs::create_dir_all(r.join(".vscode")).unwrap();
-        std::fs::create_dir_all(r.join(".hidden")).unwrap();
-        for f in [
-            "a.http", "api/v2/b.rest", "api/notes.txt", "ignored/c.http", "package.json", ".vscode/d.http", ".hidden/e.http",
-            "http-client.env.json", "http-client.private.env.json", "respite-dev.json", "respite-dev.private.json",
-        ] {
+        let r = other.path();
+        for d in ["api/v2", "empty", "env", ".hidden"] {
+            std::fs::create_dir_all(r.join(d)).unwrap();
+        }
+        for f in ["b.http", "api/v2/c.rest", "api/notes.txt", "env/respite-dev.json", ".hidden/d.http", "settings.json"] {
             std::fs::write(r.join(f), "").unwrap();
         }
-        std::fs::write(r.join(".gitignore"), "ignored/\n*.private.*\n.vscode/\n").unwrap();
-        std::fs::create_dir(r.join(".git")).unwrap(); // .gitignore applies inside a git repo
         let rel: Vec<_> = scan(r).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect();
-        assert_eq!(rel, [".vscode/d.http", "a.http", "api/v2/b.rest", "respite-dev.json", "respite-dev.private.json"]);
+        assert_eq!(rel, ["api", "api/v2", "api/v2/c.rest", "b.http", "empty"]);
     }
 }

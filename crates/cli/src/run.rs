@@ -84,11 +84,11 @@ pub(crate) fn run(args: RunArgs) -> Result<u8, CliError> {
         ([], _) => vec![Part::Headers, Part::Body, Part::Timing],
         (parts, _) => parts.to_vec(),
     };
-    let (env, mut overrides) = environment(&loaded, &args.env)?;
-    // ponytail: masks private-env and prompted values; $dotenv/$processEnv values are not tracked yet.
-    let mut secrets: Vec<String> = env.values().filter(|v| v.secret && v.value.len() >= 4).map(|v| v.value.clone()).collect();
+    let (env, mut overrides, env_name) = environment(&loaded, &args.env)?;
+    // Prompted values; the executor's secrets are added per request.
+    let mut secrets: Vec<String> = vec![];
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
-    let exec = crate::executor(&loaded.root, args.env.env.as_deref());
+    let exec = crate::executor(env_name.as_deref());
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
 
     let mut exit = 0;
@@ -104,6 +104,13 @@ pub(crate) fn run(args: RunArgs) -> Result<u8, CliError> {
             };
             result.map_err(|e| exec_error(e, &loaded, req))
         });
+        // Tokens may have been acquired by this request.
+        let cx = Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
+        for s in exec.secrets(&cx) {
+            if !secrets.contains(&s) {
+                secrets.push(s);
+            }
+        }
         let code = match &outcome {
             Ok(Outcome::Done(ex)) if args.fail_on_status && ex.response.status >= 400 => 1,
             Ok(Outcome::Done(ex)) if ex.tests.iter().any(|t| !t.passed) => 1,

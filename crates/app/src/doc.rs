@@ -28,8 +28,10 @@ pub struct Doc {
     pub editor: Entity<EditorState>,
     pub file: Arc<HttpFile>,
     pub env: Arc<HashMap<String, Variable>>,
-    /// Environments visible from this file's env-file chain.
+    /// Every environment (env files in the env folder).
     pub env_names: Vec<String>,
+    /// The environment `env` holds: the file's `# @env` when it was last applied.
+    pub env_name: Option<String>,
     pub exec: Arc<Executor>,
     /// `request_line` of the block under the cursor.
     pub active: Option<usize>,
@@ -75,7 +77,8 @@ impl Doc {
         let block_bar = editor.update(cx, |s, cx| s.create_gutter_decorations_collection(vec![], cx));
         let http = !crate::workspace::is_env_file(&path);
         let (path, env) = (Arc::new(path), Arc::new(env));
-        let lang = std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { path: path.clone(), env: env.clone(), all: Arc::new(all), env_name }));
+        let lang =
+            std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { path: path.clone(), env: env.clone(), all: Arc::new(all), env_name: env_name.clone() }));
         let fixes = std::rc::Rc::new(crate::fixes::Fixes(lang.clone()));
         editor.update(cx, |s, _| {
             let lsp = s.lsp_mut();
@@ -93,6 +96,7 @@ impl Doc {
             file: Arc::default(),
             env,
             env_names,
+            env_name,
             exec,
             active: None,
             applied: None,
@@ -159,6 +163,10 @@ impl Doc {
         let all = self.lang.borrow().all.clone();
         let mut found = self.file.diagnostics.clone();
         found.extend(http_env::check_vars(&self.file, &all, dir));
+        if let Some(env) = self.file.env.as_ref().filter(|e| !self.env_names.contains(e)) {
+            let message = format!("no environment '{env}': create it from the environment menu");
+            found.push(http_syntax::Diagnostic { line: 1, severity: http_syntax::Severity::Error, code: "unknown_environment", message });
+        }
         self.editor.update(cx, |s, cx| {
             if let Some(set) = s.diagnostics_mut() {
                 set.clear();
@@ -193,7 +201,7 @@ impl Doc {
 
     /// After an environment switch: new values for run, hover and diagnostics.
     pub fn set_env(&mut self, (env, env_names, all, env_name): EnvView, exec: Arc<Executor>, cx: &mut App) {
-        (self.env, self.env_names, self.exec) = (Arc::new(env), env_names, exec);
+        (self.env, self.env_names, self.env_name, self.exec) = (Arc::new(env), env_names, env_name.clone(), exec);
         {
             let mut lang = self.lang.borrow_mut();
             (lang.env, lang.all, lang.env_name) = (self.env.clone(), Arc::new(all), env_name);
@@ -250,6 +258,81 @@ impl Doc {
         .absolute()
         .inset_0()
     }
+}
+
+impl Doc {
+    /// Request lines running now. By status: a finished request's task stays in `tasks`.
+    pub fn running_lines(&self) -> Vec<usize> {
+        self.status.iter().filter(|(_, s)| matches!(s, Status::Running)).map(|(l, _)| *l).collect()
+    }
+
+    /// A green ▶ in the gutter at each visible request line, right of its number (a red ■ while
+    /// it runs; setting `editor.send_button`). Painted over the editor at paint time from the
+    /// layout just made, so it follows edits, wrapping, folding and scrolling. A click runs (or
+    /// cancels) that request.
+    pub fn send_buttons(&self, view: WeakEntity<crate::Respite>) -> impl IntoElement {
+        let (editor, path) = (self.editor.clone(), self.path.clone());
+        let lines: Vec<usize> = self.file.requests.iter().map(|r| r.request_line).collect();
+        let running: Vec<usize> = self.running_lines();
+        canvas(
+            move |bounds, window, cx| {
+                let s = editor.read(cx);
+                let Some(vis) = s.visible_row_range() else { return vec![] };
+                let (text, map) = (s.text(), s.display_map());
+                let mut out = vec![];
+                for &line in &lines {
+                    let row = line - 1;
+                    if map.is_buffer_line_hidden(row) || !vis.contains(&map.buffer_line_to_display_row(row)) {
+                        continue;
+                    }
+                    let start = text.line_start_offset(row);
+                    let Some(at) = s.range_to_bounds(&(start..start)) else { continue };
+                    // A square as tall as the line, ending just before the text: right of the number.
+                    let side = at.size.height;
+                    let rect = Bounds::new(point((at.left() - side - px(2.)).max(bounds.left()), at.top()), size(side, side));
+                    if rect.top() < bounds.top() || rect.bottom() > bounds.bottom() {
+                        continue;
+                    }
+                    let hitbox = window.insert_hitbox(rect, HitboxBehavior::BlockMouseExceptScroll);
+                    out.push((rect, hitbox, line, running.contains(&line)));
+                }
+                out
+            },
+            move |_, buttons, window, cx| {
+                for (rect, hitbox, line, busy) in buttons {
+                    paint_arrow(busy, hitbox.is_hovered(window), rect, window, cx);
+                    window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                    let (view, path) = (view.clone(), path.clone());
+                    window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && e.button == MouseButton::Left && hitbox.is_hovered(window) {
+                            cx.stop_propagation();
+                            view.update(cx, |this, cx| this.send_or_cancel(&path, line, window, cx)).ok();
+                        }
+                    });
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+}
+
+fn shape(label: &str, size: Pixels, color: Hsla, window: &mut Window) -> ShapedLine {
+    let font = window.text_style().font();
+    let run = TextRun { len: label.len(), font, color, background_color: None, underline: None, strikethrough: None };
+    window.text_system().shape_line(SharedString::from(label.to_string()), size, &[run], None)
+}
+
+/// A green ▶ (red ■ while running) in the gutter, at the request line.
+fn paint_arrow(busy: bool, hover: bool, rect: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let t = cx.theme();
+    let color = if busy { t.danger } else { t.success };
+    if hover {
+        window.paint_quad(fill(rect, t.list_hover).corner_radii(px(4.)));
+    }
+    let s = shape(if busy { "■" } else { "▶" }, t.font_size * 1.15, color, window);
+    let at = point(rect.left() + (rect.size.width - s.width) / 2., rect.top());
+    let _ = s.paint(at, rect.size.height, TextAlign::Left, None, window, cx);
 }
 
 pub fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {

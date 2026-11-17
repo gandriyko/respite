@@ -13,8 +13,9 @@ From an agent, use the CLI only; never launch the GUI.
 - Pass `--non-interactive` to `run`: otherwise a `@prompt` or `@note` waits for input.
 - Pass `--output json` (or `jsonl`) when you read the result; without a TTY JSON is the default.
 - Before sending anything with side effects, check it with `--dry-run` or `show --resolved`.
-- Never write secrets into `.http` files; use environment files (below). Client secrets,
-  passwords and `SSLConfiguration` belong in `respite-<env>.private.json`.
+- Never write secrets into `.http` files; use environment files (below, in
+  `~/.config/respite/env/`). Name secret keys so they read as secrets (`password`, `apiKey`,
+  `clientSecret`, `token`): only those are masked in output and history.
 - After editing a `.http` file, run `respite check` on it.
 - A network error carries its cause, for example "connection refused" or "certificate
   required". Read it before changing the request: a TLS or proxy problem is fixed in the env
@@ -30,23 +31,24 @@ Requests are addressed by `@name`, `###` title, `:LINE` (any line of the block) 
 | `respite show FILE REQUEST [--resolved]` | The request block; `--resolved` substitutes variables |
 | `respite run FILE [REQUESTS]...` | Send requests (none named = all, in file order) |
 | `respite check [PATHS]...` | Diagnostics only, sends nothing (pre-commit / CI) |
-| `respite import PATH [--to DIR]` | Postman / Insomnia / OpenAPI / Swagger / Bruno folder / HAR → `.http` files in a new folder |
+| `respite import PATH [--to DIR]` | Postman / Insomnia / OpenAPI / Swagger / Bruno folder / HAR → `.http` files in a new folder (default under `~/.config/respite`), its environments into the env folder |
 | `respite import-curl` | cURL command(s) from stdin → request block(s) |
 | `respite export-curl FILE REQUEST [--raw]` | Request → cURL; `--raw` keeps `{{variables}}` |
-| `respite env list [--dir DIR]` | Environment names visible from a directory |
-| `respite env show NAME [--dir DIR]` | Merged variables of one environment, secrets masked |
-| `respite auth token ID [--force] [--dir DIR]` | OAuth 2.0 token of a config: cached while fresh, else refreshed or acquired; `--force` runs the full grant |
-| `respite auth clear [--env NAME] [--dir DIR]` | Forget the cached OAuth 2.0 tokens of one environment |
-| `respite history [--last N]` | Past executions of this workspace (default 20) |
-| `respite mcp` | MCP server on stdio (see below) |
+| `respite env list` | Environment names |
+| `respite env show NAME` | Merged variables of one environment, secrets masked |
+| `respite auth token ID [--force]` | OAuth 2.0 token of a config: cached while fresh, else refreshed or acquired; `--force` runs the full grant |
+| `respite auth clear [--env NAME]` | Forget the cached OAuth 2.0 tokens of one environment |
+| `respite history [--last N]` | Past executions, newest first (default 20) |
+| `respite mcp [--root DIR]` | MCP server on stdio (see below) |
 
 `list`, `check`, `import`, `env`, `history` and `run` take `--output human|json|jsonl`.
 
 Variables (`run`, `show`, `export-curl`, `auth token`):
 
-- `--env NAME` — environment (`dev` reads `respite-dev.json`).
+- `--env NAME` — environment (`dev` reads `respite-dev.json`); without it, the file's `# @env`.
 - `--var KEY=VALUE` — override any variable, highest priority, repeatable.
-- `--env-file PATH` — extra env file above the chain, named `respite-<env>(.private).json`, repeatable.
+- `--env-file PATH` — extra env file over the env folder's, named `respite-<env>.json`,
+  repeatable (CI: env files from the repo or secrets).
 
 `run` options:
 
@@ -86,14 +88,24 @@ Values of secret variables are masked.
 `list`, `check`, `show`, `run`, `export_curl`, `import`, `import_curl`, `env_list`,
 `env_show`, `history`. Arguments mirror the flags (`dry_run`, `fail_on_status`, …); `vars` is
 an object instead of repeated `--var`. Each tool returns the command's JSON output; a non-zero
-exit code sets `isError` and is appended to the text. `run` is always non-interactive.
-Relative paths resolve against the directory the client starts the server in. History marks
-these runs `mcp`. Register it, for example in Claude Code:
-`claude mcp add respite -- respite mcp`.
+exit code sets `isError` and is appended to the text. History marks these runs `mcp`.
+
+- `--root DIR` is the workspace (default: the directory the client starts the server in).
+  Relative paths start there, and every path must stay inside it; where a request file is
+  expected it must be `.http` / `.rest`. Env files can't be read through the tools.
+- Nothing returns secrets in clear: `show` has no `resolved` (use `run` with `dry_run`, which
+  masks), `export_curl` keeps `{{variables}}`, and `run` masks secret env values, OAuth
+  tokens and the `$processEnv` / `$dotenv` values the file uses.
+- `run` is always non-interactive: `@note` requests are refused, `@prompt` values come in `vars`.
+- The tools still send requests with the secrets in them, to whatever host the file names.
+
+Register it, for example in Claude Code: `claude mcp add respite -- respite mcp`. Clients that
+start servers elsewhere (Claude Desktop) need `respite mcp --root /path/to/project`.
 
 ## File syntax
 
 ```http
+# @env dev
 @host = {{baseUrl}}
 
 ### Log in
@@ -122,6 +134,7 @@ Authorization: Bearer {{login.response.body.$.token}}
 
 | Directive | Effect |
 |---|---|
+| `# @env dev` | **First line only**: the environment the whole file runs with (`--env` overrides it); elsewhere it's a `misplaced_env` warning |
 | `# @name login` | Name the request (for addressing and chaining); must be unique in the file |
 | `# @timeout 10 s` | Request timeout; `ms` / `s` / `m`, seconds by default |
 | `# @connection-timeout 2 s` | Connect timeout |
@@ -137,12 +150,13 @@ Authorization: Bearer {{login.response.body.$.token}}
 ### Variables
 
 - File variables: `@name = value` (may reference other variables).
-- Environments: `respite-<env>.json` — a flat `{"key": "value"}` object. Shared values go in
-  `respite.json`. Secrets go in git-ignored `respite-<env>.private.json` / `respite.private.json`;
-  their values are masked in output and history. Files are found in every folder from the
-  workspace root down to the `.http` file, and deeper folders win. One file per environment
-  is enough, public or private alone. Split into two only when the folder is in git: the public
-  file for what the team shares, the private one for secrets.
+- Environments live in one folder, `~/.config/respite/env/`, for every `.http` file wherever it
+  is. `respite-<env>.json` is a flat `{"key": "value"}` object; shared values go in
+  `respite.json`. Secrets live in the same file: values whose key contains `pass`, `pwd`,
+  `secret`, `token`, `key` or `credential` are masked in output and history (there are no
+  `.private.json` files; `check` reports leftover ones). A file picks its
+  environment with `# @env NAME` on its first line; without it only `respite.json` applies.
+  Env files next to `.http` files are not read; in CI pass them with `--env-file`.
 - Dynamic:
   - `{{$uuid}}`, `{{$randomInt 1 100}}`
   - `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$localDatetime}}`
@@ -163,7 +177,7 @@ Authorization: Bearer {{$auth.token("api")}}
 ```
 
 ```jsonc
-// respite-dev.json (committed)
+// ~/.config/respite/env/respite-dev.json
 { "Security": { "Auth": { "api": {
   "Type": "OAuth2",
   "Grant Type": "Client Credentials",
@@ -171,8 +185,8 @@ Authorization: Bearer {{$auth.token("api")}}
   "Client ID": "respite",
   "Client Secret": "{{clientSecret}}",
   "Scope": "read write"
-}}}}
-// respite-dev.private.json (git-ignored): { "clientSecret": "…" }
+}}},
+  "clientSecret": "…" }
 ```
 
 - `{{$auth.token("id")}}` is the access token, `{{$auth.idToken("id")}}` the ID token.
@@ -198,21 +212,22 @@ Authorization: Bearer {{$auth.token("api")}}
   - `Custom Request Parameters` / `Custom Request Headers` — `"name": "v"`, a list, or
     `{"Value": …, "Use": "Everywhere" | "In Auth Request" | "In Token Request"}`;
   - `Acquire Automatically: false` — requests fail until `respite auth token ID` gets one.
-- Config values may use `{{variables}}`; keep secrets in `.private` files. A private file can
-  hold just the fields it adds (`"Client Secret"`): configs merge field by field.
+- Config values may use `{{variables}}`. A config in `respite.json` applies to every
+  environment; an environment's file can add just some fields (`"Client Secret"`): configs
+  merge field by field. Configs always count as secret.
 - The token is acquired before the first request that needs it, then reused. Near expiry it is
   renewed with the refresh token, falling back to the full grant. Changing the config drops it.
-- Cache: `~/.respite/history/<project>/oauth.<env>.json`, owner-only. Tokens are masked in
+- Cache: `~/.respite/history/oauth.<env>.json`, owner-only. Tokens are masked in
   history.
 - `check` reports `unknown_auth` for an id that no env file defines.
 
 ### Client certificates, CAs, proxy
 
-Client certificates (mTLS) use JetBrains' `SSLConfiguration` in an env file, usually the
-private one. It applies to every request of that environment, token requests included:
+Client certificates (mTLS) use JetBrains' `SSLConfiguration` in an env file. It applies to
+every request of that environment, token requests included:
 
 ```jsonc
-// respite-dev.private.json
+// respite-dev.json
 { "SSLConfiguration": {
   "clientCertificate": "certs/client.pem",       // or {"path": "certs/client.der", "format": "DER"}
   "clientCertificateKey": "certs/client.key",
@@ -269,10 +284,13 @@ In JSON output each request has `"tests": [{"line", "assert", "passed", "detail"
 
 ## Workflow for testing an endpoint
 
-1. Find or create the `.http` file next to the code: `respite list`; `respite env list`.
+1. Find or create the `.http` file next to the code: `respite list`; `respite env list`. Put
+   `# @env <env>` on its first line when it should always run with one environment.
 2. Add the request and its `# @assert` lines; run `respite check <file>`.
-3. Run it: `respite run <file> <name> --env <env> --output json --non-interactive`.
+3. Run it: `respite run <file> <name> --output json --non-interactive` (add `--env <env>` to
+   override the file's `# @env`).
 4. Read `response` and `tests`. On failure, report the failed assert, its `detail`, and the
    status plus a body excerpt. Fix the code or the expectation, then run again.
-5. For CI: `respite run <file> --env <env> --fail-fast --non-interactive`; exit code ≠ 0 fails
-   the job.
+5. For CI there is no `~/.config/respite/env/`: pass the env files with `--env-file`, e.g.
+   `respite run <file> --env staging --env-file ci/respite-staging.json --fail-fast
+   --non-interactive`; exit code ≠ 0 fails the job.

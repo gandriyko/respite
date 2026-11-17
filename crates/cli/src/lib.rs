@@ -50,13 +50,14 @@ enum Cmd {
     ImportCurl(curl::ImportArgs),
     /// Request → cURL command (variables substituted unless --raw)
     ExportCurl(curl::ExportArgs),
-    /// Postman / Insomnia / OpenAPI / Swagger / Bruno / HAR → .http files in a new folder
+    /// Postman / Insomnia / OpenAPI / Swagger / Bruno / HAR → .http files in a new folder,
+    /// environments into ~/.config/respite/env
     Import {
         /// Export file, spec, or Bruno collection folder
         path: PathBuf,
-        /// Where the new folder goes (default: current directory)
-        #[arg(long, default_value = ".")]
-        to: PathBuf,
+        /// Where the new folder goes (default: ~/.config/respite)
+        #[arg(long)]
+        to: Option<PathBuf>,
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
@@ -67,7 +68,7 @@ enum Cmd {
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
-    /// Environments from respite-<env>(.private).json
+    /// Environments from respite-<env>.json
     Env {
         #[command(subcommand)]
         cmd: EnvCmd,
@@ -85,23 +86,23 @@ enum Cmd {
         output: Option<Format>,
     },
     /// MCP server on stdio for AI agents (tools: list, run, check, …)
-    Mcp,
+    Mcp {
+        /// Workspace the tools may touch; relative paths start here (default: current directory)
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
 enum EnvCmd {
-    /// Environment names visible from a directory's env-file chain
+    /// Environment names (env files in ~/.config/respite/env)
     List {
-        #[arg(long, default_value = ".")]
-        dir: PathBuf,
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
     /// Merged variables of one environment (secrets masked)
     Show {
         name: String,
-        #[arg(long, default_value = ".")]
-        dir: PathBuf,
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
@@ -116,8 +117,6 @@ enum AuthCmd {
         /// Skip the cache and the refresh token: run the full grant
         #[arg(long)]
         force: bool,
-        #[arg(long, default_value = ".")]
-        dir: PathBuf,
         #[command(flatten)]
         env: EnvArgs,
         #[arg(long, value_enum)]
@@ -125,8 +124,6 @@ enum AuthCmd {
     },
     /// Forget the cached tokens of one environment
     Clear {
-        #[arg(long, default_value = ".")]
-        dir: PathBuf,
         /// Environment name; none = the tokens used without one
         #[arg(long)]
         env: Option<String>,
@@ -135,13 +132,13 @@ enum AuthCmd {
 
 #[derive(Args, Clone, Default)]
 pub(crate) struct EnvArgs {
-    /// Environment name (`dev` for respite-dev.json)
+    /// Environment name (`dev` for respite-dev.json); default: the file's `# @env`
     #[arg(long)]
     pub env: Option<String>,
     /// Override a variable, any level (repeatable)
     #[arg(long = "var", value_name = "KEY=VALUE")]
     pub vars: Vec<String>,
-    /// Extra env file above the chain, named respite-<env>(.private).json (repeatable)
+    /// Extra env file over the central ones, named respite-<env>.json (repeatable)
     #[arg(long = "env-file", value_name = "PATH")]
     pub env_files: Vec<PathBuf>,
 }
@@ -178,7 +175,7 @@ pub fn main_if_cli() -> Option<ExitCode> {
         Cmd::Env { cmd: EnvCmd::List { output, .. } | EnvCmd::Show { output, .. } } => Format::resolve(*output),
         Cmd::Auth { cmd: AuthCmd::Token { output, .. } } => Format::resolve(*output),
         Cmd::Run(a) => Format::resolve(a.output),
-        Cmd::Show { .. } | Cmd::Mcp | Cmd::ImportCurl(_) | Cmd::ExportCurl(_) | Cmd::Auth { cmd: AuthCmd::Clear { .. } } => Format::Human,
+        Cmd::Show { .. } | Cmd::Mcp { .. } | Cmd::ImportCurl(_) | Cmd::ExportCurl(_) | Cmd::Auth { cmd: AuthCmd::Clear { .. } } => Format::Human,
     } == Format::Human;
     Some(match dispatch(cli) {
         Ok(code) => ExitCode::from(code),
@@ -196,28 +193,30 @@ fn dispatch(cli: Cli) -> Result<u8, CliError> {
         Cmd::Run(args) => run::run(args),
         Cmd::ImportCurl(args) => curl::import(args),
         Cmd::ExportCurl(args) => curl::export(args),
-        Cmd::Import { path, to, output } => import(&path, &to, Format::resolve(output)),
+        Cmd::Import { path, to, output } => import(&path, to, Format::resolve(output)),
         Cmd::Check { paths, output } => check(&paths, Format::resolve(output)),
-        Cmd::Env { cmd: EnvCmd::List { dir, output } } => env_list(&dir, Format::resolve(output)),
-        Cmd::Env { cmd: EnvCmd::Show { name, dir, output } } => env_show(&name, &dir, Format::resolve(output)),
-        Cmd::Auth { cmd: AuthCmd::Token { id, force, dir, env, output } } => auth_token(&id, force, &dir, &env, Format::resolve(output)),
-        Cmd::Auth { cmd: AuthCmd::Clear { dir, env } } => {
-            let probe = std::path::absolute(&dir).unwrap_or(dir).join("_.http");
-            executor(&http_env::workspace_root(&probe), env.as_deref()).clear_tokens();
+        Cmd::Env { cmd: EnvCmd::List { output } } => env_list(Format::resolve(output)),
+        Cmd::Env { cmd: EnvCmd::Show { name, output } } => env_show(&name, Format::resolve(output)),
+        Cmd::Auth { cmd: AuthCmd::Token { id, force, env, output } } => auth_token(&id, force, &env, Format::resolve(output)),
+        Cmd::Auth { cmd: AuthCmd::Clear { env } } => {
+            executor(env.as_deref()).clear_tokens();
             Ok(0)
         }
         Cmd::History { last, output } => history(last, Format::resolve(output)),
-        Cmd::Mcp => Ok(mcp::serve()),
+        Cmd::Mcp { root } => {
+            let root = root.unwrap_or_else(|| ".".into());
+            let root = root.canonicalize().map_err(|e| CliError::new("bad_argument", format!("--root: {e}"), 3).at(&root, None))?;
+            Ok(mcp::serve(&root))
+        }
     }
 }
 
 /// `respite auth token`: the token is printed in full, the user asked for it.
-fn auth_token(id: &str, force: bool, dir: &Path, args: &EnvArgs, format: Format) -> Result<u8, CliError> {
-    let path = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()).join("_.http");
-    let root = http_env::workspace_root(&path);
-    let loaded = Loaded { path, root, file: Default::default(), src: String::new() };
-    let (env, overrides) = environment(&loaded, args)?;
-    let exec = executor(&loaded.root, args.env.as_deref());
+fn auth_token(id: &str, force: bool, args: &EnvArgs, format: Format) -> Result<u8, CliError> {
+    let path = std::path::absolute("_.http").unwrap_or_default();
+    let loaded = Loaded { path, file: Default::default(), src: String::new() };
+    let (env, overrides, name) = environment(&loaded, args)?;
+    let exec = executor(name.as_deref());
     let cx = http_exec::Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     let t = rt.block_on(exec.auth_token(&cx, id, force)).map_err(|e| run::exec_error_plain(e, &loaded.path))?;
@@ -239,9 +238,12 @@ fn auth_token(id: &str, force: bool, dir: &Path, args: &EnvArgs, format: Format)
     Ok(0)
 }
 
-fn import(path: &Path, to: &Path, format: Format) -> Result<u8, CliError> {
+fn import(path: &Path, to: Option<PathBuf>, format: Format) -> Result<u8, CliError> {
     let c = http_import::import(path).map_err(|e| CliError::new("import_failed", e, 3))?;
-    let files = http_import::write(&c, to).map_err(|e| CliError::new("io_error", e.to_string(), 3).at(to, None))?;
+    let no_home = || CliError::new("io_error", "no home directory", 3);
+    let to = to.or_else(http_env::collections_dir).ok_or_else(no_home)?;
+    let env_dir = http_env::env_dir().ok_or_else(no_home)?;
+    let files = http_import::write(&c, &to, &env_dir).map_err(|e| CliError::new("io_error", e.to_string(), 3).at(&to, None))?;
     if format == Format::Human {
         println!("Imported {} '{}':", c.format, c.name);
         for f in &files {
@@ -321,7 +323,6 @@ pub(crate) fn paint(s: &str, code: &str, err: bool) -> String {
 
 pub(crate) struct Loaded {
     pub path: PathBuf,
-    pub root: PathBuf,
     pub file: HttpFile,
     pub src: String,
 }
@@ -330,8 +331,7 @@ pub(crate) fn load(path: &Path) -> Result<Loaded, CliError> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(path, None))?;
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let root = http_env::workspace_root(&path);
-    Ok(Loaded { file: http_syntax::parse(&src), path, root, src })
+    Ok(Loaded { file: http_syntax::parse(&src), path, src })
 }
 
 /// Request address: `name` (or `###` title), `:LINE`, `#N`.
@@ -357,19 +357,23 @@ pub(crate) fn find(loaded: &Loaded, addr: &str) -> Result<usize, CliError> {
 pub(crate) type Vars = HashMap<String, Variable>;
 pub(crate) type Overrides = HashMap<String, String>;
 
-/// Merged variables for `args.env` plus `--var` overrides. Env-file errors go to stderr.
-pub(crate) fn environment(loaded: &Loaded, args: &EnvArgs) -> Result<(Vars, Overrides), CliError> {
-    let mut extra = settings_env_files(&loaded.root);
-    extra.extend(args.env_files.iter().cloned());
-    let envs = Environments::load(&loaded.path, &loaded.root, &extra);
+/// Merged variables of the environment (`--env`, else the file's `# @env`), `--var` overrides,
+/// and the environment's name. Env-file errors go to stderr.
+pub(crate) fn environment(loaded: &Loaded, args: &EnvArgs) -> Result<(Vars, Overrides, Option<String>), CliError> {
+    let envs = Environments::load(&args.env_files);
     for (p, e) in &envs.errors {
         eprintln!("{} {}: {e}", paint("warning:", YELLOW, true), p.display());
     }
-    if let Some(name) = &args.env
+    let name = args.env.clone().or_else(|| loaded.file.env.clone());
+    if let Some(name) = &name
         && !envs.names().contains(name)
     {
-        return Err(CliError::new("unknown_environment", format!("no environment '{name}'"), 3)
-            .hint(format!("available: {}", envs.names().join(", "))));
+        let mut e = CliError::new("unknown_environment", format!("no environment '{name}'"), 3)
+            .hint(format!("available: {} (env files in {})", envs.names().join(", "), env_dir_shown()));
+        if args.env.is_none() {
+            e = e.at(&loaded.path, Some(1));
+        }
+        return Err(e);
     }
     let overrides = args
         .vars
@@ -380,20 +384,20 @@ pub(crate) fn environment(loaded: &Loaded, args: &EnvArgs) -> Result<(Vars, Over
                 .ok_or_else(|| CliError::new("bad_argument", format!("--var expects KEY=VALUE, got '{kv}'"), 3))
         })
         .collect::<Result<_, _>>()?;
-    Ok((envs.variables(args.env.as_deref()), overrides))
+    Ok((envs.variables(name.as_deref()), overrides, name))
 }
 
-/// Global + workspace settings; problems in the files go to stderr.
-pub(crate) fn settings(root: &Path) -> Settings {
-    let loaded = respite_settings::Loaded::load(Some(root));
+fn env_dir_shown() -> String {
+    http_env::env_dir().map_or_else(|| "~/.config/respite/env".into(), |d| d.display().to_string())
+}
+
+/// Settings; problems in the file go to stderr.
+pub(crate) fn settings() -> Settings {
+    let loaded = respite_settings::Loaded::load();
     for e in &loaded.errors {
         eprintln!("{} {e}", paint("warning:", YELLOW, true));
     }
     loaded.settings
-}
-
-fn settings_env_files(root: &Path) -> Vec<PathBuf> {
-    settings(root).env_files(root)
 }
 
 /// Request defaults from `request.*` settings.
@@ -409,10 +413,10 @@ pub fn exec_options(s: &Settings) -> http_exec::Options {
 }
 
 /// Executor with history (limits from settings) and request defaults.
-pub(crate) fn executor(root: &Path, env: Option<&str>) -> http_exec::Executor {
-    let s = settings(root);
+pub(crate) fn executor(env: Option<&str>) -> http_exec::Executor {
+    let s = settings();
     let source = if std::env::var(mcp::SOURCE_ENV).as_deref() == Ok("mcp") { "mcp" } else { "cli" };
-    let exec = http_exec::Executor::new(open_store(root, &s), env, source);
+    let exec = http_exec::Executor::new(open_store(&s), env, source);
     exec.set_options(exec_options(&s));
     // Browser and device sign-ins: stdout stays the result, the instructions go to stderr.
     exec.set_auth_ui(http_exec::AuthUi {
@@ -476,8 +480,8 @@ fn show(path: &Path, addr: &str, resolved: bool, args: &EnvArgs) -> Result<u8, C
         println!("{}", block.join("\n"));
         return Ok(0);
     }
-    let (env, overrides) = environment(&loaded, args)?;
-    let exec = executor(&loaded.root, args.env.as_deref());
+    let (env, overrides, name) = environment(&loaded, args)?;
+    let exec = executor(name.as_deref());
     let cx = http_exec::Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
     let sent = exec.prepare(&cx, index).map_err(|e| run::exec_error(e, &loaded, r))?;
     println!("{} {}", sent.method, sent.url);
@@ -490,8 +494,10 @@ fn show(path: &Path, addr: &str, resolved: bool, args: &EnvArgs) -> Result<u8, C
     Ok(0)
 }
 
-pub(crate) fn open_store(root: &Path, s: &Settings) -> Option<Store> {
-    let mut store = Store::open(&Store::default_base()?, root)
+/// One history for everything: its root is the central folder, so `Entry::file` is relative
+/// there and absolute for files elsewhere. The app opens the same one.
+pub fn open_store(s: &Settings) -> Option<Store> {
+    let mut store = Store::open(&Store::default_base()?, &http_env::collections_dir()?)
         .inspect_err(|e| eprintln!("{} history disabled: {e}", paint("warning:", YELLOW, true)))
         .ok()?;
     (store.per_request, store.total) = (s.history.per_request, s.history.total);
@@ -501,11 +507,9 @@ pub(crate) fn open_store(root: &Path, s: &Settings) -> Option<Store> {
 fn check(paths: &[PathBuf], format: Format) -> Result<u8, CliError> {
     let paths = if paths.is_empty() { vec![PathBuf::from(".")] } else { paths.to_vec() };
     let mut rows = vec![];
-    let mut bad_env_files = std::collections::BTreeMap::new();
+    let envs = Environments::load(&[]);
     for f in paths.iter().flat_map(|p| http_files(p)) {
         let loaded = load(&f)?;
-        let envs = Environments::load(&loaded.path, &loaded.root, &settings_env_files(&loaded.root));
-        bad_env_files.extend(envs.errors.iter().cloned());
         let dir = loaded.path.parent().unwrap_or(Path::new("."));
         let mut diags = loaded.file.diagnostics.clone();
         diags.extend(http_env::check(&loaded.file, &envs, dir));
@@ -514,8 +518,8 @@ fn check(paths: &[PathBuf], format: Format) -> Result<u8, CliError> {
             rows.push((f.display().to_string(), d.line, d.severity, d.code, d.message));
         }
     }
-    for (p, e) in bad_env_files {
-        rows.push((p.display().to_string(), 1, Severity::Error, "invalid_env_file", e));
+    for (p, e) in &envs.errors {
+        rows.push((p.display().to_string(), 1, Severity::Error, "invalid_env_file", e.clone()));
     }
     let errors = rows.iter().filter(|r| r.2 == Severity::Error).count();
     let sev = |s: Severity| if s == Severity::Error { "error" } else { "warning" };
@@ -542,15 +546,8 @@ fn check(paths: &[PathBuf], format: Format) -> Result<u8, CliError> {
     Ok(if errors > 0 { 3 } else { 0 })
 }
 
-/// Env chain as seen by a `.http` file in `dir`.
-fn dir_envs(dir: &Path) -> Environments {
-    let probe = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()).join("_.http");
-    let root = http_env::workspace_root(&probe);
-    Environments::load(&probe, &root, &settings_env_files(&root))
-}
-
-fn env_list(dir: &Path, format: Format) -> Result<u8, CliError> {
-    let names = dir_envs(dir).names();
+fn env_list(format: Format) -> Result<u8, CliError> {
+    let names = Environments::load(&[]).names();
     match format {
         Format::Human => names.iter().for_each(|n| println!("{n}")),
         _ => println!("{}", json!(names)),
@@ -558,11 +555,11 @@ fn env_list(dir: &Path, format: Format) -> Result<u8, CliError> {
     Ok(0)
 }
 
-fn env_show(name: &str, dir: &Path, format: Format) -> Result<u8, CliError> {
-    let envs = dir_envs(dir);
+fn env_show(name: &str, format: Format) -> Result<u8, CliError> {
+    let envs = Environments::load(&[]);
     if !envs.names().iter().any(|n| n == name) {
         return Err(CliError::new("unknown_environment", format!("no environment '{name}'"), 3)
-            .hint(format!("available: {}", envs.names().join(", "))));
+            .hint(format!("available: {} (env files in {})", envs.names().join(", "), env_dir_shown())));
     }
     let mut vars: Vec<_> = envs.variables(Some(name)).into_iter().collect();
     vars.sort_by(|a, b| a.0.cmp(&b.0));
@@ -593,9 +590,7 @@ pub(crate) fn status_color(status: u16) -> &'static str {
 }
 
 fn history(last: usize, format: Format) -> Result<u8, CliError> {
-    let cwd = std::path::absolute(".").unwrap_or_default();
-    let root = http_env::workspace_root(&cwd.join("_.http"));
-    let entries: Vec<_> = open_store(&root, &settings(&root)).map(|s| s.list()).unwrap_or_default().into_iter().take(last).collect();
+    let entries: Vec<_> = open_store(&settings()).map(|s| s.list()).unwrap_or_default().into_iter().take(last).collect();
     match format {
         Format::Human => {
             for e in &entries {

@@ -1,7 +1,8 @@
-//! Sidebar: projects → folders → `.http` files → requests.
+//! Sidebar: the central folder (folders → `.http` files → requests), then the files added
+//! from elsewhere.
 //!
 //! Styled after the VS Code / Zed project panels: disclosure chevrons, indent guides,
-//! compact single-child folders (`crates/app`), inset rounded selection, a fixed
+//! compact single-child folders (`api/v2`), inset rounded selection, a fixed
 //! right-aligned method column (as in Bruno / Insomnia) and muted meta on the right.
 
 use std::{
@@ -14,11 +15,7 @@ use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, input::Input};
 use http_exec::Store;
 
-use crate::{
-    Respite,
-    doc::Status,
-    workspace::{self, Project},
-};
+use crate::{Respite, doc::Status, workspace};
 
 const ROW_H: f32 = 24.;
 const INDENT: f32 = 14.;
@@ -27,10 +24,19 @@ const PAD: f32 = 6.;
 /// Chevron column width; leaves get a spacer of the same width.
 const CHEVRON: f32 = 14.;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Section {
+    /// `~/.config/respite`
+    Collections,
+    /// Added from elsewhere.
+    Files,
+}
+
 pub(crate) enum Row {
-    Project(usize),
+    Section(Section),
     Dir { path: PathBuf, name: String, depth: usize },
-    File { path: PathBuf, name: String, depth: usize, requests: usize },
+    /// `added`: in the Files section (× drops it from the list).
+    File { path: PathBuf, name: String, depth: usize, requests: usize, added: bool },
     Request { path: PathBuf, line: usize, method: String, label: String, depth: usize },
     Note { text: &'static str, depth: usize },
 }
@@ -38,13 +44,13 @@ pub(crate) enum Row {
 impl Row {
     fn depth(&self) -> usize {
         match self {
-            Row::Project(_) => 0,
+            Row::Section(_) => 0,
             Row::Dir { depth, .. } | Row::File { depth, .. } | Row::Request { depth, .. } | Row::Note { depth, .. } => *depth,
         }
     }
 }
 
-/// Folder tree of one project's files.
+/// Folder tree of the central folder.
 #[derive(Default)]
 struct Tree {
     dirs: BTreeMap<String, Tree>,
@@ -52,37 +58,55 @@ struct Tree {
 }
 
 impl Tree {
-    fn build(root: &Path, files: &[PathBuf]) -> Self {
+    /// `entries`: folders and files under `root` (folders make empty nodes).
+    fn build(root: &Path, entries: &[PathBuf]) -> Self {
         let mut tree = Tree::default();
-        for f in files {
-            let rel = f.strip_prefix(root).unwrap_or(f);
-            let dirs = rel.parent().into_iter().flat_map(|p| p.components()).map(|c| c.as_os_str().to_string_lossy().into_owned());
-            dirs.fold(&mut tree, |node, d| node.dirs.entry(d).or_default()).files.push(f.clone());
+        for e in entries {
+            let rel = e.strip_prefix(root).unwrap_or(e);
+            let is_dir = !workspace::is_request_file(e);
+            let parent = if is_dir { Some(rel) } else { rel.parent() };
+            let dirs = parent.into_iter().flat_map(|p| p.components()).map(|c| c.as_os_str().to_string_lossy().into_owned());
+            let node = dirs.fold(&mut tree, |node, d| node.dirs.entry(d).or_default());
+            if !is_dir {
+                node.files.push(e.clone());
+            }
         }
         tree
     }
 }
 
+/// `+`, new folder, `×` … on a row or a section header: shown on hover, or always.
+fn row_action(id: impl Into<ElementId>, child: impl IntoElement, always: bool, cx: &App) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .p_0p5()
+        .rounded_sm()
+        .text_color(cx.theme().muted_foreground)
+        .when(!always, |d| d.invisible().group_hover("row", |s| s.visible()))
+        .hover(|s| s.bg(cx.theme().list_active))
+        .child(child)
+}
+
 impl Respite {
-    pub(crate) fn add_project(&mut self, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add Project".into()),
-        });
-        cx.spawn(async move |this, cx| {
+    /// `+` in the Files section: `.http` / `.rest` files from anywhere, several at once.
+    pub(crate) fn add_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Add".into()) });
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
-            let Some(root) = paths.into_iter().next() else { return };
-            this.update(cx, |this, cx| {
-                if !this.projects.iter().any(|p| p.root == root) {
-                    this.projects.push(Project::new(root.clone()));
-                    this.save_projects();
+            this.update_in(cx, |this, window, cx| {
+                // ponytail: the system dialog has no extension filter here; other files are skipped after.
+                let (ok, skipped): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| workspace::is_request_file(p));
+                if !skipped.is_empty() {
+                    window.push_notification(format!("Skipped {} file(s): only .http and .rest", skipped.len()), cx);
                 }
-                if let Some(p) = this.projects.iter_mut().find(|p| p.root == root) {
-                    p.files = Some(workspace::scan(&root));
+                let first = ok.first().cloned();
+                for p in ok {
+                    this.add_file(p);
                 }
-                this.expanded.insert(root);
+                if let Some(p) = first {
+                    this.open(p, None, window, cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -90,10 +114,27 @@ impl Respite {
         .detach();
     }
 
-    /// Postman / Insomnia / OpenAPI / Bruno / HAR → a new folder in the collections dir.
+    /// List `path` in the Files section, unless it's there already or under the central folder.
+    pub(crate) fn add_file(&mut self, path: PathBuf) {
+        if path.starts_with(workspace::collections_dir()) || self.files.contains(&path) {
+            return;
+        }
+        self.files.push(path);
+        workspace::save_files(Store::default_base().as_deref(), &self.files);
+    }
+
+    /// Drops the file from the list only; the file and its history stay.
+    fn remove_file(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        self.files.retain(|p| p != path);
+        workspace::save_files(Store::default_base().as_deref(), &self.files);
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        window.push_notification(format!("Removed {name} from the list. The file and its history are kept."), cx);
+        cx.notify();
+    }
+
+    /// Postman / Insomnia / OpenAPI / Bruno / HAR → a new folder in the central folder (its
+    /// subfolders kept), environments into the env folder.
     pub(crate) fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let collections = workspace::collections_dir();
-        let current_root = self.doc().map(|d| self.root_of(&d.path));
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             // Bruno collections are folders.
@@ -106,26 +147,18 @@ impl Respite {
             let Some(src) = paths.into_iter().next() else { return };
             this.update_in(cx, |this, window, cx| {
                 let result = http_import::import(&src).and_then(|c| {
-                    // A collection becomes a new folder in the collections dir. Environments alone
-                    // go to the open file's project, else to a collection of their own: never to
-                    // the collections dir itself, where they'd apply to nothing visible.
-                    let dest = match (http_import::render(&c).is_empty(), current_root) {
-                        (false, _) => collections.clone(),
-                        (true, Some(root)) => root,
-                        (true, None) => collections.join(http_import::sanitize(&c.name)),
-                    };
-                    http_import::write(&c, &dest).map(|f| (c, f, dest)).map_err(|e| e.to_string())
+                    http_import::write(&c, &workspace::collections_dir(), &workspace::env_dir()).map(|f| (c, f)).map_err(|e| e.to_string())
                 });
-                let (c, files, dest) = match result {
+                let (c, files) = match result {
                     Ok(r) => r,
                     Err(e) => {
                         window.push_notification(format!("Import failed: {e}"), cx);
                         return;
                     }
                 };
-                this.rescan_projects_of(&dest);
-                this.expanded.insert(dest.clone());
-                if let Some(first) = files.iter().find(|f| f.extension().is_some_and(|e| e == "http")).or(files.first()) {
+                this.central = None;
+                this.reload_envs(cx);
+                if let Some(first) = files.iter().find(|f| workspace::is_request_file(f)).or(files.first()) {
                     this.open(first.clone(), None, window, cx);
                 }
                 let mut msg = format!("Imported {} '{}': {} file(s)", c.format, c.name, files.len());
@@ -140,29 +173,12 @@ impl Respite {
         .detach();
     }
 
-    /// Hover `+`: a new `.http` file in `dir`, named in the system save dialog.
-    fn add_button(&self, ix: usize, dir: PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id(("add-file", ix))
-            .flex_none()
-            .px_1()
-            .rounded_sm()
-            .text_color(cx.theme().muted_foreground)
-            .invisible()
-            .group_hover("row", |s| s.visible())
-            .hover(|s| s.bg(cx.theme().list_active))
-            .child("+")
-            .on_click(cx.listener(move |this, _, window, cx| {
-                cx.stop_propagation();
-                this.new_file(&dir, window, cx);
-            }))
-    }
-
+    /// A new `.http` file in `dir`, named in the system save dialog.
     fn new_file(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_new_path(dir, Some("requests.http"));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(mut path))) = picked.await else { return };
-            if path.extension().is_none_or(|e| e != "http" && e != "rest") {
+            if !workspace::is_request_file(&path) {
                 path.set_extension("http");
             }
             this.update_in(cx, |this, window, cx| {
@@ -173,7 +189,8 @@ impl Respite {
                     window.push_notification(format!("{}: {e}", path.display()), cx);
                     return;
                 }
-                this.rescan_projects_of(&path);
+                this.add_file(path.clone()); // saved outside the central folder: list it
+                this.central = None;
                 this.open(path, None, window, cx);
                 cx.notify();
             })
@@ -182,21 +199,23 @@ impl Respite {
         .detach();
     }
 
-    /// Drops the project from the sidebar list only; files and history stay.
-    fn remove_project(&mut self, pi: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if pi >= self.projects.len() {
-            return;
-        }
-        let p = self.projects.remove(pi);
-        self.expanded.remove(&p.root);
-        self.save_projects();
-        window.push_notification(format!("Removed {} from the list. Files and history are kept.", p.name), cx);
-        cx.notify();
-    }
-
-    fn save_projects(&self) {
-        let roots: Vec<PathBuf> = self.projects.iter().filter(|p| !p.flat).map(|p| p.root.clone()).collect();
-        workspace::save_list(Store::default_base().as_deref(), &roots);
+    /// A new folder in `dir`, named in the system save dialog.
+    fn new_folder(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_new_path(dir, Some("New Folder"));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            this.update_in(cx, |this, window, cx| {
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    window.push_notification(format!("{}: {e}", path.display()), cx);
+                    return;
+                }
+                this.collapsed_dirs.remove(&path);
+                this.central = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle(&mut self, key: &Path) {
@@ -211,14 +230,16 @@ impl Respite {
         }
     }
 
-    fn toggle_project(&mut self, pi: usize, cx: &mut Context<Self>) {
-        let p = &mut self.projects[pi];
-        if p.files.is_none() || !self.expanded.contains(&p.root) {
-            p.files = Some(workspace::scan(&p.root)); // rescan on expand: picks up new files
-        }
-        let root = p.root.clone();
-        self.toggle(&root);
-        cx.notify();
+    /// Folders and request files of the central folder, scanned once until something changes.
+    pub(crate) fn central_files(&mut self) -> Vec<PathBuf> {
+        self.central.get_or_insert_with(|| workspace::scan(&workspace::collections_dir())).clone()
+    }
+
+    /// Every request file the sidebar lists: the central folder's, then the added ones.
+    pub(crate) fn all_files(&mut self) -> Vec<PathBuf> {
+        let mut all: Vec<PathBuf> = self.central_files().into_iter().filter(|p| workspace::is_request_file(p)).collect();
+        all.extend(self.files.iter().cloned());
+        all
     }
 
     /// `(request_line, method, label)` of a file: live parse when open, else read once.
@@ -234,37 +255,24 @@ impl Respite {
     }
 
     fn build_rows(&mut self, query: &str) -> Vec<Row> {
-        let mut rows = vec![];
-        for pi in 0..self.projects.len() {
-            // Files are scanned lazily on expand; searching needs them all.
-            if !query.is_empty() && self.projects[pi].files.is_none() {
-                self.projects[pi].files = Some(workspace::scan(&self.projects[pi].root));
-            }
-            let p = &self.projects[pi];
-            let (root, files, flat) = (p.root.clone(), p.files.clone().unwrap_or_default(), p.flat);
-            if flat {
-                self.emit(&Tree::build(&root, &files), &root, 0, query, &mut rows);
-                continue;
-            }
-            if !query.is_empty() {
-                // Searching: only projects with matches, always expanded.
-                let mut found = vec![];
-                self.emit(&Tree::build(&root, &files), &root, 1, query, &mut found);
-                if !found.is_empty() {
-                    rows.push(Row::Project(pi));
-                    rows.extend(found);
-                }
-                continue;
-            }
-            rows.push(Row::Project(pi));
-            if !self.expanded.contains(&root) {
-                continue;
-            }
-            if files.is_empty() {
-                rows.push(Row::Note { text: "No .http or .rest files", depth: 1 });
-            }
-            self.emit(&Tree::build(&root, &files), &root, 1, query, &mut rows);
+        let root = workspace::collections_dir();
+        let central = self.central_files();
+        let mut rows = vec![Row::Section(Section::Collections)];
+        let mut found = vec![];
+        self.emit(&Tree::build(&root, &central), &root, 0, query, &mut found);
+        if found.is_empty() && query.is_empty() {
+            rows.push(Row::Note { text: "No files yet: + creates one", depth: 0 });
         }
+        rows.extend(found);
+        rows.push(Row::Section(Section::Files));
+        let mut found = vec![];
+        for f in self.files.clone() {
+            self.emit_file(&f, 0, query, true, &mut found);
+        }
+        if found.is_empty() && query.is_empty() {
+            rows.push(Row::Note { text: "+ adds .http / .rest files from anywhere", depth: 0 });
+        }
+        rows.extend(found);
         rows
     }
 
@@ -297,27 +305,50 @@ impl Respite {
             }
         }
         for f in &tree.files {
-            let outline = if workspace::is_env_file(f) { vec![] } else { self.outline_of(f) };
-            let name = f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-            if searching {
-                // A file-name match keeps all its requests; otherwise only the matching ones.
-                let file_hit = name.to_lowercase().contains(query);
-                let hits: Vec<_> = outline
-                    .into_iter()
-                    .filter(|(_, m, l)| file_hit || l.to_lowercase().contains(query) || m.to_lowercase().contains(query))
-                    .collect();
-                if hits.is_empty() && !file_hit {
-                    continue;
-                }
-                rows.push(Row::File { path: f.clone(), name, depth, requests: hits.len() });
-                rows.extend(hits.into_iter().map(|(line, method, label)| Row::Request { path: f.clone(), line, method, label, depth: depth + 1 }));
-                continue;
-            }
-            rows.push(Row::File { path: f.clone(), name, depth, requests: outline.len() });
-            if self.expanded.contains(f) {
-                rows.extend(outline.into_iter().map(|(line, method, label)| Row::Request { path: f.clone(), line, method, label, depth: depth + 1 }));
-            }
+            self.emit_file(f, depth, query, false, rows);
         }
+    }
+
+    fn emit_file(&mut self, f: &Path, depth: usize, query: &str, added: bool, rows: &mut Vec<Row>) {
+        let outline = self.outline_of(f);
+        let name = f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let path = f.to_path_buf();
+        if !query.is_empty() {
+            // A file-name match keeps all its requests; otherwise only the matching ones.
+            let file_hit = name.to_lowercase().contains(query);
+            let hits: Vec<_> =
+                outline.into_iter().filter(|(_, m, l)| file_hit || l.to_lowercase().contains(query) || m.to_lowercase().contains(query)).collect();
+            if hits.is_empty() && !file_hit {
+                return;
+            }
+            rows.push(Row::File { path: path.clone(), name, depth, requests: hits.len(), added });
+            rows.extend(hits.into_iter().map(|(line, method, label)| Row::Request { path: path.clone(), line, method, label, depth: depth + 1 }));
+            return;
+        }
+        rows.push(Row::File { path: path.clone(), name, depth, requests: outline.len(), added });
+        if self.expanded.contains(&path) {
+            rows.extend(outline.into_iter().map(|(line, method, label)| Row::Request { path: path.clone(), line, method, label, depth: depth + 1 }));
+        }
+    }
+
+    /// New file / new folder buttons for `dir` (a folder row or the Collections header).
+    fn folder_actions(&self, ix: usize, dir: &Path, always: bool, cx: &mut Context<Self>) -> [Stateful<Div>; 2] {
+        let size = cx.theme().font_size * 0.95;
+        let (d1, d2) = (dir.to_path_buf(), dir.to_path_buf());
+        [
+            row_action(("new-file", ix), Icon::default().data(include_bytes!("../assets/file-plus.svg")).size(size), always, cx).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.new_file(&d1, window, cx);
+                }),
+            ),
+            row_action(("new-folder", ix), Icon::default().data(include_bytes!("../assets/folder-plus.svg")).size(size), always, cx).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.new_folder(&d2, window, cx);
+                }),
+            ),
+        ]
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -350,31 +381,26 @@ impl Respite {
 
         // Inset by 4 px on both sides, so selection and hover read as rounded pills.
         let row = match row {
-            Row::Project(pi) => {
-                let (p, pi) = (&self.projects[*pi], *pi);
-                let open = self.expanded.contains(&p.root);
-                let remove = div()
-                    .id(("remove-project", pi))
-                    .flex_none()
-                    .px_1()
-                    .rounded_sm()
+            Row::Section(section) => {
+                let title = match section {
+                    Section::Collections => "COLLECTIONS",
+                    Section::Files => "FILES",
+                };
+                let head = base
+                    .cursor_default()
+                    .when(ix > 0, |r| r.mt_2())
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(muted)
-                    .invisible()
-                    .group_hover("row", |s| s.visible())
-                    .hover(move |s| s.bg(active))
-                    .child("×")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.remove_project(pi, window, cx);
-                    }));
-                base.when(pi > 0, |r| r.mt_1())
-                    .child(chevron(open, muted))
-                    .child(icon(if open { IconName::FolderOpen } else { IconName::Folder }, t.primary))
-                    .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).truncate().child(p.name.clone()))
-                    .child(self.add_button(ix, p.root.clone(), cx))
-                    .child(remove)
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_project(pi, cx)))
-                    .into_any_element()
+                    .child(div().flex_1().child(title));
+                match section {
+                    Section::Collections => head.children(self.folder_actions(ix, &workspace::collections_dir(), true, cx)),
+                    Section::Files => head.child(
+                        row_action("add-files", Icon::new(IconName::Plus).size_3p5(), true, cx)
+                            .on_click(cx.listener(|this, _, window, cx| this.add_files(window, cx))),
+                    ),
+                }
+                .into_any_element()
             }
             Row::Dir { path, name, .. } => {
                 let open = !self.collapsed_dirs.contains(path);
@@ -382,19 +408,19 @@ impl Respite {
                 base.child(chevron(open, muted))
                     .child(icon(if open { IconName::FolderOpen } else { IconName::Folder }, muted))
                     .child(div().flex_1().truncate().child(name.clone()))
-                    .child(self.add_button(ix, path.clone(), cx))
+                    .children(self.folder_actions(ix, path, false, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_dir(&p);
                         cx.notify();
                     }))
                     .into_any_element()
             }
-            Row::File { path, name, requests, .. } => {
+            Row::File { path, name, requests, added, .. } => {
                 let doc = self.docs.iter().position(|d| *d.path == *path);
                 let current = doc.is_some() && doc == self.current;
                 let dirty = doc.is_some_and(|i| self.docs[i].dirty);
                 let open = self.expanded.contains(path);
-                let (p, q) = (path.clone(), path.clone());
+                let (p, q, r) = (path.clone(), path.clone(), path.clone());
                 let toggle = div()
                     .id(("file-chevron", ix))
                     .flex_none()
@@ -404,18 +430,18 @@ impl Respite {
                         this.toggle(&q);
                         cx.notify();
                     }));
-                let env = workspace::is_env_file(path);
-                let meta = match (dirty, env) {
-                    (true, _) => "●".to_string(),
-                    (false, true) => String::new(),
-                    (false, false) => requests.to_string(),
-                };
+                let meta = if dirty { "●".to_string() } else { requests.to_string() };
+                let remove = added.then(|| {
+                    row_action(("remove-file", ix), Icon::new(IconName::Close).size_3(), false, cx).on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.remove_file(&r, window, cx);
+                    }))
+                });
                 base.when(current, |r| r.bg(active))
-                    .map(|r| if env { r.child(spacer()) } else { r.child(toggle) })
-                    .child(icon(if env { IconName::Globe } else { IconName::FileText }, if current { t.foreground } else { muted }))
+                    .child(toggle)
+                    .child(icon(IconName::FileText, if current { t.foreground } else { muted }))
                     .child(div().flex_1().truncate().child(name.clone()))
-                    // Next to the file: also how a collapsed `Demo/Demo.http` gets a sibling.
-                    .children(path.parent().map(|d| self.add_button(ix, d.to_path_buf(), cx)))
+                    .children(remove)
                     .child(div().flex_none().text_xs().text_color(muted).child(meta))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let is_current = this.doc().is_some_and(|d| *d.path == p);
@@ -488,23 +514,7 @@ impl Respite {
         }));
         let t = cx.theme();
         let (muted, hover) = (t.muted_foreground, t.list_hover);
-        let icon_button = |id: &'static str, name: IconName| {
-            div().id(id).p_1().rounded_md().cursor_pointer().text_color(muted).hover(move |s| s.bg(hover)).child(Icon::new(name).size_3p5())
-        };
-        let header = div()
-            .flex_none()
-            .h(px(32.))
-            .pl_3()
-            .pr_1p5()
-            .flex()
-            .items_center()
-            .justify_between()
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(muted)
-            .child("PROJECTS")
-            .child(icon_button("add-project", IconName::Plus).on_click(cx.listener(|this, _, _, cx| this.add_project(cx))));
-        let search = div().flex_none().px_2().pb_1p5().capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+        let search = div().flex_none().px_2().pt_2().pb_1p5().capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
             let step = match ev.keystroke.key.as_str() {
                 "up" => -1,
                 "down" => 1,
@@ -544,7 +554,6 @@ impl Respite {
             .flex_col()
             // Background and border come from the card it sits in (main.rs `card`).
             .text_color(t.sidebar_foreground)
-            .child(header)
             .child(search)
             .child(div().flex_1().min_h_0().child(list.size_full()))
             .child(div().flex_none().h(px(1.)).mx_2().bg(t.sidebar_border))
@@ -592,11 +601,13 @@ mod tests {
     #[test]
     fn tree_groups_by_folder() {
         let root = Path::new("/w");
-        let files = ["/w/a.http", "/w/crates/app/x.http", "/w/crates/app/y.rest", "/w/api/v1/z.http"].map(PathBuf::from);
-        let t = Tree::build(root, &files);
+        let entries = ["/w/a.http", "/w/api", "/w/api/v1", "/w/api/v1/z.http", "/w/crates/app/x.http", "/w/crates/app/y.rest", "/w/empty"]
+            .map(PathBuf::from);
+        let t = Tree::build(root, &entries);
         assert_eq!(t.files, [PathBuf::from("/w/a.http")]);
-        assert_eq!(t.dirs.keys().collect::<Vec<_>>(), ["api", "crates"]);
+        assert_eq!(t.dirs.keys().collect::<Vec<_>>(), ["api", "crates", "empty"]);
         assert_eq!(t.dirs["crates"].dirs["app"].files.len(), 2);
         assert_eq!(t.dirs["api"].dirs["v1"].files, [PathBuf::from("/w/api/v1/z.http")]);
+        assert!(t.dirs["empty"].files.is_empty() && t.dirs["empty"].dirs.is_empty()); // a new folder shows
     }
 }

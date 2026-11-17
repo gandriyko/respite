@@ -292,7 +292,7 @@ impl Lang {
         }
         let ctx = self.0.borrow();
         let shown = |v: &Variable| if v.secret { "••••••".to_string() } else { code(&v.value) };
-        // `respite.json` / `respite.private.json` apply with any environment, and with none.
+        // `respite.json` applies with any environment, and with none.
         let scope = |v: &Variable| match file_name(&v.source).starts_with("respite.") {
             true => ", shared by all environments",
             false => "",

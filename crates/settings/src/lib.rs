@@ -1,5 +1,4 @@
-//! Settings: `~/.config/respite/settings.json` (global) overlaid by
-//! `<workspace>/.respite/settings.json` (per project, can be committed).
+//! Settings: `~/.config/respite/settings.json`.
 //!
 //! JSON with `//` and `/* */` comments, nested by group (`request.timeout_ms` is
 //! `{"request": {"timeout_ms": …}}`). Missing keys take defaults, unknown keys are ignored.
@@ -62,6 +61,8 @@ pub struct Editor {
     pub soft_wrap: bool,
     /// Background on the line under the cursor.
     pub highlight_current_line: bool,
+    /// A green ▶ in the gutter at each request line; a click runs it.
+    pub send_button: bool,
 }
 
 /// The response panel (`"response": {…}`).
@@ -126,15 +127,13 @@ pub struct Curl {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Env {
-    /// Extra env files above the chain; `~/` is the home directory, relative = workspace root.
-    pub files: Vec<String>,
     /// Environments shown with a red warning; `*` matches any suffix, case-insensitive.
     pub prod_pattern: String,
 }
 
 impl Default for Env {
     fn default() -> Self {
-        Self { files: vec![], prod_pattern: "prod*".into() }
+        Self { prod_pattern: "prod*".into() }
     }
 }
 
@@ -171,7 +170,7 @@ impl Default for Settings {
 
 impl Default for Editor {
     fn default() -> Self {
-        Self { line_numbers: true, soft_wrap: false, highlight_current_line: false }
+        Self { line_numbers: true, soft_wrap: false, highlight_current_line: false, send_button: true }
     }
 }
 
@@ -194,23 +193,13 @@ impl Default for Curl {
     }
 }
 
-impl Settings {
-    /// `env.files` as paths (`~/` → home, relative → `root`).
-    pub fn env_files(&self, root: &Path) -> Vec<PathBuf> {
-        let home = std::env::home_dir().unwrap_or_default();
-        self.env.files.iter().map(|p| p.strip_prefix("~/").map_or_else(|| root.join(p), |rest| home.join(rest))).collect()
-    }
-}
-
-/// Both layers as written, plus the merged result.
+/// The file as written, plus the result over the defaults.
 #[derive(Clone)]
 pub struct Loaded {
     pub global_path: Option<PathBuf>,
-    pub workspace_path: Option<PathBuf>,
     global: Value,
-    workspace: Value,
     pub settings: Settings,
-    /// Unreadable / invalid files (their layer is skipped).
+    /// An unreadable / invalid file (the defaults apply).
     pub errors: Vec<String>,
 }
 
@@ -220,22 +209,21 @@ pub fn global_path() -> Option<PathBuf> {
 }
 
 impl Loaded {
-    pub fn load(root: Option<&Path>) -> Self {
-        Self::load_from(global_path(), root.map(|r| r.join(".respite/settings.json")))
+    pub fn load() -> Self {
+        Self::load_from(global_path())
     }
 
-    pub fn load_from(global_path: Option<PathBuf>, workspace_path: Option<PathBuf>) -> Self {
+    pub fn load_from(global_path: Option<PathBuf>) -> Self {
         let mut errors = vec![];
-        let mut read = |p: &Option<PathBuf>| match p.as_deref().map(read_jsonc) {
+        let global = match global_path.as_deref().map(read_jsonc) {
             Some(Ok(v)) => v,
             Some(Err(e)) => {
-                errors.push(format!("{}: {e}", p.as_ref().unwrap().display()));
+                errors.push(format!("{}: {e}", global_path.as_ref().unwrap().display()));
                 Value::Object(Map::new())
             }
             None => Value::Object(Map::new()),
         };
-        let (global, workspace) = (read(&global_path), read(&workspace_path));
-        let mut loaded = Self { global_path, workspace_path, global, workspace, settings: Settings::default(), errors };
+        let mut loaded = Self { global_path, global, settings: Settings::default(), errors };
         loaded.merge();
         loaded
     }
@@ -243,7 +231,6 @@ impl Loaded {
     fn merge(&mut self) {
         let mut v = serde_json::to_value(Settings::default()).expect("defaults serialize");
         deep_merge(&mut v, &self.global);
-        deep_merge(&mut v, &self.workspace);
         match serde_json::from_value(v) {
             Ok(s) => self.settings = s,
             Err(e) => self.errors.push(format!("settings: {e}")),
@@ -268,11 +255,6 @@ impl Loaded {
         std::fs::write(&path, serde_json::to_string_pretty(&self.global)? + "\n")?;
         self.merge();
         Ok(())
-    }
-
-    /// The workspace file overrides `key`, so editing the global value has no effect.
-    pub fn overridden(&self, key: &str) -> bool {
-        key.split('.').try_fold(&self.workspace, |v, k| v.get(k)).is_some()
     }
 }
 
@@ -301,29 +283,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layers_comments_and_set() {
+    fn defaults_comments_and_set() {
         let dir = tempfile::tempdir().unwrap();
-        let (g, w) = (dir.path().join("cfg/settings.json"), dir.path().join("ws.json"));
-        std::fs::write(&w, "{\n // project wants a short timeout\n \"request\": {\"timeout_ms\": 500}, \"appearance\": \"light\" /* why not */\n}").unwrap();
+        let g = dir.path().join("cfg/settings.json");
+        std::fs::create_dir_all(g.parent().unwrap()).unwrap();
+        std::fs::write(&g, "{\n // short timeout\n \"request\": {\"timeout_ms\": 500}, \"appearance\": \"light\" /* why not */\n}").unwrap();
 
-        let mut l = Loaded::load_from(Some(g.clone()), Some(w));
+        let mut l = Loaded::load_from(Some(g.clone()));
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         assert_eq!((l.settings.appearance, l.settings.request.timeout_ms), (Appearance::Light, 500));
         assert_eq!(l.settings.theme, "Default");
         assert!(l.settings.request.follow_redirects); // default kept beside the override
-        assert!(l.overridden("request.timeout_ms") && !l.overridden("font_size"));
 
         l.set("font_size", 16.into()).unwrap();
         l.set("request.timeout_ms", 9000.into()).unwrap();
-        assert_eq!((l.settings.font_size, l.settings.request.timeout_ms), (16., 500)); // workspace still wins
+        assert_eq!((l.settings.font_size, l.settings.request.timeout_ms), (16., 9000));
         let written: Value = serde_json::from_str(&std::fs::read_to_string(&g).unwrap()).unwrap();
-        assert_eq!(written, serde_json::json!({"font_size": 16, "request": {"timeout_ms": 9000}}));
+        assert_eq!(written, serde_json::json!({"font_size": 16, "request": {"timeout_ms": 9000}, "appearance": "light"}));
 
         let env = Env::default();
         assert!(env.is_prod("prod") && env.is_prod("Production") && !env.is_prod("dev"));
 
         std::fs::write(&g, "{ broken").unwrap();
-        let l = Loaded::load_from(Some(g), None);
+        let l = Loaded::load_from(Some(g));
         assert_eq!((l.errors.len(), l.settings.font_size), (1, 14.));
     }
 }

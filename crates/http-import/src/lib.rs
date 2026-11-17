@@ -24,7 +24,7 @@ pub struct Collection {
     pub root: Folder,
     /// Environment name (`$shared` for variables of every environment) → variables.
     pub envs: BTreeMap<String, Vec<(String, String)>>,
-    /// Same, for secrets (written to `respite-<env>.private.json`).
+    /// Same, for secrets (written to the same env file; masked by name).
     pub private_envs: BTreeMap<String, Vec<(String, String)>>,
     /// What could not be converted (scripts, unsupported auth, …).
     pub warnings: Vec<String>,
@@ -159,41 +159,72 @@ pub fn block(r: &Req) -> String {
 }
 
 /// Env file of an environment: `respite.json` for `$shared`, else `respite-<env>.json`.
-pub(crate) fn env_file(env: &str, private: bool) -> String {
-    // `x.private` would read back as the private env `x`: write it as `x-private`.
+pub(crate) fn env_file(env: &str) -> String {
+    // `x.private` is not an env file name: write it as `x-private`.
     let env = sanitize(env);
     let env = env.strip_suffix(".private").map_or(env.clone(), |x| format!("{x}-private"));
-    let stem = if env == "$shared" { "respite".to_string() } else { format!("respite-{env}") };
-    format!("{stem}{}.json", if private { ".private" } else { "" })
+    if env == "$shared" { "respite.json".to_string() } else { format!("respite-{env}.json") }
 }
 
-/// One env file per environment (public and private) in `dir`. An environment whose files
-/// already exist gets the next free name (`dev-2`, …): nothing is replaced.
-fn write_envs(c: &Collection, dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let taken = |env: &str| [false, true].iter().any(|p| dir.join(env_file(env, *p)).exists());
-    let mut written = vec![];
-    for env in c.envs.keys().chain(c.private_envs.keys()).collect::<std::collections::BTreeSet<_>>() {
-        let name = (1..).map(|n| if n == 1 { env.clone() } else { format!("{env}-{n}") }).find(|n| !taken(n)).unwrap();
-        for (private, envs) in [(false, &c.envs), (true, &c.private_envs)] {
-            if let Some(vars) = envs.get(env) {
-                let json: Map<String, Value> = vars.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
-                let path = dir.join(env_file(&name, private));
-                std::fs::write(&path, serde_json::to_string_pretty(&json)? + "\n")?;
-                written.push(path);
-            }
-        }
+/// An environment to write: name and variables, secrets included (later keys win).
+type EnvSet = (String, Vec<(String, String)>);
+
+/// `My Shop API` → `my-shop-api`: an environment name that fits `# @env`.
+fn slug(name: &str) -> String {
+    let s: String = name.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let s = s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
+    if s.is_empty() { "collection".into() } else { s }
+}
+
+/// The collection's environments, for the shared env folder, where `respite.json` belongs to
+/// everyone: its own variables (`$shared`) go into each of its environments (theirs win), or,
+/// with none, into one named after the collection.
+fn env_sets(c: &Collection) -> Vec<EnvSet> {
+    let get = |k: &str| -> Vec<(String, String)> {
+        [&c.envs, &c.private_envs].into_iter().flat_map(|m| m.get(k).cloned().unwrap_or_default()).collect()
+    };
+    let shared = get("$shared");
+    let named: std::collections::BTreeSet<&String> = c.envs.keys().chain(c.private_envs.keys()).filter(|k| *k != "$shared").collect();
+    if named.is_empty() {
+        return if shared.is_empty() { vec![] } else { vec![(slug(&c.name), shared)] };
     }
-    Ok(written)
+    named.into_iter().map(|n| (n.clone(), shared.iter().cloned().chain(get(n)).collect())).collect()
 }
 
-/// Write the collection into a new folder under `dest` (`<dest>/<name>`, `-2`, `-3`… if taken).
-/// An environment-only import (a Postman environment file) goes to `dest` itself instead,
-/// without replacing existing environments. Returns the files written.
-pub fn write(c: &Collection, dest: &Path) -> io::Result<Vec<PathBuf>> {
-    let files = render(c);
-    if files.is_empty() && !(c.envs.is_empty() && c.private_envs.is_empty()) {
-        std::fs::create_dir_all(dest)?;
-        return write_envs(c, dest);
+/// The collection's environments ([`env_sets`]) in `dir`, one file each. One whose file
+/// already exists gets the next free name (`dev-2`, …): nothing is replaced. Returns the files
+/// written and the name of the first environment.
+fn write_envs(c: &Collection, dir: &Path) -> io::Result<(Vec<PathBuf>, Option<String>)> {
+    let (mut written, mut first) = (vec![], None);
+    for (env, vars) in env_sets(c) {
+        let name = (1..).map(|n| if n == 1 { env.clone() } else { format!("{env}-{n}") }).find(|n| !dir.join(env_file(n)).exists()).unwrap();
+        // Later keys win: an environment's own value over the collection's.
+        let json: Map<String, Value> = vars.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+        let path = dir.join(env_file(&name));
+        std::fs::write(&path, serde_json::to_string_pretty(&json)? + "\n")?;
+        written.push(path);
+        first.get_or_insert(name);
+    }
+    Ok((written, first))
+}
+
+/// Write the collection into a new folder under `dest` (`<dest>/<name>`, `-2`, `-3`… if taken),
+/// keeping its subfolders, and its environments into `env_dir` (see [`write_envs`]); each
+/// `.http` file starts with `# @env` naming the first one. Returns the files written.
+pub fn write(c: &Collection, dest: &Path, env_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = render(c);
+    let (mut envs, mut env) = (vec![], None);
+    if !(c.envs.is_empty() && c.private_envs.is_empty()) {
+        std::fs::create_dir_all(env_dir)?;
+        (envs, env) = write_envs(c, env_dir)?;
+    }
+    if files.is_empty() {
+        return Ok(envs);
+    }
+    if let Some(env) = env {
+        for (_, text) in &mut files {
+            text.insert_str(0, &format!("# @env {env}\n"));
+        }
     }
     let base = dest.join(sanitize(&c.name));
     let dir = (1..).map(|n| if n == 1 { base.clone() } else { PathBuf::from(format!("{}-{n}", base.display())) }).find(|d| !d.exists()).unwrap();
@@ -204,8 +235,7 @@ pub fn write(c: &Collection, dest: &Path) -> io::Result<Vec<PathBuf>> {
         std::fs::write(&path, text)?;
         written.push(path);
     }
-    std::fs::create_dir_all(&dir)?;
-    written.extend(write_envs(c, &dir)?);
+    written.extend(envs);
     Ok(written)
 }
 

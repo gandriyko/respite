@@ -1,31 +1,28 @@
-//! Help (F1): the `.http` syntax reference, opened as a read-only tab. A real file under
-//! `~/.respite/help`, so tabs, Cmd+W, reopening on launch and running examples all just work.
+//! Help (F1): the `.http` syntax reference, opened as a read-only tab. The text lives in the
+//! binary; the tab's path is virtual (nothing is written to disk), so the text always matches
+//! the app version. Its examples still run like any other request.
 
 use std::path::{Path, PathBuf};
 
 use gpui::*;
-use http_exec::Store;
 
 use crate::Respite;
 
 const HELP: &str = include_str!("../help.http");
 
-fn path() -> Option<PathBuf> {
-    Some(Store::default_base()?.join("help").join("Syntax Reference.http"))
+/// A path no file has: the tab's identity and its breadcrumbs (`Respite Help › Syntax Reference.http`).
+fn path() -> PathBuf {
+    PathBuf::from("/Respite Help/Syntax Reference.http")
 }
 
-/// Opened read-only (also when reopened as the last file on launch).
+/// Opened read-only, never saved, not reopened on launch.
 pub(crate) fn is_help(p: &Path) -> bool {
-    path().is_some_and(|h| h == p)
+    p == path()
 }
 
 impl Respite {
     pub(crate) fn show_help(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = path() else { return };
-        // Rewritten every time: the text follows the app version. If writing fails the tab
-        // still opens from memory; only reopening on the next launch is lost.
-        let _ = std::fs::create_dir_all(path.parent().expect("has a parent")).and_then(|_| std::fs::write(&path, HELP));
-        self.open(path, Some(HELP.into()), window, cx);
+        self.open(path(), Some(HELP.into()), window, cx);
     }
 }
 
@@ -43,5 +40,6 @@ mod tests {
         assert_eq!(by_title("GraphQL").method, "GRAPHQL");
         assert!(by_title("Directives").directive("no-redirect").is_some());
         assert!(by_title("Use login's response").headers.iter().any(|h| h.value.contains("login.response")));
+        assert!(!super::path().exists());
     }
 }

@@ -1,5 +1,6 @@
-//! Respite GUI: sidebar (projects → .http files → requests), tabs of open files,
+//! Respite GUI: sidebar (the central folder and added files → requests), tabs of open files,
 //! a plain-text editor (no run buttons or statuses in its lines), response panel.
+//! Each file runs with the environment its first line names (`# @env dev`).
 
 mod attach;
 mod doc;
@@ -38,12 +39,11 @@ use gpui_component::{
 };
 use http_env::Environments;
 use http_exec::{Exchange, Executor, Store};
-use workspace::Project;
 
 actions!(
     respite,
     [
-        RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddProject, Import, Quit,
+        RunRequest, SmartPaste, PasteCurl, CopyAsCurl, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, AddFiles, Import, Quit,
         NextEnvironment, ToggleHistory, InsertFile, RunAll, RunSelected, RepeatLast, CancelRequests, GoToFile, GoToRequest,
         CommandPalette, PrevRequest, NextRequest, QuickFix, RenameSymbol, GoToWorkspaceRequest, FocusEditor, FocusResponse,
         ExpandTemplate, CopyJsonPath, ToggleResponse, ToggleSplit, ShowHelp, ClearAuthTokens
@@ -64,14 +64,24 @@ fn keymap_path(s: &respite_settings::Loaded) -> Option<PathBuf> {
     Some(s.global_path.as_ref()?.parent()?.join("keymap.json"))
 }
 
-/// Starting point for "Create …" in the environment menu (only the Respite format is offered).
-/// The file to edit for environment `name` (`None` = Shared, `respite.json`): public before
-/// private, the one deepest in the chain (closest to the `.http` file, it wins the merge).
-fn env_file(paths: &[PathBuf], name: Option<&str>) -> Option<PathBuf> {
-    let stem = name.map_or_else(|| "respite".to_string(), |n| format!("respite-{n}"));
-    [format!("{stem}.json"), format!("{stem}.private.json")].iter().find_map(|f| {
-        paths.iter().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == *f)).max_by_key(|p| p.components().count()).cloned()
-    })
+/// The env file of environment `name` (`None` = Shared, `respite.json`) in the env folder.
+fn env_file(name: Option<&str>) -> PathBuf {
+    workspace::env_dir().join(name.map_or_else(|| "respite.json".to_string(), |n| format!("respite-{n}.json")))
+}
+
+/// A new env file from the template; an existing one is left as is.
+fn create_env_file(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+    std::fs::write(path, RESPITE_TEMPLATE)
+}
+
+/// Variables of environment `name`, every environment's name, all variables together, and `name`.
+fn env_view(name: Option<String>) -> doc::EnvView {
+    let envs = Environments::load(&[]);
+    (envs.variables(name.as_deref()), envs.names(), envs.all_variables(), name)
 }
 
 /// The env picker's "no named environment" entry: only `respite.json` (shared values) applies.
@@ -92,16 +102,18 @@ impl Drop for AbortOnDrop {
 }
 
 struct Respite {
-    env_name: Option<String>,
-    /// One per workspace root (history and cookies are per project).
-    executors: HashMap<PathBuf, Arc<Executor>>,
+    /// One per environment (cookies and OAuth tokens are per environment; one history).
+    executors: HashMap<Option<String>, Arc<Executor>>,
     /// The latest browser / device sign-in instruction, shown while a request waits for it.
     auth_notice: Option<String>,
     auth_tx: tokio::sync::mpsc::UnboundedSender<String>,
     docs: Vec<Doc>,
     current: Option<usize>,
-    projects: Vec<Project>,
-    /// Expanded project roots and files in the sidebar.
+    /// Folders and request files of the central folder; `None` rescans it.
+    central: Option<Vec<PathBuf>>,
+    /// Files added from elsewhere (the sidebar's Files section).
+    files: Vec<PathBuf>,
+    /// Expanded files in the sidebar.
     expanded: HashSet<PathBuf>,
     /// `(request_line, method, label)` of files that are not open, parsed when expanded.
     outlines: HashMap<PathBuf, Vec<(usize, String, String)>>,
@@ -145,7 +157,7 @@ struct Respite {
     history_filter: Entity<InputState>,
     /// Theme's own monospace font, used when `font_family` is empty.
     default_mono: SharedString,
-    /// Env files of the open tabs' chains at the last check; a change reloads the environments.
+    /// Env files at the last check; a change reloads the environments.
     env_files_seen: Option<Vec<(PathBuf, Option<std::time::SystemTime>)>>,
     /// Tabs, most recently used first (Ctrl+Tab).
     mru: Vec<PathBuf>,
@@ -193,13 +205,11 @@ enum BodyOther {
 }
 
 impl Respite {
-    fn new(root: PathBuf, open: Option<PathBuf>, env_name: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // `--env` wins; otherwise the environment last picked for this project.
-        let env_name = env_name.or_else(|| workspace::load_env(Store::default_base().as_deref(), &root));
-        let mut projects = workspace::projects(Store::default_base().as_deref(), &workspace::collections_dir(), &root);
-        let current = projects.iter_mut().find(|p| p.root == root).expect("current project is listed");
-        let files = current.files.get_or_insert_with(|| workspace::scan(&root));
-        let first = files.iter().find(|f| !workspace::is_env_file(f)).cloned();
+    fn new(open: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let base = Store::default_base();
+        let files = workspace::load_files(base.as_deref());
+        let central = workspace::scan(&workspace::collections_dir());
+        let first = central.iter().chain(&files).find(|f| workspace::is_request_file(f)).cloned();
         let readonly = |http: bool, window: &mut Window, cx: &mut App| {
             cx.new(|cx| {
                 // Folding only for bodies (JSON nodes); in headers/request it would fold the whole text.
@@ -217,7 +227,7 @@ impl Respite {
                 s
             })
         };
-        let settings = respite_settings::Loaded::load(Some(&root));
+        let settings = respite_settings::Loaded::load();
         for e in &settings.errors {
             notify_later(window, cx, format!("Settings: {e}"));
         }
@@ -292,12 +302,12 @@ impl Respite {
             body_filter,
             body_other: None,
             _subs,
-            env_name,
             executors: HashMap::new(),
             docs: vec![],
             current: None,
-            projects,
-            expanded: HashSet::from([root.clone()]),
+            central: Some(central),
+            files,
+            expanded: HashSet::new(),
             outlines: HashMap::new(),
             collapsed_dirs: HashSet::new(),
             rows: vec![],
@@ -324,15 +334,12 @@ impl Respite {
             }
         })
         .detach();
-        // An explicit file wins; else the file (and cursor) last used in this project — or in any
-        // project, on a plain launch (no folder given); else the first one.
-        let base = Store::default_base();
-        let last = match root == workspace::collections_dir() {
-            true => workspace::last_opened(base.as_deref()),
-            false => workspace::last_file(base.as_deref(), &root),
-        };
+        // An explicit file wins (and joins the list); else the file (and cursor) last used; else
+        // the first one; else a sample in the central folder.
+        let last = workspace::last_opened(base.as_deref());
         match (open, last, first) {
             (Some(path), _, _) => {
+                this.add_file(path.clone());
                 this.open(path, None, window, cx);
             }
             (None, Some((path, line, column)), _) => {
@@ -344,7 +351,7 @@ impl Respite {
                 this.open(path, None, window, cx);
             }
             (None, None, None) => {
-                this.open(root.join("untitled.http"), Some(SAMPLE.into()), window, cx);
+                this.open(workspace::collections_dir().join("untitled.http"), Some(SAMPLE.into()), window, cx);
             }
         }
         this.apply_settings(window, cx);
@@ -382,43 +389,18 @@ impl Respite {
             self.docs[ix].dirty = false;
             self.outlines.remove(&*self.docs[ix].path.clone());
         }
-        let envs = self.env_stamp();
+        let envs = env_stamp();
         if self.env_files_seen.as_ref().is_some_and(|seen| *seen != envs) {
-            self.select_env(self.env_name.clone(), cx);
+            self.reload_envs(cx);
         }
         self.env_files_seen = Some(envs);
-    }
-
-    /// Env files (and their mtimes) in the chains of the open files, plus `env.files`.
-    fn env_stamp(&self) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
-        let mut dirs: Vec<PathBuf> = vec![];
-        for d in &self.docs {
-            let root = self.root_of(&d.path);
-            dirs.extend(d.path.parent().into_iter().flat_map(Path::ancestors).take_while(|a| a.starts_with(&root)).map(Path::to_path_buf));
-            dirs.extend(self.settings.settings.env_files(&root));
-        }
-        dirs.sort();
-        dirs.dedup();
-        let mut out: Vec<_> = dirs
-            .iter()
-            .flat_map(|p| match std::fs::read_dir(p) {
-                Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| workspace::is_env_file(p)).collect(),
-                Err(_) => vec![p.clone()], // an `env.files` entry (a file, maybe missing)
-            })
-            .map(|p| {
-                let t = doc::mtime(&p);
-                (p, t)
-            })
-            .collect();
-        out.sort();
-        out
     }
 
     /// Re-read the settings files when they change on disk (edited by hand, another window).
     // ponytail: polls mtimes every second (with the open files); `notify` if this ever shows up in a profile.
     fn watch_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
         let stamp = |l: &respite_settings::Loaded| {
-            [&l.global_path, &l.workspace_path, &keymap_path(l)].map(|p| p.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
+            [&l.global_path, &keymap_path(l)].map(|p| p.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
         };
         let mut last = stamp(&self.settings);
         cx.spawn_in(window, async move |this, cx| {
@@ -431,7 +413,7 @@ impl Respite {
                         return;
                     }
                     last = now;
-                    let fresh = respite_settings::Loaded::load_from(this.settings.global_path.clone(), this.settings.workspace_path.clone());
+                    let fresh = respite_settings::Loaded::load_from(this.settings.global_path.clone());
                     // A half-written or broken file keeps the current settings.
                     if !fresh.errors.is_empty() {
                         for e in &fresh.errors {
@@ -451,18 +433,14 @@ impl Respite {
         .detach();
     }
 
-    fn executor(&mut self, root: &Path) -> Arc<Executor> {
-        let (env, s, tx) = (self.env_name.clone(), self.settings.settings.clone(), self.auth_tx.clone());
+    /// The executor of environment `env`, shared by every file that runs with it.
+    fn executor(&mut self, env: Option<&str>) -> Arc<Executor> {
+        let (s, tx) = (self.settings.settings.clone(), self.auth_tx.clone());
         self.executors
-            .entry(root.to_path_buf())
+            .entry(env.map(String::from))
             .or_insert_with(|| {
-                let store = Store::default_base().and_then(|base| {
-                    let mut st = Store::open(&base, root).inspect_err(|e| eprintln!("respite: history disabled: {e}")).ok()?;
-                    // ponytail: history limits apply to executors created after a change.
-                    (st.per_request, st.total) = (s.history.per_request, s.history.total);
-                    Some(st)
-                });
-                let exec = Executor::new(store, env.as_deref(), "gui");
+                // ponytail: history limits apply to executors created after a change.
+                let exec = Executor::new(respite_cli::open_store(&s), env, "gui");
                 exec.set_options(respite_cli::exec_options(&s));
                 exec.set_auth_ui(http_exec::AuthUi {
                     notice: Arc::new(move |m| {
@@ -533,13 +511,13 @@ impl Respite {
                         return None;
                     }
                 };
-                let root = self.root_of(&path);
-                let env = self.env_for(&path, &root);
-                let st = &self.settings.settings;
-                let (line_numbers, soft_wrap) = (st.editor.line_numbers, st.editor.soft_wrap);
-                let exec = self.executor(&root);
                 // Env files are plain JSON (tree-sitter highlighting, no requests).
                 let http = !workspace::is_env_file(&path);
+                let env_name = if http { http_syntax::parse(&text).env } else { None };
+                let env = env_view(env_name);
+                let exec = self.executor(env.3.as_deref());
+                let st = &self.settings.settings;
+                let (line_numbers, soft_wrap) = (st.editor.line_numbers, st.editor.soft_wrap);
                 // Folded row → hidden lines, kept current by the doc; read by the fold placeholder.
                 let fold_counts = doc::FoldCounts::default();
                 let weak = cx.entity().downgrade();
@@ -597,9 +575,15 @@ impl Respite {
                 });
                 let subs = vec![
                     cx.subscribe(&editor, |this, editor, ev: &InputEvent, cx| {
-                        if let (InputEvent::Change, Some(d)) = (ev, this.docs.iter_mut().find(|d| d.editor == editor)) {
+                        let Some(ix) = this.docs.iter().position(|d| d.editor == editor) else { return };
+                        if let InputEvent::Change = ev {
+                            let d = &mut this.docs[ix];
                             d.dirty = true;
                             d.reparse(cx);
+                            // The first line's `# @env` changed: run with that environment now.
+                            if d.http && d.file.env != d.env_name {
+                                this.refresh_env(ix, cx);
+                            }
                         }
                     }),
                     // Cursor moves and scrolling only notify; re-render overlays and the active block.
@@ -611,7 +595,7 @@ impl Respite {
                     }),
                 ];
                 self.docs.push(Doc::new(path.clone(), editor, env, exec, subs, fold_counts, cx));
-                if let Some(e) = Environments::load(&path, &root, &[]).errors.first() {
+                if let Some(e) = Environments::load(&[]).errors.first() {
                     notify_later(window, cx, format!("Env file skipped: {}: {}", e.0.display(), e.1));
                 }
                 self.docs.len() - 1
@@ -629,18 +613,13 @@ impl Respite {
         Some(ix)
     }
 
-    /// Root of `path`'s env chain, history and saved state; the same one the CLI uses.
-    fn root_of(&self, path: &Path) -> PathBuf {
-        http_env::workspace_root(path)
-    }
-
     fn doc(&self) -> Option<&Doc> {
         self.current.map(|ix| &self.docs[ix])
     }
 
     /// Any request running in the current tab (or a batch).
     fn running(&self) -> bool {
-        self.batch.is_some() || self.doc().is_some_and(|d| !d.tasks.is_empty())
+        self.batch.is_some() || self.doc().is_some_and(|d| !d.running_lines().is_empty())
     }
 
     /// The current tab goes first in the Ctrl+Tab order (not while Ctrl+Tab is cycling).
@@ -718,6 +697,9 @@ impl Respite {
     /// Write tab `ix` to disk; `false` (with a notification) when that fails.
     fn save_doc(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(d) = self.docs.get_mut(ix) else { return false };
+        if help_page::is_help(&d.path) {
+            return true; // read-only, in memory only
+        }
         let text = d.editor.read(cx).value();
         let saved = std::fs::write(&*d.path, text.as_bytes());
         match saved {
@@ -726,13 +708,12 @@ impl Respite {
                 d.mtime = doc::mtime(&d.path);
                 let path = (*d.path).clone();
                 self.outlines.remove(&path);
-                // A new file (e.g. the untitled sample) shows up in its project.
-                self.rescan_projects_of(&path);
+                // A new file (e.g. the untitled sample) shows up in the sidebar.
+                self.central = None;
                 if workspace::is_env_file(&path) {
                     // New variables / environments apply to every open request file right away.
-                    self.select_env(self.env_name.clone(), cx);
-                    let root = self.root_of(&path);
-                    if let Some((p, e)) = Environments::load(&path, &root, &[]).errors.into_iter().find(|(p, _)| *p == path) {
+                    self.reload_envs(cx);
+                    if let Some((p, e)) = Environments::load(&[]).errors.into_iter().find(|(p, _)| *p == path) {
                         window.push_notification(format!("{} is not valid JSON, so it is skipped: {e}", p.display()), cx);
                     }
                 }
@@ -747,18 +728,12 @@ impl Respite {
         }
     }
 
-    /// Current file + cursor, per project (`state.json` → `files`); reopened on next launch.
+    /// Current file + cursor (`state.json` → `last_file`); reopened on next launch.
     fn remember_position(&self, cx: &App) {
-        let Some(d) = self.doc() else { return };
+        // Help has no file to reopen; the file before it stays the one remembered.
+        let Some(d) = self.doc().filter(|d| !help_page::is_help(&d.path)) else { return };
         let pos = d.editor.read(cx).cursor_position();
-        let root = self.root_of(&d.path);
-        workspace::save_last_file(Store::default_base().as_deref(), &root, &d.path, pos.line, pos.character);
-    }
-
-    fn rescan_projects_of(&mut self, path: &Path) {
-        for p in self.projects.iter_mut().filter(|p| p.files.is_some() && path.starts_with(&p.root)) {
-            p.files = Some(workspace::scan(&p.root));
-        }
+        workspace::save_last_file(Store::default_base().as_deref(), &d.path, pos.line, pos.character);
     }
 
     /// A dirty tab needs a second close (or a save) — no silent data loss.
@@ -846,6 +821,17 @@ impl Respite {
         });
         d.tasks.insert(request_line, (id, task));
         cx.notify();
+    }
+
+    /// The Send button after a request line (`Doc::send_buttons`): run it, or stop it if running.
+    fn send_or_cancel(&mut self, path: &Path, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
+        if self.docs[ix].running_lines().contains(&line) {
+            self.cancel(ix, line, cx);
+        } else {
+            // Also puts the cursor there: the response panel shows the request under it.
+            self.go_to(path.to_path_buf(), line, true, window, cx);
+        }
     }
 
     fn cancel(&mut self, ix: usize, request_line: usize, cx: &mut Context<Self>) {
@@ -952,47 +938,81 @@ impl Respite {
 
     // ---- center ----
 
-    /// Merged variables for the selected environment, plus every environment name the file can see.
-    fn env_for(&self, path: &Path, root: &Path) -> doc::EnvView {
-        let envs = Environments::load(path, root, &self.settings.settings.env_files(root));
-        (envs.variables(self.env_name.as_deref()), envs.names(), envs.all_variables(), self.env_name.clone())
+    /// Tab `ix` runs with the environment its `# @env` line names now.
+    fn refresh_env(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let name = self.docs[ix].file.env.clone();
+        let exec = self.executor(name.as_deref());
+        self.docs[ix].set_env(env_view(name), exec, cx);
+        cx.notify();
     }
 
-    /// Switch every open file to `name` (`None` = no environment) and remember it for the
-    /// current project. Executors are rebuilt: cookies are kept per environment.
-    fn select_env(&mut self, name: Option<String>, cx: &mut Context<Self>) {
-        self.env_name = name;
-        if let Some(d) = self.doc() {
-            let root = self.root_of(&d.path);
-            workspace::save_env(Store::default_base().as_deref(), &root, self.env_name.as_deref());
-        }
-        self.executors.clear();
+    /// The env files changed: every request tab re-reads its environment.
+    fn reload_envs(&mut self, cx: &mut Context<Self>) {
         for ix in 0..self.docs.len() {
-            let path = self.docs[ix].path.clone();
-            let root = self.root_of(&path);
-            let env = self.env_for(&path, &root);
-            let exec = self.executor(&root);
-            self.docs[ix].set_env(env, exec, cx);
+            if self.docs[ix].http {
+                self.refresh_env(ix, cx);
+            }
         }
-        cx.notify();
+    }
+
+    /// Run the current file with `name` (`None` = Shared only): writes its `# @env` first
+    /// line, as an undoable edit; the reparse switches the environment.
+    fn select_env(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.doc().filter(|d| d.http) else { return };
+        d.editor.clone().update(cx, |s, cx| {
+            let (range, text) = http_syntax::env_edit(&s.value(), name.as_deref());
+            let rope = s.text();
+            let range = lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end));
+            s.apply_lsp_edits(&vec![lsp_types::TextEdit { range, new_text: text }], window, cx);
+        });
+    }
+
+    /// "New Environment…": a `respite-<name>.json` in the env folder, named in the save dialog.
+    fn new_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = workspace::env_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            window.push_notification(format!("{}: {e}", dir.display()), cx);
+            return;
+        }
+        let picked = cx.prompt_for_new_path(&dir, Some("respite-staging.json"));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            this.update_in(cx, |this, window, cx| {
+                // Only that name makes it an environment; anything else would be skipped.
+                if !workspace::is_env_file(&path) {
+                    window.push_notification("Name it respite-<environment>.json", cx);
+                    return;
+                }
+                if let Err(e) = create_env_file(&path) {
+                    window.push_notification(format!("{}: {e}", path.display()), cx);
+                    return;
+                }
+                this.open(path, None, window, cx);
+                this.reload_envs(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Cmd+Alt+E: Shared → first → … → last → Shared.
     fn next_env(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let names = self.doc().map(|d| d.env_names.clone()).unwrap_or_default();
-        let next = match self.env_name.as_ref().and_then(|n| names.iter().position(|x| x == n)) {
+        let Some(d) = self.doc().filter(|d| d.http) else { return };
+        let (names, current) = (d.env_names.clone(), d.env_name.clone());
+        let next = match current.as_ref().and_then(|n| names.iter().position(|x| x == n)) {
             None => names.first().cloned(),
             Some(i) => names.get(i + 1).cloned(),
         };
-        self.select_env(next, cx);
-        let label = self.env_name.clone().unwrap_or_else(|| SHARED.into());
+        let label = next.clone().unwrap_or_else(|| SHARED.into());
+        self.select_env(next, window, cx);
         window.push_notification(format!("Environment: {label}"), cx);
     }
 
-    /// Top-right "Run with" picker; red when the environment looks like production.
+    /// Top-right "Run with" picker for the current file; red when the environment looks like
+    /// production. Picking one writes the file's `# @env` line.
     fn env_picker(&self, cx: &mut Context<Self>) -> AnyElement {
-        let names = self.doc().map(|d| d.env_names.clone()).unwrap_or_default();
-        let current = self.env_name.clone();
+        let Some(d) = self.doc().filter(|d| d.http) else { return div().into_any_element() };
+        let (names, current) = (d.env_names.clone(), d.env_name.clone());
         let prod = current.as_deref().is_some_and(|n| self.settings.settings.env.is_prod(n));
         let label = current.clone().unwrap_or_else(|| SHARED.into());
         let view = cx.entity().downgrade();
@@ -1003,45 +1023,21 @@ impl Respite {
             .small()
             .when(prod, |b| b.danger())
             .when(!prod, |b| b.ghost())
-            .dropdown_menu(move |menu, _, cx| {
+            .dropdown_menu(move |menu, _, _| {
                 let pick = |name: Option<String>| {
                     let view = view.clone();
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                        view.update(cx, |this, cx| this.select_env(name.clone(), cx)).ok();
-                    }
-                };
-                // Open an env file in a tab; `template` creates it first.
-                let edit = |path: PathBuf, template: Option<&'static str>| {
-                    let view = view.clone();
                     move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        if let Some(t) = template
-                            && let Err(e) = std::fs::write(&path, t)
-                        {
-                            window.push_notification(format!("{}: {e}", path.display()), cx);
-                            return;
-                        }
-                        view.update(cx, |this, cx| {
-                            if template.is_some() {
-                                this.rescan_projects_of(&path);
-                            }
-                            this.open(path.clone(), None, window, cx);
-                        })
-                        .ok();
+                        view.update(cx, |this, cx| this.select_env(name.clone(), window, cx)).ok();
                     }
                 };
-                // Env files of the current file's chain (read only when the menu opens).
-                let chain = view.upgrade().and_then(|v| {
-                    let this = v.read(cx);
-                    this.doc().map(|d| ((*d.path).clone(), this.root_of(&d.path)))
-                });
-                let files = chain.as_ref().map(|(path, root)| Environments::load(path, root, &[]).paths()).unwrap_or_default();
-                // A pencil after each environment opens its file. It runs before the row's own
-                // click (inner first), which then closes the menu without switching environments.
+                // Env files (read only when the menu opens).
+                let files = Environments::load(&[]).paths();
+                // A pencil after each environment opens its file (creating it first). It runs
+                // before the row's own click (inner first), which then closes the menu without
+                // switching environments.
                 let editing = Rc::new(std::cell::Cell::new(false));
                 let row = |label: String, name: Option<String>| {
-                    // Shared always gets a pencil: without `respite.json` it creates one at the root.
-                    let file = env_file(&files, name.as_deref())
-                        .or_else(|| chain.as_ref().filter(|_| name.is_none()).map(|(_, root)| root.join("respite.json")));
+                    let file = Some(env_file(name.as_deref()));
                     let (view, editing, on_row) = (view.clone(), editing.clone(), pick(name.clone()));
                     let editing_row = editing.clone();
                     PopupMenuItem::element(move |_, cx| {
@@ -1058,18 +1054,11 @@ impl Respite {
                                     .child(Icon::default().data(include_bytes!("../assets/pencil.svg")).size(cx.theme().font_size * 0.9))
                                     .on_click(move |_, window, cx| {
                                         editing.set(true);
-                                        let created = !file.exists();
-                                        if created && let Err(e) = std::fs::write(&file, RESPITE_TEMPLATE) {
+                                        if let Err(e) = create_env_file(&file) {
                                             window.push_notification(format!("{}: {e}", file.display()), cx);
                                             return;
                                         }
-                                        view.update(cx, |this, cx| {
-                                            if created {
-                                                this.rescan_projects_of(&file);
-                                            }
-                                            this.open(file.clone(), None, window, cx);
-                                        })
-                                        .ok();
+                                        view.update(cx, |this, cx| this.open(file.clone(), None, window, cx)).ok();
                                     }),
                             )
                         })
@@ -1086,31 +1075,18 @@ impl Respite {
                     menu = menu.label("No other environments");
                 }
                 menu = names.iter().fold(menu, |menu, n| menu.item(row(n.clone(), Some(n.clone()))));
-                let Some((path, root)) = chain else { return menu };
                 menu = menu.separator();
                 for p in files {
-                    let shown = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
-                    menu = menu.item(PopupMenuItem::new(format!("Edit {shown}")).on_click(edit(p, None)));
+                    let shown = p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(format!("Edit {shown}")).on_click(move |_, window, cx| {
+                        view.update(cx, |this, cx| this.open(p.clone(), None, window, cx)).ok();
+                    }));
                 }
-                // New files go to the project root (applies to every subfolder) or next to the
-                // file (only its folder and below); say which. Only a new environment's file:
-                // `respite.json` comes from Shared's pencil. `dev` when on Shared.
-                let names = [format!("respite-{}.json", current.as_deref().unwrap_or("dev"))];
-                let root_name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-                let here = path.parent().unwrap_or(&root).to_path_buf();
-                let dirs = if here == root { vec![root.clone()] } else { vec![root.clone(), here] };
-                for name in &names {
-                    for dir in &dirs {
-                        let p = dir.join(name);
-                        if !p.exists() {
-                            // `join("")` (the root itself) leaves a trailing `/`.
-                            let shown = Path::new(&root_name).join(dir.strip_prefix(&root).unwrap_or(dir)).display().to_string();
-                            let shown = shown.trim_end_matches('/');
-                            menu = menu.item(PopupMenuItem::new(format!("Create {name} in {shown}/")).on_click(edit(p, Some(RESPITE_TEMPLATE))));
-                        }
-                    }
-                }
-                menu
+                let view = view.clone();
+                menu.item(PopupMenuItem::new("New Environment…").on_click(move |_, window, cx| {
+                    view.update(cx, |this, cx| this.new_environment(window, cx)).ok();
+                }))
             })
             .into_any_element()
     }
@@ -1183,7 +1159,13 @@ impl Respite {
             return card(false, cx).child(self.history_page(cx)).into_any_element();
         }
         let body = match self.doc() {
-            Some(d) => div().flex_1().min_h_0().relative().child(Editor::new(&d.editor).size_full()).child(d.block_tint()),
+            Some(d) => div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(Editor::new(&d.editor).size_full())
+                .child(d.block_tint())
+                .when(d.http && self.settings.settings.editor.send_button, |el| el.child(d.send_buttons(cx.entity().downgrade()))),
             None => div()
                 .flex_1()
                 .flex()
@@ -1198,6 +1180,23 @@ impl Respite {
         div().size_full().flex().flex_col().children(tabs).child(card).into_any_element()
     }
 
+}
+
+/// Env files (and their mtimes) in the env folder.
+fn env_stamp() -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    let mut out: Vec<_> = std::fs::read_dir(workspace::env_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| workspace::is_env_file(p))
+        .map(|p| {
+            let t = doc::mtime(&p);
+            (p, t)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// A panel on the window background: rounded, hairline border, ring colour while it has focus.
@@ -1374,7 +1373,7 @@ impl Render for Respite {
                     this.close(ix, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
+            .on_action(cx.listener(|this, _: &AddFiles, window, cx| this.add_files(window, cx)))
             .on_action(cx.listener(|this, _: &Import, window, cx| this.import(window, cx)))
             .on_action(cx.listener(|this, _: &NextEnvironment, window, cx| this.next_env(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
@@ -1419,7 +1418,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Quit Respite", Quit),
         ]),
         Menu::new("File").items([
-            MenuItem::action("Add Project…", AddProject),
+            MenuItem::action("Add Files…", AddFiles),
             MenuItem::action("Import…", Import),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
@@ -1505,7 +1504,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Next Tab", Box::new(NextTab)),
         ("Save", Box::new(SaveFile)),
         ("Close Tab", Box::new(CloseTab)),
-        ("Add Project…", Box::new(AddProject)),
+        ("Add Files…", Box::new(AddFiles)),
         ("Import…", Box::new(Import)),
         ("Settings…", Box::new(OpenSettings)),
         ("Syntax Reference", Box::new(ShowHelp)),
@@ -1515,34 +1514,25 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
 }
 
 /// `respite <command> …` runs the CLI without starting the GUI;
-/// `respite [open] [--env NAME] [file.http | dir]` opens the GUI.
+/// `respite [open] [file.http]` opens the GUI (the file joins the sidebar's Files).
 fn main() -> std::process::ExitCode {
     if let Some(code) = respite_cli::main_if_cli() {
         return code;
     }
-    // ponytail: hand-rolled GUI args; fold into clap when `open` grows options.
     // `-psn_…` is a process serial number some macOS launches still pass to app bundles.
-    let mut args = std::env::args().skip(1).filter(|a| a != "open" && !a.starts_with("-psn_"));
-    let (mut env_name, mut target) = (None, None);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--env" => env_name = args.next(),
-            _ => target = Some(a),
-        }
-    }
+    let target = std::env::args().skip(1).find(|a| a != "open" && !a.starts_with("-psn_"));
     let cwd = std::env::current_dir().expect("current dir");
-    let (root, open) = match target.map(|t| std::path::absolute(&t).unwrap_or_else(|_| cwd.join(&t))) {
-        Some(p) if p.is_dir() => (p, None),
-        Some(p) => (http_env::workspace_root(&p), Some(p)),
-        // No target: the collections folder, not the launch dir (cwd is `/` from Finder, `target/…` from cargo).
-        None => {
-            let dir = workspace::collections_dir();
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                eprintln!("respite: {}: {e}", dir.display());
-            }
-            (dir, None)
+    let open = match target.map(|t| std::path::absolute(&t).unwrap_or_else(|_| cwd.join(&t))) {
+        Some(p) if p.is_dir() => {
+            eprintln!("respite: {} is a folder; open a .http file, or add files from the sidebar", p.display());
+            None
         }
+        other => other,
     };
+    let dir = workspace::collections_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("respite: {}: {e}", dir.display());
+    }
     gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx); // theme and fonts come from settings (Respite::apply_settings)
         themes::register(cx);
@@ -1556,7 +1546,7 @@ fn main() -> std::process::ExitCode {
         let mut view = None;
         let handle = cx
             .open_window(options, |window, cx| {
-                let v = cx.new(|cx| Respite::new(root, open, env_name, window, cx));
+                let v = cx.new(|cx| Respite::new(open, window, cx));
                 view = Some(v.downgrade());
                 cx.new(|cx| Root::new(v, window, cx))
             })

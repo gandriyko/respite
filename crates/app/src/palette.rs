@@ -29,6 +29,17 @@ const SHOWN: usize = 50;
 const VISIBLE: usize = 8;
 
 /// Lower is better; `None` = no match. Substring beats a scattered (fuzzy) match.
+/// Where a file is, for a picker row: its folder inside the central folder, else its full folder.
+fn folder_label(f: &std::path::Path) -> String {
+    let dir = f.parent().unwrap_or(f);
+    dir.strip_prefix(crate::workspace::collections_dir()).unwrap_or(dir).display().to_string()
+}
+
+/// A file inside the central folder relative to it, else its full path.
+fn file_label(f: &std::path::Path) -> String {
+    f.strip_prefix(crate::workspace::collections_dir()).unwrap_or(f).display().to_string()
+}
+
 fn score(hay: &str, query: &str) -> Option<usize> {
     if query.is_empty() {
         return Some(0);
@@ -136,24 +147,19 @@ impl Respite {
         input.update(cx, |s, cx| s.focus(window, cx));
     }
 
-    /// Cmd+P: every request file of every project.
+    /// Cmd+P: every request file in the sidebar (central folder, then added).
     pub(crate) fn pick_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut items = vec![];
-        for p in &mut self.projects {
-            let root = p.root.clone();
-            let name = if p.flat { String::new() } else { format!("{}/", p.name) };
-            for f in p.files.get_or_insert_with(|| crate::workspace::scan(&root)).iter() {
-                let path = f.clone();
-                let rel = f.strip_prefix(&root).unwrap_or(f).parent().map(|d| d.display().to_string()).unwrap_or_default();
-                items.push(Item {
-                    label: f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                    detail: format!("{name}{rel}"),
-                    run: Rc::new(move |this, window, cx| {
-                        this.open(path.clone(), None, window, cx);
-                    }),
-                });
-            }
-        }
+        let items = self
+            .all_files()
+            .into_iter()
+            .map(|f| Item {
+                label: f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                detail: folder_label(&f),
+                run: Rc::new(move |this, window, cx| {
+                    this.open(f.clone(), None, window, cx);
+                }),
+            })
+            .collect();
         self.open_picker("Open file…", items, window, cx);
     }
 
@@ -177,29 +183,26 @@ impl Respite {
         self.open_picker("Go to request…", items, window, cx);
     }
 
-    /// Cmd+T: requests of every request file in every project (open tabs: their unsaved text).
-    // ponytail: parses every file per open; cache by mtime if workspaces grow to thousands of files.
+    /// Cmd+T: requests of every request file in the sidebar (open tabs: their unsaved text).
+    // ponytail: parses every file per open; cache by mtime if collections grow to thousands of files.
     pub(crate) fn pick_workspace_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut items = vec![];
-        let projects: Vec<_> = self.projects.iter_mut().map(|p| (p.root.clone(), p.files.get_or_insert_with(|| crate::workspace::scan(&p.root)).clone())).collect();
-        for (root, files) in projects {
-            for f in files.into_iter().filter(|f| !crate::workspace::is_env_file(f)) {
-                let file = match self.docs.iter().find(|d| *d.path == f) {
-                    Some(d) => d.file.clone(),
-                    None => std::sync::Arc::new(http_syntax::parse(&std::fs::read_to_string(&f).unwrap_or_default())),
-                };
-                let rel = f.strip_prefix(&root).unwrap_or(&f).display().to_string();
-                for r in &file.requests {
-                    let (path, line) = (f.clone(), r.request_line);
-                    items.push(Item {
-                        label: r.label(),
-                        detail: format!("{} {} · {rel}", r.method, r.url),
-                        run: Rc::new(move |this, window, cx| this.go_to(path.clone(), line, false, window, cx)),
-                    });
-                }
+        for f in self.all_files() {
+            let file = match self.docs.iter().find(|d| *d.path == f) {
+                Some(d) => d.file.clone(),
+                None => std::sync::Arc::new(http_syntax::parse(&std::fs::read_to_string(&f).unwrap_or_default())),
+            };
+            let rel = file_label(&f);
+            for r in &file.requests {
+                let (path, line) = (f.clone(), r.request_line);
+                items.push(Item {
+                    label: r.label(),
+                    detail: format!("{} {} · {rel}", r.method, r.url),
+                    run: Rc::new(move |this, window, cx| this.go_to(path.clone(), line, false, window, cx)),
+                });
             }
         }
-        self.open_picker("Go to request in workspace…", items, window, cx);
+        self.open_picker("Go to request in any file…", items, window, cx);
     }
 
     /// Cmd+Shift+P: menu commands, by name.
@@ -236,19 +239,14 @@ impl Respite {
         crate::center_line(editor, line - 1, true, window, cx);
     }
 
-    /// `project › folder › file › request` above the editor.
+    /// `folder › file › request` above the editor: folders inside the central folder; a file
+    /// from elsewhere shows its parent folder's name.
     pub(crate) fn breadcrumbs(&self, cx: &App) -> Option<impl IntoElement> {
         let d = self.doc()?;
-        let mut parts: Vec<String> = vec![];
-        if let Some(p) = self.projects.iter().filter(|p| d.path.starts_with(&p.root)).max_by_key(|p| p.root.components().count()) {
-            if !p.flat {
-                parts.push(p.name.clone());
-            }
-            let rel = d.path.strip_prefix(&p.root).unwrap_or(&d.path);
-            parts.extend(rel.iter().map(|c| c.to_string_lossy().into_owned()));
-        } else {
-            parts.push(d.name());
-        }
+        let mut parts: Vec<String> = match d.path.strip_prefix(crate::workspace::collections_dir()) {
+            Ok(rel) => rel.iter().map(|c| c.to_string_lossy().into_owned()).collect(),
+            Err(_) => d.path.iter().rev().take(2).collect::<Vec<_>>().into_iter().rev().map(|c| c.to_string_lossy().into_owned()).collect(),
+        };
         if let Some(r) = d.active.and_then(|l| d.file.requests.iter().find(|r| r.request_line == l)) {
             parts.push(r.label());
         }
