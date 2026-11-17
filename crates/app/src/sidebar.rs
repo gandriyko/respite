@@ -75,10 +75,11 @@ impl Tree {
     }
 }
 
-/// `+`, new folder, `×` … on a row or a section header: shown on hover, or always.
-fn row_action(id: impl Into<ElementId>, child: impl IntoElement, always: bool, cx: &App) -> Stateful<Div> {
+/// `+`, new folder, `×` … on a row or a section header: shown on hover, or always; `tip` on hover.
+fn row_action(id: impl Into<ElementId>, child: impl IntoElement, tip: &'static str, always: bool, cx: &App) -> Stateful<Div> {
     div()
         .id(id)
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip).build(window, cx))
         .flex_none()
         .p_0p5()
         .rounded_sm()
@@ -336,13 +337,13 @@ impl Respite {
         let size = cx.theme().font_size * 0.95;
         let (d1, d2) = (dir.to_path_buf(), dir.to_path_buf());
         [
-            row_action(("new-file", ix), Icon::default().data(include_bytes!("../assets/file-plus.svg")).size(size), always, cx).on_click(
+            row_action(("new-file", ix), Icon::default().data(include_bytes!("../assets/file-plus.svg")).size(size), "New File", always, cx).on_click(
                 cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.new_file(&d1, window, cx);
                 }),
             ),
-            row_action(("new-folder", ix), Icon::default().data(include_bytes!("../assets/folder-plus.svg")).size(size), always, cx).on_click(
+            row_action(("new-folder", ix), Icon::default().data(include_bytes!("../assets/folder-plus.svg")).size(size), "New Folder", always, cx).on_click(
                 cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.new_folder(&d2, window, cx);
@@ -396,7 +397,7 @@ impl Respite {
                 match section {
                     Section::Collections => head.children(self.folder_actions(ix, &workspace::collections_dir(), true, cx)),
                     Section::Files => head.child(
-                        row_action("add-files", Icon::new(IconName::Plus).size_3p5(), true, cx)
+                        row_action("add-files", Icon::new(IconName::Plus).size_3p5(), "Add .http / .rest Files…", true, cx)
                             .on_click(cx.listener(|this, _, window, cx| this.add_files(window, cx))),
                     ),
                 }
@@ -432,7 +433,7 @@ impl Respite {
                     }));
                 let meta = if dirty { "●".to_string() } else { requests.to_string() };
                 let remove = added.then(|| {
-                    row_action(("remove-file", ix), Icon::new(IconName::Close).size_3(), false, cx).on_click(cx.listener(move |this, _, window, cx| {
+                    row_action(("remove-file", ix), Icon::new(IconName::Close).size_3(), "Remove from the List (the file stays)", false, cx).on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.remove_file(&r, window, cx);
                     }))
