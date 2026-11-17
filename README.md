@@ -89,7 +89,7 @@ You need a recent stable Rust toolchain (edition 2024); see [Development setup](
 
 The sidebar has two parts:
 
-- **Collections**: the central folder, `~/.config/respite`. Create files and folders there from the sidebar (hover a folder for its buttons). Imports from Postman, Insomnia, OpenAPI, Bruno and HAR land here too, keeping their subfolders.
+- **Collections**: the central folder, `~/.config/respite`. Create files and folders there from the sidebar (hover a folder for its buttons); the trash button moves a file or folder to the Trash (a folder asks first). A folder's import button (or File > Import…) takes several picks at once: `.http` / `.rest` files are copied in, and Postman, Insomnia, OpenAPI, Bruno and HAR exports each become a folder, keeping their subfolders.
 - **Files**: `.http` / `.rest` files that live elsewhere, for example in a repository. **+** adds them (several at once), or drag them from Finder onto the window; **×** drops one from the list without touching the file.
 
 Run `respite file.http` to open a file; it joins the Files list. Each file picks its environment with `# @env dev` on its first line, and the environment menu above the editor writes that line for you.

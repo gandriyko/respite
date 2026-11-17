@@ -12,7 +12,13 @@ use std::{
 };
 
 use gpui::{prelude::FluentBuilder as _, *};
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, input::Input};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{Input, InputEvent, InputState},
+    notification::Notification,
+};
 use http_exec::Store;
 
 use crate::{Respite, doc::Status, workspace};
@@ -106,7 +112,10 @@ impl Respite {
         // ponytail: the system dialog has no extension filter here; other files are skipped after.
         let (ok, skipped): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| workspace::is_request_file(p));
         if !skipped.is_empty() {
-            window.push_notification(format!("Skipped {} file(s): only .http and .rest", skipped.len()), cx);
+            let names: Vec<_> = skipped.iter().map(|p| p.file_name().unwrap_or(p.as_os_str()).to_string_lossy()).collect();
+            let title = if skipped.len() == 1 { "Not a request file" } else { "Not request files" };
+            let n = Notification::warning(format!("{}\nOnly .http and .rest files can be added.", names.join(", "))).title(title).placement(Anchor::TopLeft);
+            window.push_notification(n, cx);
         }
         let first = ok.first().cloned();
         for p in ok {
@@ -136,40 +145,61 @@ impl Respite {
         cx.notify();
     }
 
-    /// Postman / Insomnia / OpenAPI / Bruno / HAR → a new folder in the central folder (its
-    /// subfolders kept), environments into the env folder.
+    /// File > Import…: into the central folder.
     pub(crate) fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.import_into(workspace::collections_dir(), window, cx);
+    }
+
+    /// Several picks at once into `dir`: `.http` / `.rest` files are copied; Postman / Insomnia /
+    /// OpenAPI / Bruno / HAR each become a new folder (subfolders kept), environments go to
+    /// the env folder.
+    pub(crate) fn import_into(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             // Bruno collections are folders.
             directories: true,
-            multiple: false,
+            multiple: true,
             prompt: Some("Import".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
-            let Some(src) = paths.into_iter().next() else { return };
             this.update_in(cx, |this, window, cx| {
-                let result = http_import::import(&src).and_then(|c| {
-                    http_import::write(&c, &workspace::collections_dir(), &workspace::env_dir()).map(|f| (c, f)).map_err(|e| e.to_string())
-                });
-                let (c, files) = match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        window.push_notification(format!("Import failed: {e}"), cx);
-                        return;
+                let mut first = None;
+                for src in paths {
+                    let name = src.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    if workspace::is_request_file(&src) {
+                        let dest = dir.join(&name);
+                        let copied = if dest.exists() { Err("a file with this name is already there".to_string()) } else { std::fs::copy(&src, &dest).map_err(|e| e.to_string()) };
+                        match copied {
+                            Ok(_) => _ = first.get_or_insert(dest),
+                            Err(e) => window.push_notification(Notification::warning(format!("{name}: {e}")).title("Not imported"), cx),
+                        }
+                        continue;
                     }
-                };
+                    let result = http_import::import(&src)
+                        .and_then(|c| http_import::write(&c, &dir, &workspace::env_dir()).map(|f| (c, f)).map_err(|e| e.to_string()));
+                    let (c, files) = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            window.push_notification(Notification::warning(format!("{name}: {e}")).title("Not imported"), cx);
+                            continue;
+                        }
+                    };
+                    if let Some(f) = files.iter().find(|f| workspace::is_request_file(f)).or(files.first()) {
+                        first.get_or_insert(f.clone());
+                    }
+                    let mut msg = format!("Imported {} '{}': {} file(s)", c.format, c.name, files.len());
+                    if !c.warnings.is_empty() {
+                        msg += &format!(". {} warning(s): {}", c.warnings.len(), c.warnings.join("; "));
+                    }
+                    window.push_notification(msg, cx);
+                }
                 this.central = None;
+                this.collapsed_dirs.remove(&dir);
                 this.reload_envs(cx);
-                if let Some(first) = files.iter().find(|f| workspace::is_request_file(f)).or(files.first()) {
-                    this.open(first.clone(), None, window, cx);
+                if let Some(f) = first {
+                    this.open(f, None, window, cx);
                 }
-                let mut msg = format!("Imported {} '{}': {} file(s)", c.format, c.name, files.len());
-                if !c.warnings.is_empty() {
-                    msg += &format!(". {} warning(s): {}", c.warnings.len(), c.warnings.join("; "));
-                }
-                window.push_notification(msg, cx);
                 cx.notify();
             })
             .ok();
@@ -177,49 +207,96 @@ impl Respite {
         .detach();
     }
 
-    /// A new `.http` file in `dir`, named in the system save dialog.
+    /// A new `.http` file in `dir`, named in an in-app dialog.
     fn new_file(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_new_path(dir, Some("requests.http"));
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(mut path))) = picked.await else { return };
+        let dir = dir.to_path_buf();
+        self.ask_name("New File", "requests.http", "Create", window, cx, move |this, name, window, cx| {
+            let mut path = dir.join(name);
             if !workspace::is_request_file(&path) {
                 path.set_extension("http");
             }
-            this.update_in(cx, |this, window, cx| {
-                // The dialog already confirmed overwriting; an existing file is just opened, never truncated.
-                if !path.exists()
-                    && let Err(e) = std::fs::write(&path, "### New request\nGET https://\n")
-                {
-                    window.push_notification(format!("{}: {e}", path.display()), cx);
-                    return;
-                }
-                this.add_file(path.clone()); // saved outside the central folder: list it
-                this.central = None;
-                this.open(path, None, window, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+            // An existing file is just opened, never truncated.
+            if !path.exists()
+                && let Err(e) = std::fs::write(&path, "### New request\nGET https://\n")
+            {
+                window.push_notification(format!("{}: {e}", path.display()), cx);
+                return;
+            }
+            this.central = None;
+            this.open(path, None, window, cx);
+            cx.notify();
+        });
     }
 
-    /// A new folder in `dir`, named in the system save dialog.
+    /// A new folder in `dir`, named in an in-app dialog.
     fn new_folder(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_new_path(dir, Some("New Folder"));
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(path))) = picked.await else { return };
-            this.update_in(cx, |this, window, cx| {
-                if let Err(e) = std::fs::create_dir_all(&path) {
-                    window.push_notification(format!("{}: {e}", path.display()), cx);
+        let dir = dir.to_path_buf();
+        self.ask_name("New Folder", "New Folder", "Create", window, cx, move |this, name, window, cx| {
+            let path = dir.join(name);
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                window.push_notification(format!("{}: {e}", path.display()), cx);
+                return;
+            }
+            this.collapsed_dirs.remove(&path);
+            this.central = None;
+            cx.notify();
+        });
+    }
+
+    /// Not the system save dialog: macOS won't open it inside the hidden `~/.config`, so it
+    /// started wherever it was last. Enter or the button applies; a name with `/` is refused.
+    fn ask_name(
+        &mut self,
+        title: &'static str,
+        default: &str,
+        ok: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        apply: impl Fn(&mut Self, &str, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(default.to_string()));
+        let this = cx.entity().downgrade();
+        let apply = std::rc::Rc::new(apply);
+        let apply = std::rc::Rc::new({
+            let input = input.clone();
+            move |window: &mut Window, cx: &mut App| {
+                let name = input.read(cx).value().trim().to_string();
+                if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
+                    window.push_notification(format!("Invalid name: {name}"), cx);
                     return;
                 }
-                this.collapsed_dirs.remove(&path);
-                this.central = None;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+                window.close_dialog(cx);
+                // Enter arrives through a subscription of `Respite`, which is mid-update then.
+                let (this, apply) = (this.clone(), apply.clone());
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |this, cx| apply(this, &name, window, cx)).ok();
+                });
+            }
+        });
+        self.picker_sub = Some(cx.subscribe_in(&input, window, {
+            let apply = apply.clone();
+            move |_, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    apply(window, cx);
+                }
+            }
+        }));
+        let field = input.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let apply = apply.clone();
+            dialog.title(title).w(px(420.)).child(Input::new(&field)).footer(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(Button::new("name-cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("name-ok").label(ok).primary().on_click(move |_, window, cx| apply(window, cx))),
+            )
+        });
+        input.update(cx, |s, cx| {
+            s.focus(window, cx);
+            s.select_all(window, cx);
+        });
     }
 
     fn toggle(&mut self, key: &Path) {
@@ -336,10 +413,16 @@ impl Respite {
     }
 
     /// New file / new folder buttons for `dir` (a folder row or the Collections header).
-    fn folder_actions(&self, ix: usize, dir: &Path, always: bool, cx: &mut Context<Self>) -> [Stateful<Div>; 2] {
+    fn folder_actions(&self, ix: usize, dir: &Path, always: bool, cx: &mut Context<Self>) -> [Stateful<Div>; 3] {
         let size = cx.theme().font_size * 0.95;
-        let (d1, d2) = (dir.to_path_buf(), dir.to_path_buf());
+        let (d1, d2, d3) = (dir.to_path_buf(), dir.to_path_buf(), dir.to_path_buf());
         [
+            row_action(("import", ix), Icon::default().data(include_bytes!("../assets/import.svg")).size(size), "Import Files…", always, cx).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.import_into(d3.clone(), window, cx);
+                }),
+            ),
             row_action(("new-file", ix), Icon::default().data(include_bytes!("../assets/file-plus.svg")).size(size), "New File", always, cx).on_click(
                 cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -353,6 +436,55 @@ impl Respite {
                 }),
             ),
         ]
+    }
+
+    /// Trash button on a file or folder of the central folder.
+    fn trash_action(&self, ix: usize, path: &Path, cx: &mut Context<Self>) -> Stateful<Div> {
+        let size = cx.theme().font_size * 0.95;
+        let p = path.to_path_buf();
+        row_action(("trash", ix), Icon::default().data(include_bytes!("../assets/trash.svg")).size(size), "Move to Trash", false, cx).on_click(cx.listener(
+            move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.trash(p.clone(), window, cx);
+            },
+        ))
+    }
+
+    /// A file goes to the Trash at once; a folder asks first.
+    fn trash(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !path.is_dir() {
+            self.move_to_trash(&path, window, cx);
+            return;
+        }
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let message = format!("Move the folder “{name}” to the Trash?");
+        let answer = window.prompt(PromptLevel::Warning, &message, Some("Everything in it goes too."), &["Move to Trash", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| this.move_to_trash(&path, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn move_to_trash(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        // Unsaved edits aren't in the Trash copy: the user saves or closes the tab first.
+        if let Some(d) = self.docs.iter().find(|d| d.path.starts_with(path) && d.dirty) {
+            window.push_notification(format!("Unsaved changes in {}. Save or close it first.", d.name()), cx);
+            return;
+        }
+        if let Err(e) = trash::delete(path) {
+            window.push_notification(format!("Couldn't move {} to the Trash: {e}", path.display()), cx);
+            return;
+        }
+        while let Some(ix) = self.docs.iter().position(|d| d.path.starts_with(path)) {
+            self.close(ix, window, cx);
+        }
+        self.central = None;
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        window.push_notification(format!("Moved {name} to the Trash"), cx);
+        cx.notify();
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -413,6 +545,7 @@ impl Respite {
                     .child(icon(if open { IconName::FolderOpen } else { IconName::Folder }, muted))
                     .child(div().flex_1().truncate().child(name.clone()))
                     .children(self.folder_actions(ix, path, false, cx))
+                    .child(self.trash_action(ix, path, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_dir(&p);
                         cx.notify();
@@ -435,17 +568,19 @@ impl Respite {
                         cx.notify();
                     }));
                 let meta = if dirty { "●".to_string() } else { requests.to_string() };
-                let remove = added.then(|| {
+                let remove = if *added {
                     row_action(("remove-file", ix), Icon::new(IconName::Close).size_3(), "Remove from the List (the file stays)", false, cx).on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.remove_file(&r, window, cx);
                     }))
-                });
+                } else {
+                    self.trash_action(ix, path, cx)
+                };
                 base.when(current, |r| r.bg(active))
                     .child(toggle)
-                    .child(icon(IconName::FileText, if current { t.foreground } else { muted }))
+                    .child(icon(IconName::FileText, if current { cx.theme().foreground } else { muted }))
                     .child(div().flex_1().truncate().child(name.clone()))
-                    .children(remove)
+                    .child(remove)
                     .child(div().flex_none().text_xs().text_color(muted).child(meta))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let is_current = this.doc().is_some_and(|d| *d.path == p);
