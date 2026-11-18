@@ -38,7 +38,7 @@ Write a request, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the response. No fo
 | **Requests** | Multipart, form-urlencoded, GraphQL, bodies loaded from files, per-request directives (`@timeout`, `@name`, `@insecure`, …); TLS checks can also be turned off for all requests in Settings |
 | **Auth & network** | OAuth 2.0 via `{{$auth.token("id")}}` (Client Credentials, Password, Authorization Code + PKCE in the system browser, Device Authorization) with cached, refreshed tokens; client certificates (mTLS) and extra CAs per environment; system or custom proxy. Configured the JetBrains way, so files stay portable |
 | **Tests** | `# @assert status == 201`, `# @assert body $.id exists`, `# @assert duration < 500ms`: httpyac's operators, written as comments so the file still runs in VS Code and JetBrains; results in the Tests tab, `respite run` exits 1 on a failure |
-| **History** | Every run is stored: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry |
+| **History** | Every run is stored: a sortable, filterable table with status, duration and an OK / failed summary; reopen or rerun any entry. Runs from the CLI and from agents (`respite mcp`) are recorded too, marked `cli · file:line` / `mcp · file:line`; filter on `mcp` to see what an agent did |
 | **cURL** | Paste a `curl` command and get a request block; copy any request back as cURL |
 | **Workspace** | Collections in `~/.config/respite/collections` (with subfolders) plus `.http` files added from anywhere, light and dark themes, settings, state restored on launch |
 
@@ -287,7 +287,7 @@ Two folders, kept apart on purpose: one for what you write, one for what the app
 
 - **Collections** are plain files and folders, so Finder, an editor or git work on them too. The trash button moves them to the Trash.
 - **Files** stay where they are, for example in a repository; Respite keeps only their paths. **×** drops one from the list, the file is untouched.
-- **History** names a file relative to `collections/` when it lives there, by full path otherwise, so moving the whole `collections/` folder keeps it.
+- **History** names a file relative to `collections/` when it lives there, by full path otherwise, so moving the whole `collections/` folder keeps it. Each entry has a `source` (`gui` / `cli` / `mcp`; entries without one are `gui`); `file` is empty for a request that came from no file.
 
 ## Project layout
 

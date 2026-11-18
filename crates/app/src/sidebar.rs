@@ -679,6 +679,14 @@ impl Respite {
                 .child(Icon::new(icon).size_3p5())
                 .child(label)
         };
+        // A click anywhere above the footer (search, folders, tree, empty space) leaves the History
+        // page; the History button itself is in the footer and toggles it.
+        let leave_history = |this: &mut Self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>| {
+            if this.show_history {
+                this.show_history = false;
+                cx.notify();
+            }
+        };
         let footer = div()
             .flex_none()
             .mx_1()
@@ -693,8 +701,7 @@ impl Respite {
             .flex_col()
             // Background and border come from the card it sits in (main.rs `card`).
             .text_color(t.sidebar_foreground)
-            .child(search)
-            .child(div().flex_1().min_h_0().child(list.size_full()))
+            .child(div().flex_1().min_h_0().flex().flex_col().on_mouse_down(MouseButton::Left, cx.listener(leave_history)).child(search).child(div().flex_1().min_h_0().child(list.size_full())))
             .child(div().flex_none().h(px(1.)).mx_2().bg(t.sidebar_border))
             .child(footer)
             .into_any_element()

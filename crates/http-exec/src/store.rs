@@ -20,9 +20,11 @@ pub struct Entry {
     pub id: String,
     /// RFC 3339, UTC.
     pub time: String,
-    /// `gui` / `cli` / `mcp`.
+    /// `gui` / `cli` / `mcp` (a run by an agent through `respite mcp`); entries written before
+    /// the field existed read as `gui`.
+    #[serde(default = "gui")]
     pub source: String,
-    /// Relative to the workspace root.
+    /// Relative to the workspace root; empty for a request that came from no file.
     pub file: String,
     pub name: Option<String>,
     pub label: String,
@@ -47,6 +49,10 @@ pub struct Entry {
     /// Names of the cookies sent; values are masked like the `Cookie` header.
     #[serde(default)]
     pub cookies_sent: Vec<String>,
+}
+
+fn gui() -> String {
+    "gui".into()
 }
 
 pub struct Store {

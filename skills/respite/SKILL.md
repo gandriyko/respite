@@ -90,6 +90,11 @@ Values of secret variables are masked.
 an object instead of repeated `--var`. Each tool returns the command's JSON output; a non-zero
 exit code sets `isError` and is appended to the text. History marks these runs `mcp`.
 
+Everything you send through this skill (the `respite` CLI, marked `cli`) or the MCP server
+(marked `mcp`) is written to the same History the app shows, with its file and line, so the user
+can see what you ran: the History page filters on `cli` / `mcp`. A request refused before it
+was sent (`@note`) is not recorded, and neither is a run with `# @no-log`.
+
 - `--root DIR` is the workspace (default: the directory the client starts the server in).
   Relative paths start there, and every path must stay inside it; where a request file is
   expected it must be `.http` / `.rest`. Env files can't be read through the tools.

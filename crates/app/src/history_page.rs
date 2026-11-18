@@ -27,7 +27,7 @@ pub(crate) enum SortBy {
 const TIME_W: f32 = 104.;
 const STATUS_W: f32 = 56.;
 const METHOD_W: f32 = 48.;
-const FILE_W: f32 = 120.;
+const FILE_W: f32 = 150.;
 const DURATION_W: f32 = 64.;
 const REPLAY_W: f32 = 24.;
 
@@ -45,6 +45,17 @@ impl Respite {
         self.doc()?.exec.store()
     }
 
+    /// Where an entry ran: `file:line`; a run from the CLI or an agent (MCP) is marked, and one
+    /// without a file is only the mark.
+    fn history_origin(e: &Entry) -> String {
+        let at = (!e.file.is_empty()).then(|| format!("{}:{}", e.file, e.line));
+        match (e.source.as_str(), at) {
+            ("cli" | "mcp", Some(at)) => format!("{} · {at}", e.source),
+            ("cli" | "mcp", None) => e.source.clone(),
+            (_, at) => at.unwrap_or_default(),
+        }
+    }
+
     /// Re-read entries (newest first); keeps the picked one if it is still there.
     pub(crate) fn reload_history(&mut self) {
         self.history = self.history_store().map(|s| s.list()).unwrap_or_default();
@@ -55,7 +66,7 @@ impl Respite {
         }
     }
 
-    /// Indices of entries matching every word of the filter (method, URL, name, file, status),
+    /// Indices of entries matching every word of the filter (method, URL, name, file, source — `mcp` / `cli` / `gui` —, status),
     /// in the chosen column order.
     fn history_matches(&self, cx: &App) -> Vec<usize> {
         let query = self.history_filter.read(cx).value().to_lowercase();
@@ -65,7 +76,7 @@ impl Respite {
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                let hay = format!("{} {} {} {} {}", e.method, e.url, e.label, e.file, e.status).to_lowercase();
+                let hay = format!("{} {} {} {} {} {}", e.method, e.url, e.label, e.file, e.source, e.status).to_lowercase();
                 words.iter().all(|w| hay.contains(w))
             })
             .map(|(i, _)| i)
@@ -103,6 +114,10 @@ impl Respite {
     /// (secrets are masked in history, so the recorded request can't be resent verbatim).
     fn open_history_request(&mut self, i: usize, run: bool, window: &mut Window, cx: &mut Context<Self>) {
         let entry = self.history[i].clone();
+        if entry.file.is_empty() {
+            window.push_notification("This run came from no file, there is nothing to open", cx);
+            return;
+        }
         let Some(path) = self.history_store().map(|s| s.root().join(&entry.file)) else { return };
         let Some(ix) = self.open(path.clone(), None, window, cx) else { return };
         let requests = &self.docs[ix].file.requests;
@@ -288,7 +303,7 @@ impl Respite {
                     .child(div().flex_shrink_0().max_w(relative(0.75)).truncate().font_weight(FontWeight::SEMIBOLD).child(short_label(e)))
                     .child(div().truncate().text_xs().text_color(muted).child(e.url.clone())),
             )
-            .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(format!("{}:{}", e.file, e.line)))
+            .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(Self::history_origin(e)))
             .child(div().w(px(DURATION_W)).flex_none().text_right().text_xs().text_color(slow).child(e.total_ms.to_string()))
             .child(div().w(px(REPLAY_W)).flex_none().child(replay))
             // Click shows the response; double click opens the request in its file.

@@ -633,6 +633,52 @@ mod tests {
         assert!(missing.is_empty(), "skills/respite/SKILL.md misses: {missing:?}");
     }
 
+    /// A run is recorded as `cli`, or `mcp` when `respite mcp` started the process; a request
+    /// refused before sending (`@note` without a terminal) leaves no entry.
+    #[test]
+    fn runs_are_recorded_in_history() {
+        use std::io::{Read as _, Write as _};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut c in server.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: the only test touching the environment; nothing else runs in parallel with it.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let dir = home.path().join(".config/respite/collections");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.http");
+        std::fs::write(&file, format!("### Ping\nGET {url}/ping\n\n### Risky\n# @note careful\nGET {url}/risky\n")).unwrap();
+        let run = |what: &str| {
+            let cli = Cli::try_parse_from(["respite", "run", file.to_str().unwrap(), what, "--output", "json", "--non-interactive"]).unwrap();
+            dispatch(cli)
+        };
+        let history = || http_exec::Store::open(&home.path().join(".respite"), &dir).unwrap().list();
+
+        assert_eq!(run("#1").unwrap(), 0);
+        unsafe { std::env::set_var(mcp::SOURCE_ENV, "mcp") };
+        assert_eq!(run("#1").unwrap(), 0);
+        unsafe { std::env::remove_var(mcp::SOURCE_ENV) };
+        assert_eq!(run("#2").unwrap(), 4, "@note is refused without a terminal");
+
+        let entries = history();
+        let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert_eq!(sources, ["mcp", "cli"], "newest first; the refused request is not recorded: {entries:?}");
+        assert!(entries.iter().all(|e| e.file == "a.http" && e.status == 200 && e.url.ends_with("/ping")));
+
+        // An entry written before `source` existed reads as `gui`.
+        let path = home.path().join(format!(".respite/history/{}.json", entries[0].id));
+        let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("source");
+        std::fs::write(&path, old.to_string()).unwrap();
+        assert_eq!(history()[0].source, "gui");
+    }
+
     #[test]
     fn request_addresses() {
         let dir = tempfile::tempdir().unwrap();
