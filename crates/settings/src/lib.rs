@@ -38,7 +38,7 @@ pub struct Settings {
     pub split: Split,
     /// The editor's share of the editor + response area, 0.2–0.8.
     pub split_ratio: f32,
-    /// Theme family (`"Gruvbox"`, `"Catppuccin"`, …); `"Default"` = built-in.
+    /// Theme family (`"Gruvbox"` by default, `"Catppuccin"`, …); `"Default"` = built-in.
     pub theme: String,
     /// UI text size, px.
     pub ui_font_size: f32,
@@ -154,7 +154,7 @@ impl Default for Settings {
             keymap: Keymap::Default,
             split: Split::Horizontal,
             split_ratio: 0.55,
-            theme: "Default".into(),
+            theme: "Gruvbox".into(),
             ui_font_size: 14.,
             font_family: String::new(),
             font_size: 14.,
@@ -292,7 +292,7 @@ mod tests {
         let mut l = Loaded::load_from(Some(g.clone()));
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         assert_eq!((l.settings.appearance, l.settings.request.timeout_ms), (Appearance::Light, 500));
-        assert_eq!(l.settings.theme, "Default");
+        assert_eq!(l.settings.theme, "Gruvbox");
         assert!(l.settings.request.follow_redirects); // default kept beside the override
 
         l.set("font_size", 16.into()).unwrap();
