@@ -17,6 +17,7 @@ const SENSITIVE: [&str; 3] = ["authorization", "cookie", "x-api-key"];
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
+    /// .http file, or `-` for request block(s) on stdin (no file: History records an empty file)
     file: PathBuf,
     /// Names, `:LINE` or `#N`; none = every request in file order
     requests: Vec<String>,
@@ -69,8 +70,13 @@ enum Outcome {
 }
 
 pub(crate) fn run(args: RunArgs) -> Result<u8, CliError> {
+    let loaded = if args.file.as_os_str() == "-" { load_stdin()? } else { load(&args.file)? };
+    run_loaded(args, loaded)
+}
+
+pub(crate) fn run_loaded(args: RunArgs, loaded: Loaded) -> Result<u8, CliError> {
     let format = Format::resolve(args.output);
-    let loaded = load(&args.file)?;
+    let stdin = args.file.as_os_str() == "-";
     let indices: Vec<usize> = if args.requests.is_empty() {
         (0..loaded.file.requests.len()).collect()
     } else {
@@ -87,7 +93,7 @@ pub(crate) fn run(args: RunArgs) -> Result<u8, CliError> {
     let (env, mut overrides, env_name) = environment(&loaded, &args.env)?;
     // Prompted values; the executor's secrets are added per request.
     let mut secrets: Vec<String> = vec![];
-    let interactive = !args.non_interactive && std::io::stdin().is_terminal();
+    let interactive = !args.non_interactive && !stdin && std::io::stdin().is_terminal();
     let exec = crate::executor(env_name.as_deref());
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
 
@@ -147,6 +153,18 @@ pub(crate) fn run(args: RunArgs) -> Result<u8, CliError> {
         }
     }
     Ok(exit)
+}
+
+/// Request blocks from stdin: they belong to no file, so the path is empty (relative paths in
+/// them start at the working directory, History's `file` is empty).
+fn load_stdin() -> Result<Loaded, CliError> {
+    let mut src = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut src).map_err(|e| CliError::new("bad_input", e.to_string(), 3))?;
+    Ok(from_stdin(src))
+}
+
+pub(crate) fn from_stdin(src: String) -> Loaded {
+    Loaded { path: PathBuf::new(), file: http_syntax::parse(&src), src }
 }
 
 /// `@prompt` values (hidden input for secret-looking names) and `@note` confirmation.
@@ -348,7 +366,7 @@ impl Out<'_> {
     fn json(&self, req: &Request, outcome: &Result<Outcome, CliError>, warnings: &[&str]) -> Result<Value, CliError> {
         let mut item = json!({
             "schema": "respite.run/v1",
-            "file": self.args.file.display().to_string(),
+            "file": if self.args.file.as_os_str() == "-" { String::new() } else { self.args.file.display().to_string() },
             "request": { "name": req.name, "line": req.request_line, "method": req.method },
             "warnings": warnings,
         });

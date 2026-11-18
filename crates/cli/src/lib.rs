@@ -665,18 +665,23 @@ mod tests {
         assert_eq!(run("#1").unwrap(), 0);
         unsafe { std::env::remove_var(mcp::SOURCE_ENV) };
         assert_eq!(run("#2").unwrap(), 4, "@note is refused without a terminal");
+        // A block from stdin (`run -`, the MCP ad-hoc run) belongs to no file: History's `file` is empty.
+        let cli = Cli::try_parse_from(["respite", "run", "-", "--output", "json", "--non-interactive"]).unwrap();
+        let Cmd::Run(args) = cli.cmd else { unreachable!() };
+        assert_eq!(run::run_loaded(args, run::from_stdin(format!("GET {url}/adhoc\n"))).unwrap(), 0);
 
         let entries = history();
         let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
-        assert_eq!(sources, ["mcp", "cli"], "newest first; the refused request is not recorded: {entries:?}");
-        assert!(entries.iter().all(|e| e.file == "a.http" && e.status == 200 && e.url.ends_with("/ping")));
+        assert_eq!(sources, ["cli", "mcp", "cli"], "newest first; the refused request is not recorded: {entries:?}");
+        assert_eq!((entries[0].file.as_str(), entries[0].status, entries[0].url.ends_with("/adhoc")), ("", 200, true));
+        assert!(entries[1..].iter().all(|e| e.file == "a.http" && e.status == 200 && e.url.ends_with("/ping")));
 
         // An entry written before `source` existed reads as `gui`.
-        let path = home.path().join(format!(".respite/history/{}.json", entries[0].id));
+        let path = home.path().join(format!(".respite/history/{}.json", entries[1].id));
         let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         old.as_object_mut().unwrap().remove("source");
         std::fs::write(&path, old.to_string()).unwrap();
-        assert_eq!(history()[0].source, "gui");
+        assert_eq!(history()[1].source, "gui");
     }
 
     #[test]

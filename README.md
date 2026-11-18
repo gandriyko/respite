@@ -131,6 +131,7 @@ respite run api.http --env-file ci/respite-ci.json   # env files from elsewhere 
 respite run api.http createUser --dry-run            # show the resolved request, send nothing
 respite run api.http --fail-on-status --fail-fast    # use it as a smoke test in CI
 respite run api.http --jsonpath '$.items[*].id'      # print only the matching values
+pbpaste | respite import-curl | respite run -     # a request block from stdin: no file, History records an empty one
 ```
 
 ## OAuth 2.0
@@ -233,7 +234,7 @@ respite run api.http --env staging --fail-fast
 
 [`skills/respite/SKILL.md`](skills/respite/SKILL.md) teaches a coding agent (Claude Code, Codex and others that read Agent Skills) to send requests and test an API through the CLI. Copy the folder into the agent's skills directory, for example `~/.claude/skills/respite`.
 
-For clients that talk MCP instead of running commands, `respite mcp` is a stdio MCP server with the same commands as tools (`list`, `run`, `check`, `show`, `env_show`, …). Each tool runs the CLI command with JSON output, so the results, masking and exit codes are the same, with two differences for agents: `run` leaves out response headers unless `include` asks for them, and `check` returns its diagnostics as a normal result. Nothing opens on screen.
+For clients that talk MCP instead of running commands, `respite mcp` is a stdio MCP server with the same commands as tools (`list`, `run`, `check`, `show`, `env_show`, …). Each tool runs the CLI command with JSON output, so the results, masking and exit codes are the same, with a few differences for agents: `run` leaves out response headers unless `include` asks for them, `check` returns its diagnostics as a normal result, and `history` is compact unless `include` asks for more. `run` also sends a one-off request given as `curl` or `method` + `url` without any file (History records it with an empty `file`), refuses to run a whole file that has anything but GET / HEAD / OPTIONS requests unless it is told `all: true` (exit code 4), and `add_request` appends a checked request block to a `.http` file in the workspace. Nothing opens on screen.
 
 ```sh
 claude mcp add respite -- respite mcp

@@ -49,7 +49,9 @@ fn handle(msg: &Value, root: &Path) -> Option<Value> {
             "instructions": format!("Send HTTP requests and test APIs from .http files in the workspace {}. \
                 Paths are relative to it and must stay inside it. Start with `list` and `env_list`; \
                 check side-effecting requests with `run` and dry_run first; run `check` after editing a .http file. \
-                Requests marked `# @note` are refused: ask the user to run them.", root.display()),
+                `run` also sends a one-off request with no file (`curl`, or `method` + `url`); `add_request` saves a request \
+                to a .http file. Running a whole file that has POST/PUT/PATCH/DELETE requests is refused: name the requests, \
+                or ask the user and pass `all: true`. Requests marked `# @note` are refused: ask the user to run them.", root.display()),
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -63,6 +65,13 @@ fn handle(msg: &Value, root: &Path) -> Option<Value> {
 }
 
 fn call(name: &str, args: &Value, root: &Path) -> Result<Value, (i64, String)> {
+    let reply = |text: String, error: bool| Ok(json!({"content": [{"type": "text", "text": text}], "isError": error}));
+    if name == "add_request" {
+        return match add_request(args, root) {
+            Ok(t) => reply(t, false),
+            Err(e) => reply(e, true),
+        };
+    }
     let (argv, input) = match argv(name, args, root) {
         Ok(a) => a,
         // A rejected path is the tool's answer, not a protocol error: the agent reads it.
@@ -93,7 +102,42 @@ fn call(name: &str, args: &Value, root: &Path) -> Result<Value, (i64, String)> {
     if code != 0 && !diagnostics {
         text += &format!("\n\nexit code {code} (1 assert failed or 4xx/5xx · 2 network/timeout · 3 bad input · 4 needs confirmation)");
     }
-    Ok(json!({"content": [{"type": "text", "text": text}], "isError": code != 0 && !diagnostics}))
+    if code == 0 {
+        text = shape(name, args, &text, root);
+    }
+    reply(text, code != 0 && !diagnostics)
+}
+
+/// Compact `history` entries (`include` adds the rest) and a hint where a list comes back empty.
+fn shape(name: &str, a: &Value, out: &str, root: &Path) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(out) else { return out.to_string() };
+    let Some(items) = v.as_array_mut() else { return out.to_string() };
+    let mut shaped = false;
+    if name == "history" {
+        let include = |k: &str| a.get("include").and_then(Value::as_array).is_some_and(|l| l.iter().any(|x| x == k));
+        let mut keep = vec!["id", "time", "source", "file", "name", "method", "url", "status", "total_ms", "size_bytes"];
+        if include("headers") {
+            keep.extend(["request_headers", "response_headers", "cookies_sent"]);
+        }
+        if include("bodies") {
+            keep.push("request_body");
+        }
+        for e in items.iter_mut().filter_map(Value::as_object_mut) {
+            e.retain(|k, _| keep.contains(&k.as_str()));
+        }
+        shaped = true;
+    }
+    if v.as_array().is_some_and(Vec::is_empty) {
+        let w = root.display();
+        let hint = match name {
+            "list" => format!("No requests found. Workspace: {w}. Create a .http file there (`add_request`), or send a one-off request with `run` (`curl`, or `method` + `url`)."),
+            "env_list" => "No environments defined (respite-NAME.json files in the user's env folder, which the tools can't write). A request can still use literal URLs and `vars` on `run`.".to_string(),
+            "history" => format!("No history yet: every `run` is recorded here once something has been sent. Workspace: {w}."),
+            _ => return out.to_string(),
+        };
+        return format!("[]\n\n{hint}");
+    }
+    if shaped { v.to_string() } else { out.to_string() }
 }
 
 /// `p` resolved against `root` (symlinks and `..` included) if it stays inside; with `http`, a
@@ -134,6 +178,7 @@ fn argv(name: &str, a: &Value, root: &Path) -> Result<(Vec<String>, Option<Strin
             v.push(flag.into());
         }
     };
+    let flag_on = |k: &str| a.get(k).and_then(Value::as_bool) == Some(true);
     let json = ["--output".to_string(), "json".into()];
     let mut v: Vec<String> = vec![];
     let mut input = None;
@@ -152,8 +197,25 @@ fn argv(name: &str, a: &Value, root: &Path) -> Result<(Vec<String>, Option<Strin
         }
         "show" => v.extend(["show".into(), need_path("file", true)?, need("request")?]),
         "run" => {
-            v.extend(["run".into(), need_path("file", true)?]);
-            v.extend(list_of("requests"));
+            let ad_hoc = ad_hoc_block(a)?;
+            let named = list_of("requests");
+            match &ad_hoc {
+                Some(block) => {
+                    if !named.is_empty() {
+                        return Err("'requests' selects from a file; an ad-hoc request (curl / method + url) has just one".into());
+                    }
+                    v.extend(["run".into(), "-".into()]);
+                    input = Some(block.clone());
+                }
+                None => {
+                    let file = need_path("file", true)?;
+                    if named.is_empty() && !flag_on("all") && !flag_on("dry_run") {
+                        confirm_whole_file(&file, str_of("file").unwrap_or(&file))?;
+                    }
+                    v.extend(["run".into(), file]);
+                    v.extend(named);
+                }
+            }
             v.push("--non-interactive".into());
             v.extend(json);
             opt(&mut v, "env", "--env");
@@ -208,6 +270,167 @@ fn argv(name: &str, a: &Value, root: &Path) -> Result<(Vec<String>, Option<Strin
     Ok((v, input))
 }
 
+/// Methods that don't change anything on the server.
+const SAFE: [&str; 3] = ["GET", "HEAD", "OPTIONS"];
+
+/// Running a whole file sends every request in it: refuse (exit 4 semantics) when any of them
+/// isn't GET / HEAD / OPTIONS, so the agent names the ones it means or asks the user.
+fn confirm_whole_file(real: &str, shown: &str) -> Result<(), String> {
+    let Ok(src) = std::fs::read_to_string(real) else { return Ok(()) }; // the CLI reports it
+    let risky: Vec<String> = http_syntax::parse(&src)
+        .requests
+        .iter()
+        .filter(|r| !SAFE.contains(&r.method.to_ascii_uppercase().as_str()))
+        .map(|r| format!("{} {}", r.method, r.name.clone().unwrap_or_else(|| format!(":{}", r.request_line))))
+        .collect();
+    if risky.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "'{shown}' has requests that may change data ({}): running the whole file needs confirmation. \
+         Name the requests to run in `requests`, or ask the user and pass `all: true`.\n\n\
+         exit code 4 (needs confirmation)",
+        risky.join(", ")
+    ))
+}
+
+/// A one-off request as a .http block: from `curl`, or `method` + `url` (+ `headers`, `body`).
+/// `None` when `file` is used. Exactly one way must be given.
+fn ad_hoc_block(a: &Value) -> Result<Option<String>, String> {
+    let given = |k: &str| a.get(k).is_some_and(|x| !x.is_null());
+    let (file, curl, direct) = (given("file"), given("curl"), given("method") || given("url"));
+    match [file, curl, direct].iter().filter(|g| **g).count() {
+        0 => return Err("say what to run: `file` (a .http file), `curl` (a cURL command) or `method` + `url`".into()),
+        1 => {}
+        _ => return Err("give exactly one of `file`, `curl`, or `method` + `url`".into()),
+    }
+    if file {
+        return Ok(None);
+    }
+    let block = if curl {
+        let text = a["curl"].as_str().ok_or("'curl' must be a string")?;
+        let s = crate::settings();
+        let strip: Vec<&str> = s.curl.strip_headers.iter().map(String::as_str).collect();
+        let opts = http_curl::Options { keep_original: false, strip_headers: &strip, ..Default::default() };
+        let mut blocks = http_curl::import_all(text, &opts).map_err(|e| format!("invalid curl: {e}"))?;
+        if blocks.len() != 1 {
+            return Err(format!("'curl' must be one command, got {}", blocks.len()));
+        }
+        blocks.remove(0)
+    } else {
+        request_block(a, None, &[])?
+    };
+    // Nothing may reach the disk (`-o` becomes `>> file`) and no local file may be sent (`-d @file` becomes `< file`).
+    let parsed = http_syntax::parse(&block);
+    let [req] = &parsed.requests[..] else { return Err("expected exactly one request".into()) };
+    if req.output.is_some() {
+        return Err("an ad-hoc request can't save the response to a file (`-o` / `>>`); read it from the result".into());
+    }
+    if req.body.as_ref().is_some_and(|b| b.text.lines().any(|l| l.trim_start().starts_with('<'))) {
+        return Err("an ad-hoc request can't send a local file (`< path` / `-d @file`); put the content in `body`".into());
+    }
+    Ok(Some(block))
+}
+
+/// One request block from `method` / `url` / `headers` / `body`, with `# @name`, a `###` title
+/// and `# @assert` lines above the request line when given. Single-line fields only where the
+/// format needs it, so no field can smuggle in a directive.
+fn request_block(a: &Value, name: Option<&str>, asserts: &[String]) -> Result<String, String> {
+    let one_line = |what: &str, s: &str| -> Result<(), String> {
+        if s.chars().any(char::is_control) {
+            return Err(format!("'{what}' can't contain line breaks or control characters"));
+        }
+        Ok(())
+    };
+    let method = a.get("method").and_then(Value::as_str).unwrap_or("GET");
+    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(format!("'method' must be upper-case letters, got '{method}'"));
+    }
+    let url = a.get("url").and_then(Value::as_str).filter(|u| !u.trim().is_empty()).ok_or("'url' is required")?;
+    one_line("url", url)?;
+    let mut out = String::new();
+    if let Some(t) = a.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+        one_line("title", t)?;
+        out += &format!("### {t}\n");
+    }
+    if let Some(n) = name {
+        if n.is_empty() || n.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("'name' must be one word without whitespace".into());
+        }
+        out += &format!("# @name {n}\n");
+    }
+    for x in asserts {
+        one_line("asserts", x)?;
+        out += &format!("# @assert {}\n", x.trim().trim_start_matches("# @assert").trim());
+    }
+    out += &format!("{method} {url}\n");
+    match a.get("headers") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(h)) => {
+            for (k, x) in h {
+                let x = x.as_str().map_or_else(|| x.to_string(), String::from);
+                if k.is_empty() || k.contains(':') || k.contains(char::is_whitespace) {
+                    return Err(format!("bad header name '{k}'"));
+                }
+                one_line("headers", k)?;
+                one_line("headers", &x)?;
+                out += &format!("{k}: {x}\n");
+            }
+        }
+        Some(_) => return Err("'headers' must be an object of name: value".into()),
+    }
+    if let Some(b) = a.get("body").and_then(Value::as_str).filter(|b| !b.trim().is_empty()) {
+        if b.lines().any(|l| l.starts_with("###")) {
+            return Err("'body' can't contain a line starting with ###".into());
+        }
+        out += &format!("\n{}\n", b.trim_end());
+    }
+    Ok(out)
+}
+
+/// `add_request`: append a request block to a .http file in the workspace. The result must
+/// pass `check` (no errors in the new block); otherwise nothing is written.
+fn add_request(a: &Value, root: &Path) -> Result<String, String> {
+    let shown = a.get("file").and_then(Value::as_str).ok_or("'file' is required")?;
+    let real = inside(root, shown, true)?;
+    let name = a.get("name").and_then(Value::as_str).ok_or("'name' is required")?;
+    if a.get("method").is_none() || a.get("url").is_none() {
+        return Err("'method' and 'url' are required".into());
+    }
+    let asserts: Vec<String> = match a.get("asserts") {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(l)) => l.iter().map(|x| x.as_str().map(String::from).ok_or("'asserts' must be strings")).collect::<Result<_, _>>()?,
+        Some(_) => return Err("'asserts' must be an array of strings".into()),
+    };
+    let block = request_block(a, Some(name), &asserts)?;
+    let existing = std::fs::read_to_string(&real).unwrap_or_default();
+    // Blocks are told apart by `###`; a title-less one still needs the line.
+    let block = if !existing.trim().is_empty() && !block.starts_with("###") { format!("###\n{block}") } else { block };
+    let sep = match existing.as_str() {
+        "" => "",
+        s if s.ends_with("\n\n") => "",
+        s if s.ends_with('\n') => "\n",
+        _ => "\n\n",
+    };
+    let content = format!("{existing}{sep}{block}");
+
+    let file = http_syntax::parse(&content);
+    let dir = Path::new(&real).parent().unwrap_or(Path::new("."));
+    let mut diags = file.diagnostics.clone();
+    diags.extend(http_env::check(&file, &http_env::Environments::load(&[]), dir));
+    // Problems already in the file are `check`'s business; the new block must add none.
+    let new: Vec<_> = diags.iter().filter(|d| d.line > existing.lines().count()).collect();
+    let line = |d: &&http_syntax::Diagnostic| format!("line {} [{}] {}", d.line, d.code, d.message);
+    let errors: Vec<String> = new.iter().filter(|d| d.severity == http_syntax::Severity::Error).map(line).collect();
+    if !errors.is_empty() {
+        return Err(format!("not written, the request has errors:\n{}", errors.join("\n")));
+    }
+    let request_line = file.requests.iter().find(|r| r.name.as_deref() == Some(name)).map(|r| r.request_line);
+    std::fs::write(&real, &content).map_err(|e| format!("'{shown}': {e}"))?;
+    let warnings: Vec<String> = new.iter().map(line).collect();
+    Ok(json!({"file": real, "name": name, "line": request_line, "warnings": warnings}).to_string())
+}
+
 fn tools() -> Value {
     let s = |d: &str| json!({"type": "string", "description": d});
     let b = |d: &str| json!({"type": "boolean", "description": d});
@@ -219,16 +442,24 @@ fn tools() -> Value {
                "annotations": {"readOnlyHint": read_only}})
     };
     json!([
-        tool("list", "Requests in a .http file or every .http/.rest file under a directory: file, line, name, method, URL.",
+        tool("list", "Requests in a .http file or every .http/.rest file under a directory: file, line, name, method, URL. An empty result says where to create one.",
             json!({"path": s("File or directory (default: the workspace)")}), &[], true),
         tool("check", "Diagnostics for .http files and their env files; sends nothing. Run after editing a .http file.",
             json!({"paths": strs("Files or directories (default: the workspace)")}), &[], true),
         tool("show", "A request block as written. To see it with variables substituted (secrets masked), use `run` with dry_run.",
             json!({"file": file, "request": request}), &["file", "request"], true),
-        tool("run", "Send requests (none named = all, in file order) and return respite.run/v1 JSON: request, response \
-            (status, headers, body), timing_ms, tests (`# @assert` results), dependencies. Secrets are masked. \
+        tool("run", "Send requests and return respite.run/v1 JSON: request, response (status, body; headers on `include`), \
+            timing_ms, tests (`# @assert` results), dependencies. Say what to run in one of three ways: `file` (+ `requests`; none named = \
+            the whole file in order, refused with exit code 4 if it has anything but GET/HEAD/OPTIONS unless `all: true`), `curl` (a cURL command), \
+            or `method` + `url` (+ `headers`, `body`). curl / method+url send a one-off request that is written nowhere in the workspace \
+            (History records it with an empty file); save a keeper with `add_request`. Secrets are masked. \
             `# @note` requests are refused; `# @prompt` values must come in `vars`.",
-            json!({"file": file, "requests": strs("Requests to run, each as in `show`"),
+            json!({"file": s("Path to the .http / .rest file to run"), "requests": strs("With `file`: requests to run, each as in `show`"),
+                   "all": b("With `file` and no `requests`: confirm that every request in the file may be sent. Pass it only after asking the user"),
+                   "curl": s("Instead of `file`: a cURL command"),
+                   "method": s("Instead of `file`: HTTP method, upper-case (default GET with `url`)"), "url": s("Instead of `file`: request URL"),
+                   "headers": json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "With `method` + `url`: request headers"}),
+                   "body": s("With `method` + `url`: request body"),
                    "env": s("Environment name (`dev` reads respite-dev.json); default: the file's `# @env`"),
                    "vars": json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "Variable overrides, highest priority"}),
                    "dry_run": b("Resolve and return the request without sending it"),
@@ -236,7 +467,16 @@ fn tools() -> Value {
                    "jsonpath": s("Return only these JSONPath matches of a JSON body, e.g. $.items[*].id"),
                    "max_body": s("Cap the returned body, e.g. 64KB"),
                    "include": json!({"type": "array", "items": {"enum": ["headers", "body", "timing"]}, "description": "Parts to return (default: body, timing; add headers when needed)"})}),
-            &["file"], false),
+            &[], false),
+        tool("add_request", "Append a request block to a .http file in the workspace (created if missing; the folder must exist). \
+            `asserts` become `# @assert` lines above the request line. The file is checked like `check` and nothing is written if the new block has errors. \
+            Run it afterwards with `run`.",
+            json!({"file": s("Path to the .http / .rest file"), "name": s("`# @name` of the request: one word"), "title": s("Optional `###` title"),
+                   "method": s("HTTP method, upper-case"), "url": s("Request URL; `{{variables}}` allowed"),
+                   "headers": json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "Request headers"}),
+                   "body": s("Request body; set a Content-Type header for JSON"),
+                   "asserts": strs("Assertions without the `# @assert` prefix, e.g. `status == 200`, `body $.id exists`")}),
+            &["file", "name", "method", "url"], false),
         tool("export_curl", "A request as a cURL command, with {{variables}} kept as written.",
             json!({"file": file, "request": request}), &["file", "request"], true),
         tool("import", "Postman / Insomnia / OpenAPI / Swagger / Bruno folder / HAR → .http files in a new folder; its environments go to the user's env folder.",
@@ -250,8 +490,11 @@ fn tools() -> Value {
             json!({}), &[], true),
         tool("env_show", "Merged variables of one environment with their source files; secrets masked.",
             json!({"name": s("Environment name")}), &["name"], true),
-        tool("history", "Past executions of this workspace, newest first.",
-            json!({"last": json!({"type": "integer", "description": "How many (default 20)"})}), &[], true),
+        tool("history", "Past executions of this workspace, newest first: id, time, source, file, name, method, url, status, total_ms, size_bytes. \
+            `include` adds more per entry.",
+            json!({"last": json!({"type": "integer", "description": "How many (default 20)"}),
+                   "include": json!({"type": "array", "items": {"enum": ["headers", "bodies"]}, "description": "headers: request and response headers, cookies sent; bodies: request body"})}),
+            &[], true),
     ])
 }
 
@@ -274,6 +517,10 @@ mod tests {
 
         for t in tools().as_array().unwrap() {
             let a = json!({"file": "a.http", "request": "x", "path": ".", "name": "dev", "curl": "curl x"});
+            if t["name"] == "add_request" {
+                continue; // runs in-process, see `add_request_writes_checked_blocks`
+            }
+            let a = if t["name"] == "run" { json!({"file": "a.http"}) } else { a };
             assert!(argv(t["name"].as_str().unwrap(), &a, &root).is_ok(), "{t}");
         }
         let a = json!({"file": "a.http", "requests": ["login"], "env": "dev", "vars": {"id": "7"}, "dry_run": true, "include": ["body", "timing"]});
@@ -296,5 +543,117 @@ mod tests {
             assert!(argv(tool, &a, &root).is_err(), "{tool} {a}");
         }
         assert!(argv("import_curl", &json!({"curl": "curl x", "to": "new.http"}), &root).is_ok());
+    }
+
+    #[test]
+    fn ad_hoc_and_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("safe.http"), "### A\nGET /a\n\n###\nHEAD /b\n").unwrap();
+        std::fs::write(root.join("mixed.http"), "# @name a\nGET /a\n\n###\n# @name mk\nPOST /b\n").unwrap();
+        let run = |a: Value| argv("run", &a, &root);
+
+        // Whole file: safe methods run, anything else needs `all` or names; dry_run is never refused.
+        assert!(run(json!({"file": "safe.http"})).is_ok());
+        let e = run(json!({"file": "mixed.http"})).unwrap_err();
+        assert!(e.contains("POST mk") && e.contains("all: true") && e.contains("exit code 4"), "{e}");
+        assert!(run(json!({"file": "mixed.http", "all": true})).is_ok());
+        assert!(run(json!({"file": "mixed.http", "dry_run": true})).is_ok());
+        assert!(run(json!({"file": "mixed.http", "requests": ["mk"]})).is_ok());
+
+        // Ad hoc: the block goes on stdin to `run -`; nothing is created in the workspace.
+        let (v, input) = run(json!({"method": "POST", "url": "http://x/y", "headers": {"Accept": "a/b"}, "body": "{\"a\":1}", "jsonpath": "$.a"})).unwrap();
+        assert!(v.join(" ").starts_with("run - --non-interactive --output json"), "{v:?}");
+        assert!(v.contains(&"--jsonpath".to_string()));
+        assert_eq!(input.unwrap(), "POST http://x/y\nAccept: a/b\n\n{\"a\":1}\n");
+        let (v, input) = run(json!({"url": "http://x/", "dry_run": true})).unwrap();
+        assert!((v.contains(&"--dry-run".to_string()), input.as_deref()) == (true, Some("GET http://x/\n")));
+        let (_, input) = run(json!({"curl": "curl -X PUT http://x/z -H 'A: b' -d 'hi'"})).unwrap();
+        let block = input.unwrap();
+        assert!(block.contains("PUT http://x/z") && block.contains("A: b") && !block.contains("curl"), "{block}");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+
+        // Exactly one way; no smuggled directives, files or disk writes.
+        for a in [
+            json!({}),
+            json!({"file": "safe.http", "url": "http://x/"}),
+            json!({"curl": "curl http://x/", "url": "http://x/"}),
+            json!({"method": "GET"}),
+            json!({"method": "get", "url": "http://x/"}),
+            json!({"url": "http://x/\n# @no-log"}),
+            json!({"url": "http://x/", "headers": {"A": "b\n# @no-log"}}),
+            json!({"url": "http://x/", "body": "ok\n###\nGET /z"}),
+            json!({"method": "POST", "url": "http://x/", "body": "< /etc/hosts"}),
+            json!({"curl": "curl http://x/ -d @/etc/hosts"}),
+            json!({"curl": "curl http://x/ -o out.bin"}),
+            json!({"curl": "curl http://x/a\ncurl http://x/b"}),
+            json!({"curl": "wget http://x/"}),
+            json!({"url": "http://x/", "requests": ["a"]}),
+        ] {
+            assert!(run(a.clone()).is_err(), "{a}");
+        }
+    }
+
+    #[test]
+    fn results_are_shaped() {
+        let root = Path::new("/ws");
+        let entry = json!({"id": "i", "time": "t", "source": "mcp", "file": "", "name": null, "label": "l", "line": 1, "method": "GET", "url": "u",
+            "request_headers": [["A", "b"]], "request_body": "{}", "status": 200, "reason": "OK", "http_version": "1.1",
+            "response_headers": [["C", "d"]], "ttfb_ms": 1, "total_ms": 2, "size_bytes": 3, "dependencies": [], "response_url": "u", "redirects": [], "cookies_sent": []});
+        let out = Value::Array(vec![entry]).to_string();
+        let keys = |v: String| -> Vec<String> { serde_json::from_str::<Value>(&v).unwrap()[0].as_object().unwrap().keys().cloned().collect() };
+        let compact = keys(shape("history", &json!({}), &out, root));
+        assert_eq!(compact.len(), 10);
+        assert!(["id", "time", "source", "file", "name", "method", "url", "status", "total_ms", "size_bytes"].iter().all(|k| compact.contains(&k.to_string())));
+        let more = keys(shape("history", &json!({"include": ["headers", "bodies"]}), &out, root));
+        assert!(["request_headers", "response_headers", "request_body"].iter().all(|k| more.contains(&k.to_string())) && !more.contains(&"label".to_string()));
+        // Other tools' output passes through untouched.
+        assert_eq!(shape("list", &json!({}), &out, root), out);
+        for tool in ["list", "env_list", "history"] {
+            let t = shape(tool, &json!({}), "[]", root);
+            assert!(t.starts_with("[]\n\n") && t.len() > 20, "{tool}: {t}");
+        }
+        assert!(shape("list", &json!({}), "[]", root).contains("/ws") && shape("list", &json!({}), "[]", root).contains("add_request"));
+        assert_eq!(shape("check", &json!({}), "[]", root), "[]");
+    }
+
+    #[test]
+    fn add_request_writes_checked_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let add = |a: Value| add_request(&a, &root);
+        let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap();
+
+        let r = add(json!({"file": "n.http", "name": "list", "method": "GET", "url": "http://x/items", "asserts": ["status == 200", "# @assert body $.n exists"]})).unwrap();
+        assert!(serde_json::from_str::<Value>(&r).unwrap()["line"] == 4, "{r}");
+        assert_eq!(read("n.http"), "# @name list\n# @assert status == 200\n# @assert body $.n exists\nGET http://x/items\n");
+        add(json!({"file": "n.http", "name": "mk", "title": "Create", "method": "POST", "url": "http://x/items",
+            "headers": {"Content-Type": "application/json"}, "body": "{\"a\": 1}"})).unwrap();
+        add(json!({"file": "n.http", "name": "other", "method": "DELETE", "url": "http://x/items/1"})).unwrap();
+        let text = read("n.http");
+        assert!(text.contains("\n\n### Create\n# @name mk\nPOST http://x/items\nContent-Type: application/json\n\n{\"a\": 1}\n\n###\n# @name other\nDELETE"), "{text}");
+        let parsed = http_syntax::parse(&text);
+        assert_eq!(parsed.requests.len(), 3);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        // Refused, and the file stays as it was: bad assert, bad JSON, duplicate name, bad input, bad path.
+        let before = read("n.http");
+        for a in [
+            json!({"file": "n.http", "name": "x", "method": "GET", "url": "http://x/", "asserts": ["status ~ 1"]}),
+            json!({"file": "n.http", "name": "x", "method": "POST", "url": "http://x/", "headers": {"Content-Type": "application/json"}, "body": "{,}"}),
+            json!({"file": "n.http", "name": "list", "method": "GET", "url": "http://x/"}),
+            json!({"file": "n.http", "name": "a b", "method": "GET", "url": "http://x/"}),
+            json!({"file": "n.http", "name": "x", "method": "get", "url": "http://x/"}),
+            json!({"file": "n.http", "name": "x", "method": "GET", "url": "http://x/\n# @note"}),
+            json!({"file": "n.http", "name": "x", "method": "GET", "url": "http://x/", "asserts": ["status == 200\nGET /z"]}),
+            json!({"file": "n.http", "name": "x", "method": "GET"}),
+            json!({"file": "../x.http", "name": "x", "method": "GET", "url": "http://x/"}),
+            json!({"file": "notes.txt", "name": "x", "method": "GET", "url": "http://x/"}),
+            json!({"file": "gone/x.http", "name": "x", "method": "GET", "url": "http://x/"}),
+        ] {
+            assert!(add(a.clone()).is_err(), "{a}");
+        }
+        assert_eq!(read("n.http"), before);
+        assert!(!root.join("notes.txt").exists());
     }
 }

@@ -288,6 +288,16 @@ fn comment(t: &str) -> Option<&str> {
     t.strip_prefix("//").or_else(|| t.strip_prefix('#')).map(str::trim)
 }
 
+/// Name of the directive a comment (without its `#` / `//`) spells, `@assert …` for one.
+fn misplaced_directive(c: &str) -> Option<&str> {
+    let name = c.strip_prefix('@')?.split_whitespace().next()?;
+    DIRECTIVES.iter().copied().find(|d| *d == name)
+}
+
+fn misplaced_message(name: &str) -> String {
+    format!("`@{name}` after the request line is ignored (or sent as body text): directives go above the request line")
+}
+
 fn file_variable(t: &str) -> Option<(&str, &str)> {
     let (name, value) = t.strip_prefix('@')?.split_once('=')?;
     let name = name.trim();
@@ -399,7 +409,11 @@ fn parse_block(
         if is_tail(t) {
             break;
         }
-        if comment(t).is_none() {
+        if let Some(c) = comment(t) {
+            if let Some(d) = misplaced_directive(c) {
+                file.diagnostics.push(diag(i + 1, Severity::Warning, "misplaced_directive", misplaced_message(d)));
+            }
+        } else {
             match t.split_once(':').filter(|(n, _)| !n.trim().is_empty()) {
                 Some((n, v)) => headers.push(Header { name: n.trim().into(), value: v.trim().into(), line: i + 1 }),
                 None => file.diagnostics.push(diag(i + 1, Severity::Error, "invalid_header",
@@ -421,10 +435,20 @@ fn parse_block(
     let body = (body_end > body_start)
         .then(|| Body { text: lines[body_start..body_end].join("\n"), line: body_start + 1 });
     let json = headers.iter().any(|h| h.name.eq_ignore_ascii_case("content-type") && h.value.to_ascii_lowercase().contains("json"));
+    let mut body_directive = None;
+    if let Some(b) = &body {
+        for (n, l) in b.text.lines().enumerate() {
+            if let Some(d) = comment(l.trim()).and_then(misplaced_directive) {
+                body_directive.get_or_insert(d);
+                file.diagnostics.push(diag(b.line + n, Severity::Warning, "misplaced_directive", misplaced_message(d)));
+            }
+        }
+    }
     if let Some(b) = body.as_ref().filter(|b| json && !b.text.trim_start().starts_with('<'))
         && let Err((line, message)) = check_json(&b.text)
     {
-        file.diagnostics.push(diag(b.line + line - 1, Severity::Error, "invalid_json", format!("invalid JSON body: {message}")));
+        let hint = body_directive.map(|d| format!(" (the body contains `@{d}`: directives go above the request line)")).unwrap_or_default();
+        file.diagnostics.push(diag(b.line + line - 1, Severity::Error, "invalid_json", format!("invalid JSON body: {message}{hint}")));
     }
 
     // Tail: handler scripts and output redirect.
@@ -605,6 +629,15 @@ mod tests {
         // Not JSON by Content-Type, or a file reference: not checked.
         assert!(parse("POST /a\n\n{ broken\n").diagnostics.is_empty());
         assert!(parse("POST /a\nContent-Type: application/json\n\n< ./a.json\n").diagnostics.is_empty());
+
+        // A directive written after the body: the JSON error says where directives go.
+        let f = parse("POST /a\nContent-Type: application/json\n\n{\"a\": 1}\n# @assert status == 200\n");
+        let d: Vec<_> = f.diagnostics.iter().map(|d| (d.line, d.code)).collect();
+        assert_eq!(d, [(5, "misplaced_directive"), (5, "invalid_json")]);
+        assert!(f.diagnostics[1].message.starts_with("invalid JSON body: trailing characters"));
+        assert!(f.diagnostics[1].message.contains("directives go above the request line"));
+        let f = parse("GET /a\n# @assert status == 200\n");
+        assert_eq!(f.diagnostics.iter().map(|d| (d.line, d.code)).collect::<Vec<_>>(), [(2, "misplaced_directive")]);
 
         let body = "{\n  \"a\": {{n}},\n  \"b\": [1, 2,]\n,}";
         assert_eq!(trailing_comma(body), Some(body.find("2,").unwrap() + 1));

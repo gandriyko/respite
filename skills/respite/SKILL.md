@@ -29,7 +29,7 @@ Requests are addressed by `@name`, `###` title, `:LINE` (any line of the block) 
 |---|---|
 | `respite list [PATH]` | Requests in a file or directory: file, line, name, method, URL |
 | `respite show FILE REQUEST [--resolved]` | The request block; `--resolved` substitutes variables |
-| `respite run FILE [REQUESTS]...` | Send requests (none named = all, in file order) |
+| `respite run FILE [REQUESTS]...` | Send requests (none named = all, in file order); `FILE` `-` reads request block(s) from stdin and History records them with no file |
 | `respite check [PATHS]...` | Diagnostics only, sends nothing (pre-commit / CI) |
 | `respite import PATH [--to DIR]` | Postman / Insomnia / OpenAPI / Swagger / Bruno folder / HAR → `.http` files in a new folder (default under `~/.config/respite/collections`), its environments into the env folder |
 | `respite import-curl` | cURL command(s) from stdin → request block(s) |
@@ -85,12 +85,34 @@ Values of secret variables are masked.
 ### MCP server
 
 `respite mcp` serves the same commands as MCP tools over stdio, for clients without a shell:
-`list`, `check`, `show`, `run`, `export_curl`, `import`, `import_curl`, `env_list`,
-`env_show`, `history`. Arguments mirror the flags (`dry_run`, `fail_on_status`, …); `vars` is
-an object instead of repeated `--var`. Each tool returns the command's JSON output; a non-zero
-exit code sets `isError` and is appended to the text, except `check` finding errors: its
-diagnostics come back as a normal result. `run` returns body and timing; pass
-`include: ["headers", …]` for response headers. History marks these runs `mcp`.
+`list`, `check`, `show`, `run`, `add_request`, `export_curl`, `import`, `import_curl`,
+`env_list`, `env_show`, `history`. Arguments mirror the flags (`dry_run`, `fail_on_status`, …);
+`vars` is an object instead of repeated `--var`. Each tool returns the command's JSON output; a
+non-zero exit code sets `isError` and is appended to the text, except `check` finding errors: its
+diagnostics come back as a normal result. `list`, `env_list` and `history` with nothing to show
+return `[]` plus a hint (workspace path, what to do next).
+
+- `run` returns body and timing; pass `include: ["headers", …]` for response headers. It takes
+  one of three sources: `file` (+ `requests`), `curl` (a cURL command) or `method` + `url`
+  (+ `headers` object, `body` string). The last two send a one-off request that is written
+  nowhere in the workspace; History records it with an empty `file`. They have the same masking
+  and `include` / `jsonpath` / `max_body` options, and can't write the response to a file or send a
+  local file (`-o`, `-d @file`, `< path`); this is `respite run -` on the CLI.
+- `run` with a `file` and no `requests` is refused with exit code 4 ("needs confirmation") when
+  the file has any request that isn't GET / HEAD / OPTIONS: name the requests, or ask the user and
+  pass `all: true`. `dry_run` is never refused.
+- `add_request` (`file`, `name`, `method`, `url`, optional `title`, `headers`, `body`, `asserts`)
+  appends a block to a `.http` file in the workspace, creating the file (its folder must exist).
+  `asserts` are written as `# @assert` lines above the request line. It is checked as `check`
+  does and nothing is written if the new block has errors.
+- `history` returns id, time, source, file, name, method, url, status, total_ms and size_bytes;
+  `include: ["headers"]` adds request / response headers and cookies sent, `["bodies"]` the
+  request body.
+- A directive (`# @assert`, `# @name`, …) after the request line is not applied: `check` warns
+  `misplaced_directive`, and in a JSON body the `invalid_json` error says so. Directives go above
+  the request line.
+
+History marks these runs `mcp`.
 
 Everything you send through this skill (the `respite` CLI, marked `cli`) or the MCP server
 (marked `mcp`) is written to the same History the app shows, with its file and line, so the user
