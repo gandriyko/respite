@@ -88,10 +88,12 @@ fn call(name: &str, args: &Value, root: &Path) -> Result<Value, (i64, String)> {
     if !err.trim().is_empty() {
         text += &format!("\n\nstderr:\n{}", err.trim_end());
     }
-    if code != 0 {
+    // `check` finding errors (exit 3) is its answer, not a failed call: the diagnostics are the result.
+    let diagnostics = name == "check" && code == 3 && text.starts_with('{');
+    if code != 0 && !diagnostics {
         text += &format!("\n\nexit code {code} (1 assert failed or 4xx/5xx · 2 network/timeout · 3 bad input · 4 needs confirmation)");
     }
-    Ok(json!({"content": [{"type": "text", "text": text}], "isError": code != 0}))
+    Ok(json!({"content": [{"type": "text", "text": text}], "isError": code != 0 && !diagnostics}))
 }
 
 /// `p` resolved against `root` (symlinks and `..` included) if it stays inside; with `http`, a
@@ -165,10 +167,12 @@ fn argv(name: &str, a: &Value, root: &Path) -> Result<(Vec<String>, Option<Strin
             flag(&mut v, "fail_on_status", "--fail-on-status");
             opt(&mut v, "jsonpath", "--jsonpath");
             opt(&mut v, "max_body", "--max-body");
-            let include = list_of("include");
-            if !include.is_empty() {
-                v.extend(["--include".into(), include.join(",")]);
+            // Response headers are mostly CDN noise; an agent asks for them with `include`.
+            let mut include = list_of("include");
+            if include.is_empty() {
+                include = vec!["body".into(), "timing".into()];
             }
+            v.extend(["--include".into(), include.join(",")]);
         }
         "export_curl" => v.extend(["export-curl".into(), need_path("file", true)?, need("request")?, "--raw".into()]),
         "import" => {
@@ -231,7 +235,7 @@ fn tools() -> Value {
                    "fail_fast": b("Stop at the first failure"), "fail_on_status": b("Treat 4xx/5xx as failure"),
                    "jsonpath": s("Return only these JSONPath matches of a JSON body, e.g. $.items[*].id"),
                    "max_body": s("Cap the returned body, e.g. 64KB"),
-                   "include": json!({"type": "array", "items": {"enum": ["headers", "body", "timing"]}, "description": "Parts to return (default: all)"})}),
+                   "include": json!({"type": "array", "items": {"enum": ["headers", "body", "timing"]}, "description": "Parts to return (default: body, timing; add headers when needed)"})}),
             &["file"], false),
         tool("export_curl", "A request as a cURL command, with {{variables}} kept as written.",
             json!({"file": file, "request": request}), &["file", "request"], true),
@@ -274,6 +278,8 @@ mod tests {
         }
         let a = json!({"file": "a.http", "requests": ["login"], "env": "dev", "vars": {"id": "7"}, "dry_run": true, "include": ["body", "timing"]});
         assert_eq!(argv("run", &a, &root).unwrap().0.join(" "), format!("run {r}/a.http login --non-interactive --output json --env dev --var id=7 --dry-run --include body,timing"));
+        let d = argv("run", &json!({"file": "a.http"}), &root).unwrap().0.join(" ");
+        assert!(d.ends_with("--include body,timing"), "{d}");
         assert_eq!(argv("export_curl", &json!({"file": "a.http", "request": "#1"}), &root).unwrap().0.join(" "), format!("export-curl {r}/a.http #1 --raw"));
         assert!(argv("show", &json!({"file": "a.http"}), &root).is_err());
 

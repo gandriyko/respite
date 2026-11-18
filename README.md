@@ -233,7 +233,7 @@ respite run api.http --env staging --fail-fast
 
 [`skills/respite/SKILL.md`](skills/respite/SKILL.md) teaches a coding agent (Claude Code, Codex and others that read Agent Skills) to send requests and test an API through the CLI. Copy the folder into the agent's skills directory, for example `~/.claude/skills/respite`.
 
-For clients that talk MCP instead of running commands, `respite mcp` is a stdio MCP server with the same commands as tools (`list`, `run`, `check`, `show`, `env_show`, …). Each tool runs the CLI command with JSON output, so the results, masking and exit codes are the same. Nothing opens on screen.
+For clients that talk MCP instead of running commands, `respite mcp` is a stdio MCP server with the same commands as tools (`list`, `run`, `check`, `show`, `env_show`, …). Each tool runs the CLI command with JSON output, so the results, masking and exit codes are the same, with two differences for agents: `run` leaves out response headers unless `include` asks for them, and `check` returns its diagnostics as a normal result. Nothing opens on screen.
 
 ```sh
 claude mcp add respite -- respite mcp

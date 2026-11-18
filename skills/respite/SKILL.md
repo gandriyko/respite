@@ -88,7 +88,9 @@ Values of secret variables are masked.
 `list`, `check`, `show`, `run`, `export_curl`, `import`, `import_curl`, `env_list`,
 `env_show`, `history`. Arguments mirror the flags (`dry_run`, `fail_on_status`, …); `vars` is
 an object instead of repeated `--var`. Each tool returns the command's JSON output; a non-zero
-exit code sets `isError` and is appended to the text. History marks these runs `mcp`.
+exit code sets `isError` and is appended to the text, except `check` finding errors: its
+diagnostics come back as a normal result. `run` returns body and timing; pass
+`include: ["headers", …]` for response headers. History marks these runs `mcp`.
 
 Everything you send through this skill (the `respite` CLI, marked `cli`) or the MCP server
 (marked `mcp`) is written to the same History the app shows, with its file and line, so the user
