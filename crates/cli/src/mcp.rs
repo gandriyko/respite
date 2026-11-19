@@ -101,6 +101,9 @@ fn call(name: &str, args: &Value, root: &Path) -> Result<Value, (i64, String)> {
     let diagnostics = name == "check" && code == 3 && text.starts_with('{');
     if code != 0 && !diagnostics {
         text += &format!("\n\nexit code {code} (1 assert failed or 4xx/5xx · 2 network/timeout · 3 bad input · 4 needs confirmation)");
+        if name == "run" && text.contains("\"code\":\"timeout\"") {
+            text += "\nA slow server needs a longer limit: pass `timeout` (seconds).";
+        }
     }
     if code == 0 {
         text = shape(name, args, &text, root);
@@ -229,6 +232,9 @@ fn argv(name: &str, a: &Value, root: &Path) -> Result<(Vec<String>, Option<Strin
             flag(&mut v, "fail_on_status", "--fail-on-status");
             opt(&mut v, "jsonpath", "--jsonpath");
             opt(&mut v, "max_body", "--max-body");
+            if let Some(t) = timeout_secs(a)? {
+                v.extend(["--timeout".into(), format!("{t}s")]);
+            }
             // Response headers are mostly CDN noise; an agent asks for them with `include`.
             let mut include = list_of("include");
             if include.is_empty() {
@@ -335,6 +341,14 @@ fn ad_hoc_block(a: &Value) -> Result<Option<String>, String> {
 /// One request block from `method` / `url` / `headers` / `body`, with `# @name`, a `###` title
 /// and `# @assert` lines above the request line when given. Single-line fields only where the
 /// format needs it, so no field can smuggle in a directive.
+/// `timeout` argument: whole seconds, at least 1 (an agent can raise the limit, not remove it).
+fn timeout_secs(a: &Value) -> Result<Option<u64>, String> {
+    match a.get("timeout") {
+        None | Some(Value::Null) => Ok(None),
+        Some(t) => t.as_u64().filter(|&n| n > 0).map(Some).ok_or_else(|| format!("'timeout' must be whole seconds, 1 or more, got {t}")),
+    }
+}
+
 fn request_block(a: &Value, name: Option<&str>, asserts: &[String]) -> Result<String, String> {
     let one_line = |what: &str, s: &str| -> Result<(), String> {
         if s.chars().any(char::is_control) {
@@ -358,6 +372,9 @@ fn request_block(a: &Value, name: Option<&str>, asserts: &[String]) -> Result<St
             return Err("'name' must be one word without whitespace".into());
         }
         out += &format!("# @name {n}\n");
+    }
+    if let Some(t) = timeout_secs(a)? {
+        out += &format!("# @timeout {t} s\n");
     }
     for x in asserts {
         one_line("asserts", x)?;
@@ -466,6 +483,7 @@ fn tools() -> Value {
                    "fail_fast": b("Stop at the first failure"), "fail_on_status": b("Treat 4xx/5xx as failure"),
                    "jsonpath": s("Return only these JSONPath matches of a JSON body, e.g. $.items[*].id"),
                    "max_body": s("Cap the returned body, e.g. 64KB"),
+                   "timeout": json!({"type": "integer", "minimum": 1, "description": "Seconds to wait for each request without `# @timeout` (default: the user's request.timeout_ms setting, else 60)"}),
                    "include": json!({"type": "array", "items": {"enum": ["headers", "body", "timing"]}, "description": "Parts to return (default: body, timing; add headers when needed)"})}),
             &[], false),
         tool("add_request", "Append a request block to a .http file in the workspace (created if missing; the folder must exist). \
@@ -475,7 +493,8 @@ fn tools() -> Value {
                    "method": s("HTTP method, upper-case"), "url": s("Request URL; `{{variables}}` allowed"),
                    "headers": json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "Request headers"}),
                    "body": s("Request body; set a Content-Type header for JSON"),
-                   "asserts": strs("Assertions without the `# @assert` prefix, e.g. `status == 200`, `body $.id exists`")}),
+                   "asserts": strs("Assertions without the `# @assert` prefix, e.g. `status == 200`, `body $.id exists`"),
+                   "timeout": json!({"type": "integer", "minimum": 1, "description": "Request timeout in seconds, written as `# @timeout N s`"})}),
             &["file", "name", "method", "url"], false),
         tool("export_curl", "A request as a cURL command, with {{variables}} kept as written.",
             json!({"file": file, "request": request}), &["file", "request"], true),
@@ -572,6 +591,15 @@ mod tests {
         let block = input.unwrap();
         assert!(block.contains("PUT http://x/z") && block.contains("A: b") && !block.contains("curl"), "{block}");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+
+        // `timeout` raises the limit (`--timeout Ns`, and `# @timeout` in an ad-hoc block); it can't remove it.
+        let (v, _) = run(json!({"file": "safe.http", "timeout": 120})).unwrap();
+        assert!(v.join(" ").contains("--timeout 120s"), "{v:?}");
+        let (_, input) = run(json!({"url": "http://x/", "timeout": 90})).unwrap();
+        assert_eq!(input.unwrap(), "# @timeout 90 s\nGET http://x/\n");
+        for t in [json!(0), json!(-1), json!(1.5), json!("2m")] {
+            assert!(run(json!({"file": "safe.http", "timeout": t})).unwrap_err().contains("'timeout'"), "{t}");
+        }
 
         // Exactly one way; no smuggled directives, files or disk writes.
         for a in [

@@ -59,6 +59,8 @@ Variables (`run`, `show`, `export-curl`, `auth token`):
 - `--include headers,body,timing` — parts to print (human: body; JSON: all).
 - `--max-body 64KB` — cap the printed body.
 - `--jsonpath '$.items[*].id'` — print only the matches from a JSON body.
+- `--timeout 120s` — timeout of requests without `# @timeout` (`ms` / `s` / `m`, seconds by
+  default); replaces the `request.timeout_ms` setting; `0` = no limit.
 
 `import-curl` options:
 
@@ -112,7 +114,9 @@ return `[]` plus a hint (workspace path, what to do next).
   `misplaced_directive`, and in a JSON body the `invalid_json` error says so. Directives go above
   the request line.
 - A request with no `# @timeout` and no `request.timeout_ms` setting stops after 60 s (exit
-  code 2), so a server that never answers doesn't hang the call. Set `# @timeout` for a slower one.
+  code 2), so a server that never answers doesn't hang the call. For a slower server pass
+  `timeout` (whole seconds, 1 or more) to `run`; `add_request` takes `timeout` too and writes
+  it as `# @timeout N s`. A `# @timeout` in the file wins over both.
 
 History marks these runs `mcp`.
 

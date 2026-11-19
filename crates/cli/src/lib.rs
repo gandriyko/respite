@@ -417,13 +417,20 @@ pub(crate) const MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Executor with history (limits from settings) and request defaults.
 pub(crate) fn executor(env: Option<&str>) -> http_exec::Executor {
+    executor_with(env, None)
+}
+
+/// [`executor`] with `run --timeout` (zero = no limit) over `request.timeout_ms`.
+pub(crate) fn executor_with(env: Option<&str>, timeout: Option<std::time::Duration>) -> http_exec::Executor {
     let s = settings();
     let source = if std::env::var(mcp::SOURCE_ENV).as_deref() == Ok("mcp") { "mcp" } else { "cli" };
     let exec = http_exec::Executor::new(open_store(&s), env, source);
     let mut options = exec_options(&s);
-    // An agent can't press Cancel: without `@timeout` or `request.timeout_ms` an MCP run stops at 60 s.
-    if source == "mcp" {
-        options.timeout = options.timeout.or(Some(MCP_TIMEOUT));
+    match timeout {
+        Some(t) => options.timeout = (!t.is_zero()).then_some(t),
+        // An agent can't press Cancel: without `@timeout` or `request.timeout_ms` an MCP run stops at 60 s.
+        None if source == "mcp" => options.timeout = options.timeout.or(Some(MCP_TIMEOUT)),
+        None => {}
     }
     exec.set_options(options);
     // Browser and device sign-ins: stdout stays the result, the instructions go to stderr.

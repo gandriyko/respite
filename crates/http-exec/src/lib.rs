@@ -636,6 +636,11 @@ fn extract(ex: &Exchange, path: &str) -> Option<String> {
     }
 }
 
+/// `10 s`, `500ms`, `2m`, as in `# @timeout`; a bare number is seconds.
+pub fn parse_duration(v: &str) -> Option<Duration> {
+    millis(v.trim(), 1000).map(Duration::from_millis)
+}
+
 /// `10 s`, `500ms`, `2m`; bare numbers in `default_unit_ms`.
 fn millis(v: &str, default_unit_ms: u64) -> Option<u64> {
     let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());

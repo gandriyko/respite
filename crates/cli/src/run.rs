@@ -46,6 +46,14 @@ pub(crate) struct RunArgs {
     /// Exit 1 when a response is 4xx/5xx
     #[arg(long)]
     fail_on_status: bool,
+    /// Timeout of requests without `# @timeout`, e.g. 120s, 500ms, 2m (bare number = seconds);
+    /// replaces `request.timeout_ms`; 0 = no limit
+    #[arg(long, value_parser = parse_timeout)]
+    timeout: Option<std::time::Duration>,
+}
+
+fn parse_timeout(s: &str) -> Result<std::time::Duration, String> {
+    http_exec::parse_duration(s).ok_or_else(|| format!("invalid timeout '{s}' (e.g. 120s, 500ms, 2m)"))
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +102,7 @@ pub(crate) fn run_loaded(args: RunArgs, loaded: Loaded) -> Result<u8, CliError> 
     // Prompted values; the executor's secrets are added per request.
     let mut secrets: Vec<String> = vec![];
     let interactive = !args.non_interactive && !stdin && std::io::stdin().is_terminal();
-    let exec = crate::executor(env_name.as_deref());
+    let exec = crate::executor_with(env_name.as_deref(), args.timeout);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
 
     let mut exit = 0;
