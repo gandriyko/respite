@@ -15,7 +15,7 @@ use crate::{Exchange, Response, SentRequest};
 const SENSITIVE: [&str; 3] = ["authorization", "cookie", "x-api-key"];
 const MASK: &str = "••••";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub id: String,
     /// RFC 3339, UTC.
@@ -145,6 +145,52 @@ impl Store {
         Ok(id)
     }
 
+    /// Mark a request as in flight: `history/running/<id>.json`, an entry with status 0 that
+    /// other processes (the app's History) see. Dropping the guard removes it.
+    pub fn begin(&self, source: &str, file: &Path, req: &http_syntax::Request, sent: &SentRequest, secrets: &[&str]) -> io::Result<Running> {
+        let dir = self.dir.join("running");
+        std::fs::create_dir_all(&dir)?;
+        let now = jiff::Timestamp::now();
+        let label = req.name.clone().unwrap_or_else(|| format!("line{}", req.request_line));
+        let id = format!("{}-{}-{}", now.strftime("%Y-%m-%dT%H-%M-%S%.9fZ"), std::process::id(), sanitize(&label));
+        let entry = Entry {
+            id: id.clone(),
+            time: now.to_string(),
+            source: source.into(),
+            file: self.relative(file),
+            name: req.name.clone(),
+            label: req.label(),
+            line: req.request_line,
+            method: sent.method.clone(),
+            url: secrets.iter().fold(sent.url.clone(), |acc, sec| acc.replace(sec, MASK)),
+            ..Default::default()
+        };
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(&path, serde_json::to_vec(&entry).map_err(io::Error::other)?)?;
+        Ok(Running(path))
+    }
+
+    /// Requests in flight, newest first. A marker left by a killed process is dropped after
+    /// [`STALE`].
+    pub fn running(&self) -> Vec<Entry> {
+        let dir = self.dir.join("running");
+        let mut out: Vec<Entry> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|f| {
+                let age = f.metadata().ok()?.modified().ok()?.elapsed().unwrap_or_default();
+                if age > STALE {
+                    let _ = std::fs::remove_file(f.path());
+                    return None;
+                }
+                serde_json::from_slice(&std::fs::read(f.path()).ok()?).ok()
+            })
+            .collect();
+        out.sort_unstable_by(|a: &Entry, b| b.id.cmp(&a.id));
+        out
+    }
+
     /// Newest first.
     // ponytail: reads every entry's JSON (≤ `total` small files); add an index file if it shows up in profiles.
     pub fn list(&self) -> Vec<Entry> {
@@ -232,6 +278,19 @@ impl Store {
     }
 }
 
+/// A `running` marker older than this belongs to a killed process.
+// ponytail: age instead of a PID liveness check; a request slower than this vanishes from the list early.
+const STALE: Duration = Duration::from_secs(600);
+
+/// In-flight marker from [`Store::begin`]; removed on drop (done, failed or cancelled).
+pub struct Running(PathBuf);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
@@ -289,5 +348,14 @@ mod tests {
         let cached = s.latest(&file, "login").unwrap();
         assert_eq!((cached.response.status, cached.response.body.as_slice()), (202, b"{\"a\":1}".as_slice()));
         assert!(s.latest(&file, "nope").is_none());
+
+        // An in-flight marker is listed apart from the history, masked, and gone on drop.
+        let sent = exchange(0).request;
+        let running = s.begin("mcp", &file, &parsed.requests[0], &sent, &["http://x"]).unwrap();
+        let r = s.running();
+        assert_eq!((r.len(), r[0].source.as_str(), r[0].url.as_str(), r[0].status), (1, "mcp", "••••/", 0));
+        assert_eq!(s.list().len(), 3);
+        drop(running);
+        assert!(s.running().is_empty());
     }
 }

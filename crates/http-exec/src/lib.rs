@@ -259,6 +259,14 @@ impl Executor {
         Some(ex)
     }
 
+    /// The in-flight marker History shows while the request is out (none with `@no-log`).
+    fn begin(&self, cx: &Context<'_>, req: &Request, sent: &SentRequest) -> Option<store::Running> {
+        let store = self.store.as_ref().filter(|_| req.directive("no-log").is_none())?;
+        let secrets = self.secrets(cx);
+        let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        store.begin(self.source, cx.path, req, sent, &secrets).map_err(|e| eprintln!("respite: running marker not saved: {e}")).ok()
+    }
+
     // Persistence failures must not fail the request; report and go on.
     fn persist(&self, cx: &Context<'_>, req: &Request, ex: &mut Exchange) {
         let Some(store) = &self.store else { return };
@@ -357,6 +365,7 @@ impl Executor {
             stack.pop();
 
             let options = self.options.read().unwrap().clone();
+            let _running = self.begin(cx, req, &prepared.sent);
             let response = send(req, &prepared.sent, self.cookies.clone(), &options, &prepared.tls).await?;
             if let Some((path, overwrite)) = &prepared.output {
                 write_output(path, *overwrite, &response.body)?;

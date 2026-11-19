@@ -146,6 +146,8 @@ struct Respite {
     settings: respite_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
     show_history: bool,
+    /// `history/` and `history/running/` mtimes at the last reload (`poll_history`).
+    history_stamp: [Option<std::time::SystemTime>; 2],
     /// History column and whether it is descending.
     history_sort: (history_page::SortBy, bool),
     history_scroll: UniformListScrollHandle,
@@ -283,6 +285,7 @@ impl Respite {
             settings,
             settings_window: None,
             show_history: false,
+            history_stamp: [None; 2],
             history_sort: (history_page::SortBy::Time, true),
             history_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -412,6 +415,7 @@ impl Respite {
                 let alive = this.update_in(cx, |this, window, cx| {
                     let now = stamp(&this.settings);
                     this.check_files(window, cx);
+                    this.poll_history(cx);
                     if now == last {
                         return;
                     }

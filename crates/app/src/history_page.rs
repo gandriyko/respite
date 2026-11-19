@@ -8,6 +8,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::Input,
+    spinner::Spinner,
 };
 use http_exec::{Entry, Store};
 
@@ -57,12 +58,30 @@ impl Respite {
     }
 
     /// Re-read entries (newest first); keeps the picked one if it is still there.
+    /// Requests in flight (status 0, from any process: app, CLI, MCP) come first.
     pub(crate) fn reload_history(&mut self) {
-        self.history = self.history_store().map(|s| s.list()).unwrap_or_default();
+        self.history_stamp = self.history_dirs_mtime();
+        self.history = self.history_store().map(|s| [s.running(), s.list()].concat()).unwrap_or_default();
         if let Some((e, _)) = &self.history_pick
             && !self.history.iter().any(|x| x.id == e.id)
         {
             self.history_pick = None;
+        }
+    }
+
+    /// Modification times of `history/` and `history/running/`: a run started or finished in
+    /// any process changes one of them.
+    fn history_dirs_mtime(&self) -> [Option<std::time::SystemTime>; 2] {
+        let dir = self.history_store().map(|s| s.dir().to_path_buf());
+        let mtime = |p: Option<std::path::PathBuf>| std::fs::metadata(p?).and_then(|m| m.modified()).ok();
+        [mtime(dir.clone()), mtime(dir.map(|d| d.join("running")))]
+    }
+
+    /// Called every second: an open History page follows runs from the CLI and MCP live.
+    pub(crate) fn poll_history(&mut self, cx: &mut Context<Self>) {
+        if self.show_history && self.history_dirs_mtime() != self.history_stamp {
+            self.reload_history();
+            cx.notify();
         }
     }
 
@@ -103,6 +122,9 @@ impl Respite {
 
     fn pick_history(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let entry = self.history[i].clone();
+        if entry.status == 0 {
+            return; // in flight: no response yet
+        }
         match self.history_store().and_then(|s| s.exchange(entry.clone())) {
             Some(ex) => self.history_pick = Some((entry, Arc::new(ex))),
             None => window.push_notification("This entry's response body is gone from disk", cx),
@@ -190,7 +212,7 @@ impl Respite {
     /// "3 OK · 1 failed · avg 414 ms" as coloured chips, for the shown rows.
     fn history_summary(&self, cx: &App) -> AnyElement {
         let t = cx.theme();
-        let rows: Vec<&Entry> = self.history_rows.iter().map(|&i| &self.history[i]).collect();
+        let rows: Vec<&Entry> = self.history_rows.iter().map(|&i| &self.history[i]).filter(|e| e.status != 0).collect();
         let ok = rows.iter().filter(|e| (200..400).contains(&e.status)).count();
         let failed = rows.len() - ok;
         let avg = if rows.is_empty() { 0 } else { rows.iter().map(|e| e.total_ms).sum::<u64>() / rows.len() as u64 };
@@ -287,8 +309,12 @@ impl Respite {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(div().size(px(8.)).rounded_full().bg(color))
-                    .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(color).child(e.status.to_string())),
+                    .map(|d| match e.status {
+                        0 => d.text_color(t.warning).child(Spinner::new().xsmall()).child(div().text_xs().child("running")),
+                        s => d
+                            .child(div().size(px(8.)).rounded_full().bg(color))
+                            .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(color).child(s.to_string())),
+                    }),
             )
             .child(div().w(px(METHOD_W)).flex_none().text_xs().font_weight(FontWeight::BOLD).font_family(mono).text_color(sidebar::method_color(&e.method, cx)).child(e.method.clone()))
             .child(
@@ -304,7 +330,7 @@ impl Respite {
                     .child(div().truncate().text_xs().text_color(muted).child(e.url.clone())),
             )
             .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(Self::history_origin(e)))
-            .child(div().w(px(DURATION_W)).flex_none().text_right().text_xs().text_color(slow).child(e.total_ms.to_string()))
+            .child(div().w(px(DURATION_W)).flex_none().text_right().text_xs().text_color(slow).when(e.status != 0, |d| d.child(e.total_ms.to_string())))
             .child(div().w(px(REPLAY_W)).flex_none().child(replay))
             // Click shows the response; double click opens the request in its file.
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
