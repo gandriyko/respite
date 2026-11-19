@@ -61,6 +61,12 @@ impl InputHighlighter for HttpHighlighter {
     }
 }
 
+/// `src` styled whole, for a one-off text outside an editor (History's hover tip).
+pub fn styled(src: &str, theme: &dyn HighlightStyleResolver) -> Vec<(Range<usize>, HighlightStyle)> {
+    let (spans, folds) = compute(src);
+    HttpHighlighter { spans, folds }.styles(&(0..src.len()), theme)
+}
+
 thread_local! {
     static LAST: std::cell::RefCell<(String, Arc<HttpFile>)> = Default::default();
 }

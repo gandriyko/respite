@@ -32,6 +32,56 @@ const FILE_W: f32 = 150.;
 const DURATION_W: f32 = 64.;
 const REPLAY_W: f32 = 24.;
 
+/// The request as a `.http` file has it: method and URL, headers, then the body (JSON pretty-printed).
+fn request_text(e: &Entry) -> String {
+    let headers: String = e.request_headers.iter().map(|(n, v)| format!("{n}: {v}\n")).collect();
+    let body = serde_json::from_str::<serde_json::Value>(&e.request_body).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_else(|| e.request_body.trim().to_string());
+    let body = if body.is_empty() { String::new() } else { format!("\n{body}\n") };
+    format!("{} {}\n{headers}{body}", e.method, e.url)
+}
+
+/// The request cell's hover tip: the request highlighted like the editor, scrollable when long.
+/// Hoverable, so the pointer can move onto it and scroll; a click copies the text.
+struct RequestTip {
+    text: SharedString,
+    runs: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+impl RequestTip {
+    fn new(e: &Entry, cx: &App) -> Self {
+        let text = request_text(e);
+        let runs = crate::highlight::styled(&text, &*cx.theme().highlight_theme);
+        Self { text: text.into(), runs }
+    }
+}
+
+impl Render for RequestTip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme();
+        div()
+            .id("request-tip")
+            .max_w(px(720.))
+            .max_h(px(420.))
+            .overflow_scroll()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_color(t.popover_foreground)
+            .shadow_md()
+            .font_family(t.mono_font_family.clone())
+            .text_size(t.mono_font_size * 0.9)
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(this.text.to_string()));
+                window.push_notification("Copied the request", cx);
+            }))
+            .child(StyledText::new(self.text.clone()).with_highlights(self.runs.clone()))
+    }
+}
+
 impl Respite {
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         self.show_history = !self.show_history;
@@ -319,12 +369,22 @@ impl Respite {
             .child(div().w(px(METHOD_W)).flex_none().text_xs().font_weight(FontWeight::BOLD).font_family(mono).text_color(sidebar::method_color(&e.method, cx)).child(e.method.clone()))
             .child(
                 div()
+                    .id(("history-request", ix))
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .items_center()
                     .gap_2()
                     .overflow_hidden()
+                    // GPUI's default 500 ms feels slow when moving down the list.
+                    .tooltip_show_delay(std::time::Duration::from_millis(100))
+                    .hoverable_tooltip({
+                        let e = e.clone();
+                        move |_, cx| {
+                            let tip = RequestTip::new(&e, cx);
+                            cx.new(|_| tip).into()
+                        }
+                    })
                     // The name keeps most of the room; the URL shrinks first.
                     .child(div().flex_shrink_0().max_w(relative(0.75)).truncate().font_weight(FontWeight::SEMIBOLD).child(short_label(e)))
                     .child(div().truncate().text_xs().text_color(muted).child(e.url.clone())),
@@ -367,4 +427,20 @@ fn time_label(rfc3339: &str) -> String {
     let tz = jiff::tz::TimeZone::system();
     let (at, today) = (ts.to_zoned(tz.clone()), jiff::Timestamp::now().to_zoned(tz));
     if at.date() == today.date() { at.strftime("%H:%M:%S").to_string() } else { at.strftime("%b %d %H:%M").to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Entry, request_text};
+
+    #[test]
+    fn request_text_pretty_json() {
+        let mut e = Entry { method: "POST".into(), url: "https://x/u".into(), request_headers: vec![("Accept".into(), "*/*".into())], ..Default::default() };
+        e.request_body = r#"{"a":1}"#.into();
+        assert_eq!(request_text(&e), "POST https://x/u\nAccept: */*\n\n{\n  \"a\": 1\n}\n");
+        e.request_body = "a=1\n".into();
+        assert_eq!(request_text(&e), "POST https://x/u\nAccept: */*\n\na=1\n");
+        e.request_body.clear();
+        assert_eq!(request_text(&e), "POST https://x/u\nAccept: */*\n");
+    }
 }
