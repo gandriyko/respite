@@ -103,18 +103,26 @@ pub(crate) fn run_loaded(args: RunArgs, loaded: Loaded) -> Result<u8, CliError> 
     let mut secrets: Vec<String> = vec![];
     let interactive = !args.non_interactive && !stdin && std::io::stdin().is_terminal();
     let exec = crate::executor_with(env_name.as_deref(), args.timeout);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    let mut stop = Stop::new(!args.dry_run);
 
     let mut exit = 0;
     let mut items = vec![];
     for (n, &index) in indices.iter().enumerate() {
         let req = &loaded.file.requests[index];
-        let outcome = ask(req, &loaded, &mut overrides, &mut secrets, interactive).and_then(|()| {
+        let mut stopped = false;
+        let outcome = ask(req, &loaded, &mut overrides, &mut secrets, interactive, &mut stop).and_then(|()| {
             let cx = Context { path: &loaded.path, file: &loaded.file, env: &env, overrides: &overrides };
             let result = if args.dry_run {
                 exec.prepare(&cx, index).map(Outcome::Dry)
             } else {
-                rt.block_on(exec.run(&cx, index)).map(|ex| Outcome::Done(Box::new(ex)))
+                match stop.run(exec.run(&cx, index)) {
+                    Some(r) => r.map(|ex| Outcome::Done(Box::new(ex))),
+                    None => {
+                        stopped = true;
+                        let e = CliError::new("cancelled", "stopped by SIGINT / SIGTERM", CANCELLED);
+                        return Err(e.at(&loaded.path, Some(req.request_line)));
+                    }
+                }
             };
             result.map_err(|e| exec_error(e, &loaded, req))
         });
@@ -150,7 +158,7 @@ pub(crate) fn run_loaded(args: RunArgs, loaded: Loaded) -> Result<u8, CliError> 
                 }
             }
         }
-        if code != 0 && args.fail_fast {
+        if stopped || (code != 0 && args.fail_fast) {
             break;
         }
     }
@@ -175,6 +183,69 @@ pub(crate) fn from_stdin(src: String) -> Loaded {
     Loaded { path: PathBuf::new(), file: http_syntax::parse(&src), src }
 }
 
+/// Exit code of a run stopped by SIGINT / SIGTERM (the Unix convention for SIGINT).
+const CANCELLED: u8 = 130;
+
+type Signals = Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>;
+
+/// SIGINT / SIGTERM during `run`: a request in flight is dropped (which aborts it and removes its
+/// History marker) and the run stops; at a prompt they exit at once with 130.
+/// Without handlers (`--dry-run`, or they could not be installed) signals keep their default.
+// ponytail: no second-signal handler; after the first one nothing is awaited, the run prints and exits.
+struct Stop {
+    rt: tokio::runtime::Runtime,
+    signals: Signals,
+}
+
+impl Stop {
+    fn new(install: bool) -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+        let signals = install.then(|| {
+            let _rt = rt.enter();
+            signal(SignalKind::interrupt()).ok().zip(signal(SignalKind::terminate()).ok())
+        });
+        Self { rt, signals: signals.flatten() }
+    }
+
+    /// `None` when a signal stopped it.
+    fn run<F: Future>(&mut self, f: F) -> Option<F::Output> {
+        let Self { rt, signals } = self;
+        rt.block_on(async {
+            tokio::select! {
+                r = f => Some(r),
+                _ = received(signals) => None,
+            }
+        })
+    }
+
+    /// Blocking terminal input; a signal exits at once, as it would without handlers.
+    fn prompt<T: Send + 'static>(&mut self, f: impl FnOnce() -> T + Send + 'static) -> T {
+        if self.signals.is_none() {
+            return f();
+        }
+        let Self { rt, signals } = self;
+        rt.block_on(async {
+            tokio::select! {
+                r = tokio::task::spawn_blocking(f) => r.expect("prompt"),
+                _ = received(signals) => std::process::exit(CANCELLED.into()),
+            }
+        })
+    }
+}
+
+async fn received(s: &mut Signals) {
+    match s {
+        Some((int, term)) => tokio::select! { _ = int.recv() => {}, _ = term.recv() => {} },
+        None => std::future::pending().await,
+    }
+}
+
+fn read_line() -> std::io::Result<String> {
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).map(|_| s.trim_end_matches(['\r', '\n']).to_string())
+}
+
 /// `@prompt` values (hidden input for secret-looking names) and `@note` confirmation.
 fn ask(
     req: &Request,
@@ -182,11 +253,8 @@ fn ask(
     overrides: &mut HashMap<String, String>,
     secrets: &mut Vec<String>,
     interactive: bool,
+    stop: &mut Stop,
 ) -> Result<(), CliError> {
-    let read_line = || {
-        let mut s = String::new();
-        std::io::stdin().read_line(&mut s).map(|_| s.trim_end_matches(['\r', '\n']).to_string())
-    };
     for d in req.directives.iter().filter(|d| d.name == "prompt") {
         let value = d.value.as_deref().unwrap_or("");
         let (var, desc) = value.split_once(char::is_whitespace).map_or((value, ""), |(v, d)| (v, d.trim()));
@@ -202,10 +270,10 @@ fn ask(
         let lower = var.to_ascii_lowercase();
         let secret = ["pass", "secret", "token", "key"].iter().any(|s| lower.contains(s));
         let answer = if secret {
-            rpassword::prompt_password(label)
+            stop.prompt(move || rpassword::prompt_password(label))
         } else {
             eprint!("{label}");
-            read_line()
+            stop.prompt(read_line)
         }
         .map_err(|e| CliError::new("prompt_failed", e.to_string(), 3))?;
         if secret && !answer.is_empty() {
@@ -220,7 +288,7 @@ fn ask(
             return Err(refuse("confirmation_required", "marked @note, needs confirmation").hint("run in a terminal to confirm"));
         }
         eprint!("{} {what}{}. Send? [y/N] ", paint("@note", YELLOW, true), note.value.as_deref().map(|v| format!(" — {v}")).unwrap_or_default());
-        let yes = read_line().is_ok_and(|a| matches!(a.trim(), "y" | "Y" | "yes"));
+        let yes = stop.prompt(read_line).is_ok_and(|a| matches!(a.trim(), "y" | "Y" | "yes"));
         if !yes {
             return Err(refuse("cancelled", "not confirmed"));
         }

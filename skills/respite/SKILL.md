@@ -78,6 +78,7 @@ Exit codes:
 | `2` | Network error or timeout |
 | `3` | Parse error, undefined variable or bad input, an OAuth 2.0 config or token request failing (`auth_failed`); also `check` finding errors |
 | `4` | Refused: a `@note` needs confirmation |
+| `130` | `run` stopped by SIGINT / SIGTERM (Ctrl+C): the request in flight is aborted, the rest don't run, the error code is `cancelled` |
 
 `run --output json` gives one object per request (an array when there are several):
 `request` (method, url, headers), `response` (status, reason, http_version, headers, body,
@@ -117,6 +118,8 @@ return `[]` plus a hint (workspace path, what to do next).
   code 2), so a server that never answers doesn't hang the call. For a slower server pass
   `timeout` (whole seconds, 1 or more) to `run`; `add_request` takes `timeout` too and writes
   it as `# @timeout N s`. A `# @timeout` in the file wins over both.
+- A cancelled tool call (`notifications/cancelled`, Esc in Claude Code) stops its request and
+  gets no reply, as the MCP spec says.
 
 History marks these runs `mcp`.
 

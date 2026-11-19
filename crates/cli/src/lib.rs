@@ -1,6 +1,7 @@
 //! `respite <command>`: the same core as the GUI, for terminals, CI and agents.
 //! Exit codes: 0 ok · 1 failed checks (`# @assert`, `--fail-on-status`) · 2 network/timeout ·
-//! 3 parse error / undefined variable / bad input · 4 refused (confirmation needed).
+//! 3 parse error / undefined variable / bad input · 4 refused (confirmation needed) ·
+//! 130 `run` stopped by SIGINT / SIGTERM.
 
 mod curl;
 mod mcp;
@@ -159,15 +160,19 @@ impl Format {
 
 /// The GUI binary calls this first; `None` means "not a CLI command, open the GUI".
 pub fn main_if_cli() -> Option<ExitCode> {
+    main_with(std::env::args().collect())
+}
+
+/// [`main_if_cli`] with explicit arguments (`args[0]` is the program), for in-process tests.
+pub fn main_with(args: Vec<String>) -> Option<ExitCode> {
     const COMMANDS: &[&str] = &[
         "list", "show", "run", "import", "import-curl", "export-curl", "check", "env", "auth", "history", "mcp", "help", "--help", "-h", "--version",
         "-V",
     ];
-    let first = std::env::args().nth(1)?;
-    if !COMMANDS.contains(&first.as_str()) {
+    if !COMMANDS.contains(&args.get(1)?.as_str()) {
         return None;
     }
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args);
     let human = match &cli.cmd {
         Cmd::List { output, .. } | Cmd::Check { output, .. } | Cmd::History { output, .. } | Cmd::Import { output, .. } => {
             Format::resolve(*output)

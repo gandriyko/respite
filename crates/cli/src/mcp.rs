@@ -6,39 +6,97 @@
 //! `.rest` where a request file is expected), and nothing that prints substituted values
 //! unmasked is exposed (`show --resolved`, `export-curl` without `--raw`); `run` masks them.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
 /// Set for the child commands: history entries are tagged `mcp` instead of `cli`.
 pub(crate) const SOURCE_ENV: &str = "RESPITE_HISTORY_SOURCE";
 
-/// `root` is canonical.
+/// `tools/call` requests in progress: request id (JSON text) → child pid, once spawned.
+type Calls = Arc<Mutex<HashMap<String, Option<u32>>>>;
+
+/// `root` is canonical. Each `tools/call` runs on its own thread, so `notifications/cancelled` is
+/// read while it runs: the child gets SIGTERM (`run` drops its request) and the call gets no
+/// reply. When the client goes away (stdin closes), every child gets SIGTERM.
 pub(crate) fn serve(root: &Path) -> u8 {
     let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
+    // Replies come from several threads: one lock per line keeps them whole. Nothing on the way
+    // here may hold `stdout().lock()`, or the reply threads wait forever.
+    let out = Arc::new(Mutex::new(std::io::stdout()));
+    let calls: Calls = Arc::default();
+    let send = |out: &Mutex<std::io::Stdout>, r: Value| {
+        let mut o = out.lock().unwrap();
+        writeln!(o, "{r}").is_ok() && o.flush().is_ok()
+    };
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(&msg, root),
-            Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
+        let msg = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => msg,
+            Err(e) => {
+                if !send(&out, json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})) {
+                    break;
+                }
+                continue;
+            }
         };
-        if let Some(r) = reply
-            && (writeln!(out, "{r}").is_err() || out.flush().is_err())
-        {
-            break;
+        match (msg["method"].as_str(), msg.get("id")) {
+            (Some("notifications/cancelled"), _) => {
+                // A call not spawned yet is stopped by its thread; a finished one is not in the map.
+                if let Some(Some(pid)) = calls.lock().unwrap().remove(&msg["params"]["requestId"].to_string()) {
+                    terminate(pid);
+                }
+            }
+            (Some("tools/call"), Some(id)) => {
+                let key = id.to_string();
+                calls.lock().unwrap().insert(key.clone(), None);
+                let (out, calls, root) = (out.clone(), calls.clone(), root.to_path_buf());
+                std::thread::spawn(move || {
+                    let on_spawn = |pid| match calls.lock().unwrap().get_mut(&key) {
+                        Some(slot) => *slot = Some(pid),
+                        None => terminate(pid),
+                    };
+                    let reply = handle(&msg, &root, &on_spawn);
+                    // Gone from the map = cancelled: no reply.
+                    if calls.lock().unwrap().remove(&key).is_some()
+                        && let Some(r) = reply
+                    {
+                        send(&out, r);
+                    }
+                });
+            }
+            _ => {
+                if let Some(r) = handle(&msg, root, &|_| {})
+                    && !send(&out, r)
+                {
+                    break;
+                }
+            }
         }
+    }
+    for pid in calls.lock().unwrap().values().flatten() {
+        terminate(*pid);
     }
     0
 }
 
-/// The reply to one message; `None` for notifications.
-fn handle(msg: &Value, root: &Path) -> Option<Value> {
+/// SIGTERM: `respite run` drops the request in flight (History marker included) and exits.
+/// Not `Child::kill()`: that is SIGKILL, and the child could not clean up.
+// ponytail: `kill` command instead of a libc dependency. A pid freed between the child's exit and
+// its removal from `Calls` could be reused; that window is microseconds.
+fn terminate(pid: u32) {
+    let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+}
+
+/// The reply to one message; `None` for notifications. `on_spawn` gets a tool's child pid.
+fn handle(msg: &Value, root: &Path, on_spawn: &dyn Fn(u32)) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let result = match msg["method"].as_str().unwrap_or("") {
@@ -55,7 +113,7 @@ fn handle(msg: &Value, root: &Path) -> Option<Value> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call(params["name"].as_str().unwrap_or(""), &params["arguments"], root),
+        "tools/call" => call(params["name"].as_str().unwrap_or(""), &params["arguments"], root, on_spawn),
         m => Err((-32601, format!("unknown method '{m}'"))),
     };
     Some(match result {
@@ -64,7 +122,7 @@ fn handle(msg: &Value, root: &Path) -> Option<Value> {
     })
 }
 
-fn call(name: &str, args: &Value, root: &Path) -> Result<Value, (i64, String)> {
+fn call(name: &str, args: &Value, root: &Path, on_spawn: &dyn Fn(u32)) -> Result<Value, (i64, String)> {
     let reply = |text: String, error: bool| Ok(json!({"content": [{"type": "text", "text": text}], "isError": error}));
     if name == "add_request" {
         return match add_request(args, root) {
@@ -86,6 +144,7 @@ fn call(name: &str, args: &Value, root: &Path) -> Result<Value, (i64, String)> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| (-32603, e.to_string()))?;
+    on_spawn(child.id());
     // Always close stdin: no command may wait for input.
     if let Some(mut s) = child.stdin.take() {
         let _ = s.write_all(input.unwrap_or_default().as_bytes());
@@ -528,6 +587,7 @@ mod tests {
         std::fs::write(root.join("a.http"), "GET /a\n").unwrap();
         std::fs::write(root.join("respite-dev.private.json"), "{}").unwrap();
         let r = root.display().to_string();
+        let handle = |m: &Value, root: &Path| handle(m, root, &|_| {});
 
         let init = handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}), &root).unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
