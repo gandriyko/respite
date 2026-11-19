@@ -165,8 +165,13 @@ impl Default for Options {
 
 /// What every client of a run shares — the request's and the token endpoint's: proxy, client
 /// certificate, extra CAs, certificate checks.
+/// Connect timeout when a request has no `# @connection-timeout`.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn client_builder(options: &Options, tls: &tls::Tls, insecure: bool) -> Result<reqwest::ClientBuilder, Error> {
-    let mut b = reqwest::Client::builder().danger_accept_invalid_certs(insecure || options.insecure || !tls.verify);
+    let mut b = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .danger_accept_invalid_certs(insecure || options.insecure || !tls.verify);
     if let Some(id) = &tls.identity {
         b = b.identity(id.clone());
     }

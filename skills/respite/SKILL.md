@@ -111,6 +111,8 @@ return `[]` plus a hint (workspace path, what to do next).
 - A directive (`# @assert`, `# @name`, …) after the request line is not applied: `check` warns
   `misplaced_directive`, and in a JSON body the `invalid_json` error says so. Directives go above
   the request line.
+- A request with no `# @timeout` and no `request.timeout_ms` setting stops after 60 s (exit
+  code 2), so a server that never answers doesn't hang the call. Set `# @timeout` for a slower one.
 
 History marks these runs `mcp`.
 
@@ -165,8 +167,8 @@ Authorization: Bearer {{login.response.body.$.token}}
 |---|---|
 | `# @env dev` | **First line only**: the environment the whole file runs with (`--env` overrides it); elsewhere it's a `misplaced_env` warning |
 | `# @name login` | Name the request (for addressing and chaining); must be unique in the file |
-| `# @timeout 10 s` | Request timeout; `ms` / `s` / `m`, seconds by default |
-| `# @connection-timeout 2 s` | Connect timeout |
+| `# @timeout 10 s` | Request timeout; `ms` / `s` / `m`, seconds by default. Without it: `request.timeout_ms` from settings (default none; 60 s for MCP runs) |
+| `# @connection-timeout 2 s` | Connect timeout; default 15 s |
 | `# @no-redirect` | Don't follow redirects |
 | `# @no-cookie-jar` | Don't send or store cookies |
 | `# @no-log` | Don't write this run to history |

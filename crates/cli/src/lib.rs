@@ -412,12 +412,20 @@ pub fn exec_options(s: &Settings) -> http_exec::Options {
     }
 }
 
+/// Request timeout of MCP runs when neither `# @timeout` nor `request.timeout_ms` sets one.
+pub(crate) const MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Executor with history (limits from settings) and request defaults.
 pub(crate) fn executor(env: Option<&str>) -> http_exec::Executor {
     let s = settings();
     let source = if std::env::var(mcp::SOURCE_ENV).as_deref() == Ok("mcp") { "mcp" } else { "cli" };
     let exec = http_exec::Executor::new(open_store(&s), env, source);
-    exec.set_options(exec_options(&s));
+    let mut options = exec_options(&s);
+    // An agent can't press Cancel: without `@timeout` or `request.timeout_ms` an MCP run stops at 60 s.
+    if source == "mcp" {
+        options.timeout = options.timeout.or(Some(MCP_TIMEOUT));
+    }
+    exec.set_options(options);
     // Browser and device sign-ins: stdout stays the result, the instructions go to stderr.
     exec.set_auth_ui(http_exec::AuthUi {
         notice: std::sync::Arc::new(|m| eprintln!("{} {m}", paint("auth:", YELLOW, true))),
